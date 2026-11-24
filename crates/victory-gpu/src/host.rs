@@ -2522,7 +2522,7 @@ impl Host {
                 if scene.is_none() {
                     PREV_PRESENT_BLACK.store(black, Ordering::Relaxed);
                 }
-                return Some(black);
+                Some(black)
             }
             #[cfg(not(feature = "diagnostics"))]
             {
