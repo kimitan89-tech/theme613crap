@@ -25,7 +25,7 @@ pub type Site = (usize, usize);
 /// value the program computes (an index times a stride, say).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Address {
-    /// Index into the layout, or [`CODE`].
+    /// Index into the layout, or [`CODE`] / [`SPILL`].
     pub param: usize,
     /// Added modulo 2^32 (with carry into the high half of a root
     /// descriptor's address).
@@ -37,6 +37,11 @@ pub struct Address {
 /// compiler appends after the code and reads through `s_getpc_b64`; the
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
+
+/// [`Address::param`] of the console user-data spill table in `s[0:1]`:
+/// root parameters with `user_data >= 16` are loaded from it; dword `k` of
+/// an `s_load_dword*` at byte offset `o` is user-data dword `16 + o/4 + k`.
+pub const SPILL: usize = usize::MAX - 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -152,14 +157,7 @@ pub fn track(
 ) -> Result<Resources, ShaderError> {
     let t = Tracer::new(p, layout, stage, lanes)?;
     let mut out = Resources {
-        params: p
-            .inputs
-            .iter()
-            .filter_map(|&(reg, v)| {
-                let (param, dword) = t.param_of(reg)?;
-                Some((v, param, dword))
-            })
-            .collect(),
+        params: t.param_vals(),
         ..Resources::default()
     };
     // Group accesses in the same loop so a shared mask can select several
@@ -299,6 +297,10 @@ struct Tracer<'a> {
     lanes: Option<&'a Structured>,
     /// Reverse-postorder index per block.
     rpo: Vec<usize>,
+    /// User-data spill table in `s[0:1]` (parameters at `user_data >= 16`).
+    spill: bool,
+    /// Values that hold a root-parameter dword: entry inputs and spill loads.
+    params: Vec<Option<(usize, u32)>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -350,6 +352,7 @@ impl<'a> Tracer<'a> {
         {
             rpo[b] = n;
         }
+        let spill = spill_table(layout, stage);
         let mut t = Tracer {
             p,
             layout,
@@ -360,9 +363,90 @@ impl<'a> Tracer<'a> {
             origin: Vec::new(),
             lanes,
             rpo,
+            spill,
+            params: vec![None; n],
         };
         t.origin = t.propagate_copies(n)?;
+        t.collect_params();
         Ok(t)
+    }
+
+    /// Entry inputs and spill-table loads mapped to `(layout index, dword)`.
+    fn param_vals(&self) -> Vec<(Value, usize, u32)> {
+        self.params
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| p.map(|(param, dword)| (Value(i as u32), param, dword)))
+            .collect()
+    }
+
+    /// Fills [`Self::params`] from entry user SGPRs, then spill-table loads
+    /// in reverse postorder so later instructions see the mappings.
+    fn collect_params(&mut self) {
+        for &(reg, v) in &self.p.inputs {
+            if let Some(pd) = self.param_of(reg) {
+                self.params[v.0 as usize] = Some(pd);
+            }
+        }
+        if !self.spill {
+            return;
+        }
+        let order = crate::ir::reverse_postorder(&self.p.blocks);
+        for &b in &order {
+            for inst in &self.p.blocks[b].insts {
+                let Some(count) = spill_load_count(inst.name()) else {
+                    continue;
+                };
+                let Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } = &inst.fields
+                else {
+                    continue;
+                };
+                let Ok(a) = self.smem_address(inst, base, *offset, soffset) else {
+                    continue;
+                };
+                if a.param != SPILL || a.dynamic.is_some() || !a.offset.is_multiple_of(4) {
+                    continue;
+                }
+                for k in 0..count {
+                    let ud = 16 + a.offset / 4 + k;
+                    let Some((param, dword)) = self.layout_at(ud) else {
+                        continue;
+                    };
+                    let Some(&(_, v)) = inst.writes.get(k as usize) else {
+                        continue;
+                    };
+                    self.params[v.0 as usize] = Some((param, dword));
+                }
+            }
+        }
+    }
+
+    /// Layout index and dword covering user-data dword `ud`.
+    fn layout_at(&self, ud: u32) -> Option<(usize, u32)> {
+        self.layout.iter().enumerate().find_map(|(i, rp)| {
+            let start = u32::from(rp.user_data);
+            (ud >= start && ud < start + rp.sgprs).then_some((i, ud - start))
+        })
+    }
+
+    /// `(layout index, dword)` of a value that holds a root parameter.
+    fn value_param(&self, v: Value) -> Option<(usize, u32)> {
+        let mut v = v;
+        for _ in 0..8 {
+            if let Some(pd) = self.params[v.0 as usize] {
+                return Some(pd);
+            }
+            match self.origin[v.0 as usize] {
+                Term::Value(o) if o != v => v = o,
+                _ => return None,
+            }
+        }
+        None
     }
 
     /// Optimistic copy propagation: a move's result is its source's
@@ -487,14 +571,20 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some(reg) = self.inputs[v.0 as usize] {
-            return match self.param_of(reg) {
-                Some((_, 0)) => Sum {
-                    base: Some(v),
-                    offset: 0,
-                    dynamic: None,
-                },
-                _ => dynamic,
+        if let Some((_, 0)) = self.value_param(v) {
+            return Sum {
+                base: Some(v),
+                offset: 0,
+                dynamic: None,
+            };
+        }
+        if self.spill
+            && self.inputs[v.0 as usize] == Some(Reg::S(self.stage.user_sgpr(0)))
+        {
+            return Sum {
+                base: Some(v),
+                offset: 0,
+                dynamic: None,
             };
         }
         if self.getpc(v).is_some() {
@@ -632,6 +722,16 @@ impl<'a> Tracer<'a> {
             return Err("an address with two computed terms");
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
+        if self.spill
+            && self.inputs[base.0 as usize] == Some(Reg::S(self.stage.user_sgpr(0)))
+            && self.spill_high(hi)
+        {
+            return Ok(Address {
+                param: SPILL,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            });
+        }
         if let Some(pc) = self.getpc(base) {
             // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
@@ -646,17 +746,19 @@ impl<'a> Tracer<'a> {
                 dynamic: s.dynamic.or(extra.dynamic),
             });
         }
-        let reg = self.inputs[base.0 as usize].ok_or("an address not from a root parameter")?;
         let (param, _) = self
-            .param_of(reg)
+            .value_param(base)
+            .or_else(|| {
+                let reg = self.inputs[base.0 as usize]?;
+                self.param_of(reg)
+            })
             .ok_or("an address not from a root parameter")?;
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => {
-                let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
-                let input = self.p.inputs.iter().find(|i| i.0 == high);
-                Some(input.ok_or("a root descriptor without its high half")?.1)
-            }
+            RootType::Descriptor => Some(
+                self.descriptor_high(param)
+                    .ok_or("a root descriptor without its high half")?,
+            ),
             _ => return Err("an address from a root parameter that is no address"),
         };
         // shortcut: with a computed term, a high half that adds anything to the
@@ -672,6 +774,37 @@ impl<'a> Tracer<'a> {
             offset: s.offset.wrapping_add(extra.offset),
             dynamic: s.dynamic.or(extra.dynamic),
         })
+    }
+
+    /// High dword of root descriptor `param`: an entry input or a spill load.
+    fn descriptor_high(&self, param: usize) -> Option<Value> {
+        let high = Reg::S(self.stage.user_sgpr(self.layout[param].user_data) + 1);
+        if let Some(&(_, v)) = self.p.inputs.iter().find(|i| i.0 == high) {
+            return Some(v);
+        }
+        self.params.iter().enumerate().find_map(|(i, p)| {
+            matches!(p, Some((p, 1)) if *p == param).then_some(Value(i as u32))
+        })
+    }
+
+    /// `hi` is entry `s1`, or `s_and_b32` of that input with a constant mask.
+    fn spill_high(&self, hi: Term) -> bool {
+        let Term::Value(v) = hi else {
+            return false;
+        };
+        let s1 = Reg::S(self.stage.user_sgpr(1));
+        if self.inputs[v.0 as usize] == Some(s1) {
+            return true;
+        }
+        let Some((_, [a, b])) = self.sop2(v, &["s_and_b32"]) else {
+            return false;
+        };
+        let entry = |t: Term| match t {
+            Term::Value(x) => self.inputs[x.0 as usize] == Some(s1),
+            Term::Const(_) => false,
+        };
+        let mask = |t: Term| matches!(t, Term::Const(_));
+        entry(a) && mask(b) || entry(b) && mask(a)
     }
 
     /// `hi` is `high` (0 for a table), possibly plus a carry.
@@ -1723,6 +1856,33 @@ pub(crate) fn inline(code: u8) -> Option<u32> {
         246 => float(4.0),
         247 => float(-4.0),
         248 => Some(0x3E22_F983),
+        _ => None,
+    }
+}
+
+/// Root parameters arrive only through a spill table in `s[0:1]`.
+fn spill_table(layout: &[RootParam], stage: HwStage) -> bool {
+    if !layout.iter().any(|rp| rp.user_data >= 16) {
+        return false;
+    }
+    let covered = |index: u8| {
+        let code = stage.user_sgpr(index);
+        layout.iter().any(|p| {
+            let first = stage.user_sgpr(p.user_data);
+            code >= first && u32::from(code - first) < p.sgprs
+        })
+    };
+    !covered(0) && !covered(1)
+}
+
+/// Dword count of an `s_load_dword*` that can fill spill-table params.
+fn spill_load_count(name: &str) -> Option<u32> {
+    match name.strip_prefix("s_load_dword")? {
+        "" => Some(1),
+        "x2" => Some(2),
+        "x4" => Some(4),
+        "x8" => Some(8),
+        "x16" => Some(16),
         _ => None,
     }
 }
@@ -3049,5 +3209,91 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn spill_table_loads_map_to_user_data_dwords() {
+        // s_and_b32 s3, s1, lit(0xff); s_mov_b32 s2, s0;
+        // s_load_dwordx16 s[8:23], s[2:3], 0x10  -> ud 20..35 (Constants)
+        // s_load_dwordx4 s[8:11], s[2:3], 0x4c   -> ud 35..38 (Descriptor)
+        // s_load_dwordx4 s[8:11], s[2:3], null   -> ud 16..19 (Constants)
+        let r = track_words(
+            &[
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, lit(0xff)
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xF410_0201,
+                0xFA00_0010, // s_load_dwordx16 s[8:23], s[2:3], 0x10
+                0xF408_0201,
+                0xFA00_004C, // s_load_dwordx4 s[8:11], s[2:3], 0x4c
+                0xF408_0201,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+                S_ENDPGM,
+            ],
+            &[
+                param(Constants, 16, 19),
+                param(Descriptor, 35, 2),
+                param(Descriptor, 37, 2),
+            ],
+            HwStage::Cs,
+        );
+        assert_eq!(
+            r.scalar
+                .iter()
+                .map(|(_, a)| (a.param, a.offset))
+                .collect::<Vec<_>>(),
+            [(SPILL, 0x10), (SPILL, 0x4c), (SPILL, 0)]
+        );
+        let mapped: Vec<_> = r
+            .params
+            .iter()
+            .map(|&(_, param, dword)| (param, dword))
+            .collect();
+        // Last load keeps Constants at s[8:11]; the x16 load's high SGPRs keep
+        // later Constants and the Descriptor at ud 35 (s23).
+        assert!(
+            mapped.contains(&(0, 0)) && mapped.contains(&(0, 8)) && mapped.contains(&(1, 0)),
+            "spill loads should map Constants and Descriptor dwords: {mapped:?}"
+        );
+    }
+
+    #[test]
+    fn spill_loaded_root_descriptor_builds_a_buffer_descriptor() {
+        // Load Descriptor(s20..+2) from the spill table, then build a buffer
+        // descriptor around it for a later access.
+        let r = track_words(
+            &[
+                0x8703_FF01,
+                0x0000_00FF, // s_and_b32 s3, s1, lit(0xff)
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xF404_0201,
+                0xFA00_0010, // s_load_dwordx2 s[8:9], s[2:3], 0x10
+                0x8809_FF09,
+                0x0010_0000, // s_or_b32 s9, s9, lit(0x100000)
+                0xBE8A_03C1, // s_mov_b32 s10, -1
+                0xBE8B_03FF,
+                0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+                0xF420_0004,
+                0xFA00_0000, // s_buffer_load_dword s0, s[8:11], null
+                S_ENDPGM,
+            ],
+            &[param(Constants, 16, 4), param(Descriptor, 20, 2)],
+            HwStage::Cs,
+        );
+        assert!(
+            r.descriptors.iter().any(|d| matches!(
+                d.source,
+                Source::Built {
+                    address: Address {
+                        param: 1,
+                        offset: 0,
+                        dynamic: None
+                    },
+                    ..
+                }
+            )),
+            "expected a Built descriptor around spilled root param 1: {:?}",
+            r.descriptors
+        );
     }
 }

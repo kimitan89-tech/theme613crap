@@ -532,6 +532,28 @@ impl State {
                     }
                 }
             }
+            for &(slot, param) in &stage.root_uavs {
+                let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
+                else {
+                    once!(slot, "a shader writes a root UAV the title did not set");
+                    continue;
+                };
+                let Some(shadow) = crate::shadow::find(*address, 1) else {
+                    continue;
+                };
+                let len = shadow.left(*address).min(1 << 20);
+                shadow.refresh(list, *address, len);
+                let gpu = shadow.gpu(*address);
+                // SAFETY: an open list; the address is in live memory.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootUnorderedAccessView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                    }
+                }
+                shadow.gpu_writes(list, *address, len);
+            }
         }
         true
     }
@@ -605,7 +627,12 @@ impl State {
                     let _ = write!(text, " [heap {index}: {slot}]");
                 }
             }
-            for &(slot, _) in stage.root_cbvs.iter().chain(&stage.root_srvs) {
+            for &(slot, _) in stage
+                .root_cbvs
+                .iter()
+                .chain(&stage.root_srvs)
+                .chain(&stage.root_uavs)
+            {
                 if let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot)) {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));

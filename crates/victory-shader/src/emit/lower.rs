@@ -17,7 +17,7 @@ use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
-use crate::resource::{Address, CODE, Resources, Role, Site, Source};
+use crate::resource::{Address, CODE, Resources, Role, SPILL, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured, mask_constant, valu_mask_operand};
 
 type Why = &'static str;
@@ -35,6 +35,7 @@ pub(crate) struct Lowered {
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
+    pub root_uavs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -168,6 +169,8 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Compact user-data buffer indices: `(slot, root, dword) -> index`.
+    user_index: HashMap<(u8, RootType, u32), u32>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -521,6 +524,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            user_index: HashMap::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -632,25 +636,28 @@ impl<'a> Lower<'a> {
         Ok(self.s.m.load(c, at))
     }
 
-    /// A global memory load (`global_load_*`): from the program's constant
-    /// table, or from a root SRV at the address the title sets.
+    /// A global memory load or store (`global_load_*` / `global_store_*`):
+    /// from the program's constant table, or a root SRV/UAV at the address
+    /// the title sets.
     fn flat(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
-        let Fields::Flat { dst, .. } = &inst.fields else {
+        let Fields::Flat { dst, data, .. } = &inst.fields else {
             unreachable!()
         };
         let name = inst.name();
+        let store = name.starts_with("global_store_");
         let rest = name
             .strip_prefix("global_load_")
-            .ok_or("a global memory write")?;
+            .or_else(|| name.strip_prefix("global_store_"))
+            .ok_or(name)?;
         let (n, sub) = match rest {
             "dword" => (1, None),
             "dwordx2" => (2, None),
             "dwordx3" => (3, None),
             "dwordx4" => (4, None),
-            "ubyte" => (1, Some((8, false))),
-            "sbyte" => (1, Some((8, true))),
-            "ushort" => (1, Some((16, false))),
-            "sshort" => (1, Some((16, true))),
+            "ubyte" if !store => (1, Some((8, false))),
+            "sbyte" if !store => (1, Some((8, true))),
+            "ushort" if !store => (1, Some((16, false))),
+            "sshort" if !store => (1, Some((16, true))),
             _ => return Err(name),
         };
         let a = *self
@@ -658,15 +665,51 @@ impl<'a> Lower<'a> {
             .get(&(b, i))
             .ok_or("an untracked global address")?;
         let guard = self.guard(b, i)?;
-        let Some(Operand::Vector { reg, .. }) = *dst else {
-            return Err("a global load result");
-        };
         let c = self.cur;
         let mut off = self.s.m.i32(a.offset);
         if let Some(d) = a.dynamic {
             let d = self.i32_of(d)?;
             off = self.s.m.bin(c, Bin::Add, off, d);
         }
+        if store {
+            if a.param == CODE {
+                return Err("a store to the code table");
+            }
+            let src = Source::Built {
+                address: a,
+                bits: 0,
+                words: [0, 0],
+            };
+            let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a global store value");
+            };
+            let at = self.begin_guarded(guard);
+            for k in 0..n {
+                let four = self.s.m.i32(4 * k);
+                let byte = self.s.m.bin(self.cur, Bin::Add, off, four);
+                let x = self.i32_of(inst.read(Reg::V(reg + k as u8)).ok_or("a global store")?)?;
+                let f = self.as_float(x);
+                let (u, mask, al) = (
+                    self.s.m.undef(self.s.t.i32),
+                    self.s.m.i8(1),
+                    self.s.m.i32(4),
+                );
+                self.s.op(
+                    self.cur,
+                    "rawBufferStore.f32",
+                    Attr::NoUnwind,
+                    self.s.t.void,
+                    140,
+                    &[h, byte, u, f, mask, al],
+                );
+            }
+            self.end_guarded(at, &[]);
+            return Ok(());
+        }
+        let Some(Operand::Vector { reg, .. }) = *dst else {
+            return Err("a global load result");
+        };
         let h = if a.param == CODE {
             None
         } else {
@@ -675,7 +718,12 @@ impl<'a> Lower<'a> {
                 bits: 0,
                 words: [0, 0],
             };
-            Some(self.handle((b, i), &src, false, (11, 0))?)
+            // Root UAV descriptors accept SRV-typed loads via the UAV handle.
+            let props = match self.used_kind(&src).map(|u| u.kind) {
+                Some(ResourceType::Uav) => (11 | 0x1000, 0),
+                _ => (11, 0),
+            };
+            Some(self.handle((b, i), &src, false, props)?)
         };
         let dword = |l: &mut Self, byte: V| -> Result<V, Why> {
             match h {
@@ -966,11 +1014,13 @@ impl<'a> Lower<'a> {
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+        let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
+            root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -1217,7 +1267,17 @@ impl<'a> Lower<'a> {
             RootType::Constants | RootType::Table => {}
             _ => return Val::Missing("a root descriptor"),
         }
-        let index = u32::from(rp.user_data) + dword;
+        // Compact indices so spilled params (`user_data >= 16`) stay inside
+        // D3D12's 64-dword root-constant limit.
+        let key = (rp.slot, rp.root, dword);
+        let index = match self.user_index.get(&key).copied() {
+            Some(i) => i,
+            None => {
+                let i = self.user_index.len() as u32;
+                self.user_index.insert(key, i);
+                i
+            }
+        };
         self.user_reads.insert(
             index,
             UserData {
@@ -3104,6 +3164,9 @@ impl<'a> Lower<'a> {
         if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == CODE) {
             return self.code_smem(inst, a);
         }
+        if let Some(a) = self.scalar.get(&site).copied().filter(|a| a.param == SPILL) {
+            return self.spill_smem(inst, a);
+        }
         if name.starts_with("s_load_dword")
             && let Some(a) = self.scalar.get(&site).copied()
             && self
@@ -3216,6 +3279,62 @@ impl<'a> Lower<'a> {
                 }
             };
             self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// `s_load_dword*` from the user-data spill table: Constants/Table/heaps
+    /// become user-data reads; Descriptor dwords stay missing (as on entry).
+    fn spill_smem(&mut self, inst: &Inst, a: Address) -> Result<(), Why> {
+        if !inst.name().starts_with("s_load_dword") {
+            return Err("a spill-table store");
+        }
+        if a.dynamic.is_some() || !a.offset.is_multiple_of(4) {
+            return Err("a dynamic spill-table load");
+        }
+        let Fields::Smem {
+            data: Some(Operand::Scalar { code, .. }),
+            ..
+        } = inst.fields
+        else {
+            return Err("a scalar memory read as data");
+        };
+        let count = match inst.name().strip_prefix("s_load_dword") {
+            Some("") => 1u32,
+            Some("x2") => 2,
+            Some("x4") => 4,
+            Some("x8") => 8,
+            Some("x16") => 16,
+            _ => return Err("a scalar memory read as data"),
+        };
+        for k in 0..count {
+            let ud = 16 + a.offset / 4 + k;
+            let Some((param, dword)) = self.x.native.layout.iter().enumerate().find_map(|(i, rp)| {
+                let start = u32::from(rp.user_data);
+                (ud >= start && ud < start + rp.sgprs).then_some((i, ud - start))
+            }) else {
+                if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                    self.vals
+                        .insert(v, Val::Missing("an unmapped spill-table dword"));
+                }
+                continue;
+            };
+            match self.x.native.layout[param].root {
+                RootType::Constants
+                | RootType::Table
+                | RootType::ResourceHeap
+                | RootType::SamplerHeap => {
+                    let x = self.user(param, dword);
+                    if let Some(v) = inst.write(Reg::S(code + k as u8)) {
+                        self.vals.insert(v, x);
+                    }
+                }
+                // Descriptor dwords stay on the params map (Missing as data),
+                // same as entry inputs.
+                RootType::Descriptor
+                | RootType::ImmediateSampler
+                | RootType::Other(_) => {}
+            }
         }
         Ok(())
     }
@@ -3855,7 +3974,13 @@ impl<'a> Lower<'a> {
                     (RootType::Descriptor, Some(ResourceType::Srv), 11) => {
                         Ok(self.s.root_srv_handle(rp.slot))
                     }
-                    _ => Err("a root UAV or typed root view"),
+                    (RootType::Descriptor, Some(ResourceType::Uav), p)
+                        if p & 0xff == 11 || p & 0xff == 12 || p == 11 =>
+                    {
+                        let stride = if p & 0xff == 12 { props.1 } else { 0 };
+                        Ok(self.s.root_uav_handle(rp.slot, stride))
+                    }
+                    _ => Err("a typed root view"),
                 }
             }
             Source::Phi { block, args } => {
