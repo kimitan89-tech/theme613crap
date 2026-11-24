@@ -1155,9 +1155,13 @@ impl<'a> Lower<'a> {
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {
+        self.i32_at(v, self.cur)
+    }
+
+    fn i32_at(&mut self, v: Value, at: usize) -> Result<V, Why> {
         match self.get(v)? {
             Val::I32(x) => Ok(x),
-            Val::Bit(x) => Ok(self.s.m.cast(self.cur, Cast::ZExt, x, self.s.t.i32)),
+            Val::Bit(x) => Ok(self.s.m.cast(at, Cast::ZExt, x, self.s.t.i32)),
             Val::Missing(w) => Err(w),
         }
     }
@@ -1210,36 +1214,198 @@ impl<'a> Lower<'a> {
             None => (v, false),
         };
         let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-        if !self.x.st.active.contains(&lo) {
-            return Err("a lane mask holding lanes elsewhere read as data");
-        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
-                let at = match self.def_block.get(&lo) {
-                    // Program inputs (EXEC on entry).
-                    None => self.s.entry,
-                    Some(&b) if b == self.cur_ir => self.cur,
-                    Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
-                };
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                let bit = self.boolean(m, at);
+                let res = if self.x.st.active.contains(&lo) {
+                    self.active_mask_dwords(lo, m)
+                } else {
+                    self.derived_mask_dwords(lo)
+                };
                 self.balloting.remove(&lo);
-                let bit = bit?;
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = res?;
                 self.ballots.insert(lo, xy);
                 xy
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    fn active_mask_dwords(&mut self, lo: Value, m: Bool) -> Result<(V, V), Why> {
+        let at = match self.def_block.get(&lo) {
+            // Program inputs (EXEC on entry).
+            None => self.s.entry,
+            Some(&b) if b == self.cur_ir => self.cur,
+            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+        };
+        let bit = self.boolean(m, at)?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        Ok((self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1)))
+    }
+
+    /// Integer dwords of a lane mask that is not restricted to active lanes
+    /// (for example `s_not`, `s_and`, `s_or` over active compare ballots),
+    /// evaluated directly as bitwise ops on its operands' dwords.
+    fn derived_mask_dwords(&mut self, lo: Value) -> Result<(V, V), Why> {
+        const ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+        let Some(&b) = self.def_block.get(&lo) else {
+            return Err(ELSEWHERE);
+        };
+        let at = if b == self.cur_ir {
+            self.cur
+        } else {
+            self.tail[b].ok_or("a lane mask written after its use")?
+        };
+        let Some(inst) = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .find(|i| i.writes.iter().any(|&(_, w)| w == lo))
+        else {
+            return Err(ELSEWHERE);
+        };
+        let wave64 = self.x.p.wave64;
+        let width = if wave64 { "_b64" } else { "_b32" };
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return Err(ELSEWHERE);
+        };
+        let Some(op) = inst
+            .name()
+            .strip_prefix("s_")
+            .and_then(|s| s.strip_suffix(width))
+        else {
+            return Err(ELSEWHERE);
+        };
+        // Operations that can set bits in inactive lanes (0 op 0 == 1) need
+        // the console's exact wave size so upper bits match hardware.
+        let sets_inactive = matches!(op, "not" | "orn2" | "orn1" | "nand" | "nor" | "xnor");
+        if sets_inactive && self.mask_data != MaskData::Console {
+            return Err(ELSEWHERE);
+        }
+        let zero = self.s.m.i32(0);
+        let all1 = self.s.m.i32(u32::MAX);
+        match op {
+            "mov" => {
+                let a = self.mask_operand_dwords(inst, src.first().ok_or(ELSEWHERE)?, at)?;
+                Ok((a.0, if wave64 { a.1 } else { zero }))
+            }
+            "not" => {
+                let a = self.mask_operand_dwords(inst, src.first().ok_or(ELSEWHERE)?, at)?;
+                let x = self.s.m.bin(at, Bin::Xor, a.0, all1);
+                let y = if wave64 {
+                    self.s.m.bin(at, Bin::Xor, a.1, all1)
+                } else {
+                    zero
+                };
+                Ok((x, y))
+            }
+            "cselect" => {
+                let a = self.mask_operand_dwords(inst, src.first().ok_or(ELSEWHERE)?, at)?;
+                let b = self.mask_operand_dwords(inst, src.get(1).ok_or(ELSEWHERE)?, at)?;
+                let scc = inst.read(Reg::Scc).ok_or(ELSEWHERE)?;
+                let cond = match self.get(scc)? {
+                    Val::Bit(c) => c,
+                    Val::I32(x) => self.s.m.cmp(at, pred::NE, x, zero),
+                    Val::Missing(w) => return Err(w),
+                };
+                let x = self.s.m.select(at, cond, a.0, b.0);
+                let y = if wave64 {
+                    self.s.m.select(at, cond, a.1, b.1)
+                } else {
+                    zero
+                };
+                Ok((x, y))
+            }
+            "and" | "or" | "xor" | "andn2" | "orn2" | "andn1" | "orn1" | "nand" | "nor"
+            | "xnor" => {
+                let a = self.mask_operand_dwords(inst, src.first().ok_or(ELSEWHERE)?, at)?;
+                let b = self.mask_operand_dwords(inst, src.get(1).ok_or(ELSEWHERE)?, at)?;
+                let combine = |m: &mut super::bitcode::Module, x: V, y: V| match op {
+                    "and" => m.bin(at, Bin::And, x, y),
+                    "or" => m.bin(at, Bin::Or, x, y),
+                    "xor" => m.bin(at, Bin::Xor, x, y),
+                    "andn2" => {
+                        let ny = m.bin(at, Bin::Xor, y, all1);
+                        m.bin(at, Bin::And, x, ny)
+                    }
+                    "orn2" => {
+                        let ny = m.bin(at, Bin::Xor, y, all1);
+                        m.bin(at, Bin::Or, x, ny)
+                    }
+                    "andn1" => {
+                        let nx = m.bin(at, Bin::Xor, x, all1);
+                        m.bin(at, Bin::And, nx, y)
+                    }
+                    "orn1" => {
+                        let nx = m.bin(at, Bin::Xor, x, all1);
+                        m.bin(at, Bin::Or, nx, y)
+                    }
+                    "nand" => {
+                        let r = m.bin(at, Bin::And, x, y);
+                        m.bin(at, Bin::Xor, r, all1)
+                    }
+                    "nor" => {
+                        let r = m.bin(at, Bin::Or, x, y);
+                        m.bin(at, Bin::Xor, r, all1)
+                    }
+                    "xnor" => {
+                        let r = m.bin(at, Bin::Xor, x, y);
+                        m.bin(at, Bin::Xor, r, all1)
+                    }
+                    _ => unreachable!(),
+                };
+                let x = combine(&mut self.s.m, a.0, b.0);
+                let y = if wave64 {
+                    combine(&mut self.s.m, a.1, b.1)
+                } else {
+                    zero
+                };
+                Ok((x, y))
+            }
+            _ => Err(ELSEWHERE),
+        }
+    }
+
+    fn mask_operand_dwords(&mut self, inst: &Inst, op: &Operand, at: usize) -> Result<(V, V), Why> {
+        let wave64 = self.x.p.wave64;
+        let zero = self.s.m.i32(0);
+        match *op {
+            Operand::Scalar { code: NULL, .. } => Ok((zero, zero)),
+            Operand::Scalar { code, .. } => {
+                let lo_v = inst.read(Reg::S(code)).ok_or("an unread operand")?;
+                let lo = self.i32_at(lo_v, at)?;
+                let hi = if wave64 {
+                    let hi_v = inst.read(Reg::S(code + 1)).ok_or("an unread operand")?;
+                    self.i32_at(hi_v, at)?
+                } else {
+                    zero
+                };
+                Ok((lo, hi))
+            }
+            Operand::Const(c @ 128..=208) => {
+                let low = crate::resource::inline(c).ok_or("a special operand")?;
+                let hi = if wave64 {
+                    ((low as i32) >> 31) as u32
+                } else {
+                    0
+                };
+                Ok((self.s.m.i32(low), self.s.m.i32(hi)))
+            }
+            Operand::Const(c) => {
+                let low = crate::resource::inline(c)
+                    .ok_or("a special operand (vccz, execz, scc, lds_direct)")?;
+                Ok((self.s.m.i32(low), zero))
+            }
+            Operand::Literal(x) => Ok((self.s.m.i32(x), zero)),
+            _ => Err("a lane mask holding lanes elsewhere read as data"),
+        }
     }
 
     // ---- operands ----

@@ -283,6 +283,14 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            // SAFETY: live host texture.
+            let d = unsafe { texture.GetDesc() };
+            crate::host::note_scene_color(
+                record.resource,
+                d.Format.0 as u32,
+                d.Width as u32,
+                d.Height,
+            );
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -526,6 +534,16 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        // Cutscene PresentX overlay: mesh/draw keep the silhouette RT alive;
+        // post/upscale compute was hanging the host GPU (TDR / device-removed).
+        // Still count the op so execute() can drop the whole compute-only list
+        // before run_deferred (that prepare was the CPU peg).
+        if crate::host::scene_overlay_active() {
+            once!("compute skipped while PresentX scene overlay is active");
+            list.note_compute_op();
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -555,6 +573,7 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_compute_op();
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -607,6 +626,8 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.note_graphics_op();
+                    crate::host::mark_scene_drawn(&self.targets);
                     true
                 }
                 Err(_) => false,
@@ -966,6 +987,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_graphics_op();
+            crate::host::mark_scene_drawn(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1029,6 +1052,94 @@ impl State {
         true
     }
 
+    /// Computes the maximum expanded triangle vertex count for an indirect
+    /// rectangle draw from the bound per-vertex buffers, without recording
+    /// commands. `None` if a per-vertex buffer cannot be expanded.
+    fn indirect_rect_limit(&self) -> Option<u32> {
+        const MAX_INDIRECT_RECTS: u64 = 65_536;
+        let p = crate::pipeline::host_pipeline(self.pipeline as This)?;
+        let mut max_verts = 1u32 << 24;
+        for slot in 0..32 {
+            let has_per_vertex = p
+                .inputs
+                .iter()
+                .any(|e| e.slot == slot && !e.per_instance);
+            if !has_per_vertex {
+                continue;
+            }
+            let v = self.vertex[slot as usize];
+            let stride = u64::from(v.stride);
+            let rects = if stride == 0 {
+                0
+            } else {
+                u64::from(v.size) / (3 * stride)
+            };
+            if v.address == 0
+                || stride == 0
+                || rects == 0
+                || rects > MAX_INDIRECT_RECTS
+                || crate::shadow::find(v.address, rects * 3 * stride).is_none()
+            {
+                once!(
+                    slot,
+                    size = v.size,
+                    stride = v.stride,
+                    rects,
+                    "indirect rectangle vertices outside expandable buffer"
+                );
+                return None;
+            }
+            max_verts = max_verts.min((rects * 6) as u32);
+        }
+        Some(max_verts)
+    }
+
+    /// Expands all rectangles in every bound per-vertex buffer for an indirect
+    /// rectangle draw.
+    fn rectangles_all(&self, list: &HostList) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return false;
+        };
+        for slot in 0..32 {
+            let elements: Vec<(u32, u32)> = p
+                .inputs
+                .iter()
+                .filter(|e| e.slot == slot && !e.per_instance)
+                .map(|e| (e.offset, e.format))
+                .collect();
+            if elements.is_empty() {
+                continue;
+            }
+            let v = self.vertex[slot as usize];
+            let stride = u64::from(v.stride);
+            let rects = u64::from(v.size) / (3 * stride);
+            let Some((gpu, to)) = list.scratch(rects * 6 * stride) else {
+                return false;
+            };
+            let (from, to, stride) = (v.address as usize, to as usize, stride as usize);
+            let n = rects as usize;
+            list.defer_host(move || {
+                // SAFETY: the vertices lie in a title buffer (checked in
+                // `indirect_rect_limit`) and the scratch memory is the list's.
+                let (src, dst) = unsafe {
+                    (
+                        std::slice::from_raw_parts(from as *const u8, n * 3 * stride),
+                        std::slice::from_raw_parts_mut(to as *mut u8, n * 6 * stride),
+                    )
+                };
+                crate::primitive::expand_rects(src, dst, stride, &elements);
+            });
+            let view = D3D12_VERTEX_BUFFER_VIEW {
+                BufferLocation: gpu,
+                SizeInBytes: (rects * 6 * stride as u64) as u32,
+                StrideInBytes: v.stride,
+            };
+            // SAFETY: an open list; the view names live scratch memory.
+            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+        }
+        true
+    }
+
     pub(crate) fn draw_indexed(
         &mut self,
         list: &HostList,
@@ -1053,6 +1164,8 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_graphics_op();
+            crate::host::mark_scene_drawn(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1112,34 +1225,87 @@ impl State {
             why("no host signature");
             return false;
         };
+        let rects = kind == DRAW && self.topology == RECTANGLES;
+        let rect_limit = if rects {
+            match self.indirect_rect_limit() {
+                Some(limit) => Some(limit),
+                None => {
+                    #[cfg(feature = "diagnostics")]
+                    match crate::pipeline::host_pipeline(self.pipeline as This) {
+                        None => crate::pipeline::note_drop(self.pipeline as This),
+                        Some(p) => why(&format!(
+                            "rect vertices unexpandable (slots {:#x}, vb0 {}x{}, {})",
+                            p.slots, self.vertex[0].size, self.vertex[0].stride, p.name
+                        )),
+                    }
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
-        }
+        let exec_args: (ID3D12Resource, u64) = if let Some(max_verts) = rect_limit {
+            let Some(expanded) =
+                crate::indirect::bound_rects(list, args.gpu(arguments), (stride, max, max_verts))
+            else {
+                why("rect clamp failed (no clamp, or arguments unaligned)");
+                return false;
+            };
+            expanded
+        } else {
+            if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            }
+            (args.buffer.clone(), args.offset(arguments))
+        };
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
+            DRAW if rects => self.prepare(list, false) && self.rectangles_all(list),
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
-            },
+            DISPATCH => {
+                if crate::host::scene_overlay_active() {
+                    once!("indirect compute skipped while PresentX scene overlay is active");
+                    list.note_compute_op();
+                    false
+                } else {
+                    match crate::pipeline::host_pipeline(self.pipeline as This) {
+                        Some(p) if p.compute => self.bind(list, p, true),
+                        _ => false,
+                    }
+                }
+            }
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &exec_args.0);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => why(&format!(
+                    "prepare failed (topo {}, compute {}, mesh {}, {})",
+                    self.topology, p.compute, p.mesh, p.name
+                )),
             }
             return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        if rects {
+            once!(
+                max,
+                stride,
+                rect_limit,
+                vb0_size = self.vertex[0].size,
+                vb0_stride = self.vertex[0].stride,
+                "indirect rectangle draw expanded"
+            );
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
@@ -1151,17 +1317,20 @@ impl State {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
-                &args.buffer,
-                args.offset(arguments),
+                &exec_args.0,
+                exec_args.1,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &exec_args.0);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            list.note_compute_op();
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_graphics_op();
+            crate::host::mark_scene_drawn(&self.targets);
         }
         true
     }
