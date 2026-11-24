@@ -109,13 +109,17 @@ impl Shader {
             .get_or_init(|| {
                 let done = translate(&self.container);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            "shader translated"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        self.dump_matched();
+                    }
                     Err(e) => {
                         tracing::warn!(
                             stage = self.stage,
@@ -220,16 +224,10 @@ impl Shader {
     /// When `VICTORY_DUMP_FAILED_SHADERS` is set, write the console
     /// container once to `<dir>/{kind}_{stage}_{hash}.bin`.
     pub(crate) fn dump_diag(&self, kind: &str) {
-        use std::path::PathBuf;
-        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
-        let Some(dir) = DIR.get_or_init(|| {
-            let path = std::env::var_os("VICTORY_DUMP_FAILED_SHADERS")?;
-            let dir = PathBuf::from(path);
-            let _ = std::fs::create_dir_all(&dir);
-            Some(dir)
-        }) else {
+        let Some(dir) = dump_failed_dir() else {
             return;
         };
+        self.dump_matched_into(dir);
         let path = dir.join(format!("{kind}_{}_{}.bin", self.stage, self.hash));
         if path.exists() {
             return;
@@ -238,6 +236,67 @@ impl Shader {
             tracing::warn!(error = %e, path = %path.display(), "failed shader dump");
         }
     }
+
+    /// Dump this container when its hash is listed in `VICTORY_DUMP_SHADER_HASH`.
+    pub(crate) fn dump_matched(&self) {
+        let Some(dir) = dump_failed_dir() else {
+            return;
+        };
+        self.dump_matched_into(dir);
+    }
+
+    fn dump_matched_into(&self, dir: &std::path::Path) {
+        if !matched_shader_hash(&self.hash) {
+            return;
+        }
+        let path = dir.join(format!("matched_{}_{}.bin", self.stage, self.hash));
+        if path.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, &self.container) {
+            tracing::warn!(error = %e, path = %path.display(), "matched shader dump");
+        }
+    }
+}
+
+/// Folder from `VICTORY_DUMP_FAILED_SHADERS`, created on first use.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn dump_failed_dir() -> Option<&'static std::path::PathBuf> {
+    use std::path::PathBuf;
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_DUMP_FAILED_SHADERS")?;
+        let dir = PathBuf::from(path);
+        let _ = std::fs::create_dir_all(&dir);
+        Some(dir)
+    })
+    .as_ref()
+}
+
+/// Whether `hash` is listed in `VICTORY_DUMP_SHADER_HASH`.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn matched_shader_hash(hash: &str) -> bool {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    let hashes = HASHES.get_or_init(|| {
+        let value = std::env::var("VICTORY_DUMP_SHADER_HASH").unwrap_or_default();
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .filter_map(|h| {
+                if h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    Some(h.to_ascii_lowercase())
+                } else {
+                    tracing::warn!(
+                        hash = h,
+                        "VICTORY_DUMP_SHADER_HASH expects 16-digit hex hashes"
+                    );
+                    None
+                }
+            })
+            .collect()
+    });
+    !hashes.is_empty() && hashes.iter().any(|h| h == hash)
 }
 
 #[cfg(windows)]
@@ -363,6 +422,25 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+/// Compact `cs:hash` / `ps:hash+vs:hash` label for writer tracing.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shader_hashes(this: This) -> Option<String> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    if p.shaders.is_empty() {
+        return None;
+    }
+    Some(
+        p.shaders
+            .iter()
+            .map(|s| format!("{}:{}", s.stage, s.hash))
+            .collect::<Vec<_>>()
+            .join("+"),
+    )
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped

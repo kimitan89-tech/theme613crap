@@ -1,6 +1,7 @@
 //! Synthetic shaders that exercise lowering without a game or a GPU.
 
 use super::lower::{Lowered, Parts, lower};
+use super::translate;
 use crate::native::{
     ComputeIo, HwStage, MeshIo, NativeProgram, ResourceType, RootParam, RootType, StageIo,
     UsedResource,
@@ -1701,6 +1702,34 @@ mod lds_wave_device {
         }
     }
 
+}
+
+#[test]
+fn dumped_global_atomic_shader_translates() {
+    // Top failed_compute hit: root VA via readfirstlane + global_atomic_*
+    // (including fmin/fmax via float-order umin/umax) and glc into dst.
+    let path = r"D:\gta6\failed_shaders\failed_compute_f6e47efa50226beb.bin";
+    let Ok(bytes) = std::fs::read(path) else {
+        return;
+    };
+    translate(&bytes).expect("global_atomic root-address shader should translate");
+}
+
+#[test]
+fn wave64_without_cross32_ops_uses_wave32() {
+    // Console wave64 with LDS but no cross-half ops must not force WaveSize(64)
+    // on Wave32 hosts — remapped WaveSize(32) matches bit for bit.
+    let words = [
+        0xbe82_0384u32, // s_mov_b32 s2, 4
+        WRITE[0],
+        WRITE[1],
+        0x8082_8102, // s_add_i32 s2, s2, -1
+        0xbf06_8002, // s_cmp_eq_u32 s2, 0
+        0xbf84_fffb, // s_cbranch_scc0 (scalar-uniform loop)
+        END,
+    ];
+    let (lo, hi) = wave(&shader(&words, compute([4, 64, 1])));
+    assert_ne!((lo, hi), (64, 64), "zero cross-32-op shader must not force WaveSize(64)");
 }
 
 #[test]

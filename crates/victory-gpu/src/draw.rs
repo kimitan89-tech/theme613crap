@@ -89,6 +89,10 @@ impl Drop for State {
     }
 }
 
+/// UAV resources bound during the latest [`State::bind`] (diagnostics).
+#[cfg(feature = "diagnostics")]
+static PENDING_UAVS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 /// Draws recorded on the host GPU since the last frame line.
 static DRAWN: AtomicU64 = AtomicU64::new(0);
 
@@ -486,6 +490,11 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        PENDING_UAVS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -658,12 +667,15 @@ impl State {
             once!("compute skipped while PresentX scene overlay is active");
             list.note_compute_op();
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.note_watched_writers(false);
             return;
         }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.note_watched_writers(false);
             return;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -673,7 +685,10 @@ impl State {
             );
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            crate::pipeline::note_drop(self.pipeline as This);
+            {
+                crate::pipeline::note_drop(self.pipeline as This);
+                self.note_watched_writers(false);
+            }
             return;
         };
         if !p.compute {
@@ -682,14 +697,31 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            self.note_watched_writers(false);
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        {
+            list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+            self.note_watched_writers(true);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         list.note_compute_op();
+    }
+
+    /// Record this pipeline against watched 1280×720 f10/f27/f28 targets.
+    #[cfg(feature = "diagnostics")]
+    fn note_watched_writers(&self, executed: bool) {
+        for &resource in &self.targets {
+            crate::capture::note_writer(resource as This, self.pipeline as This, executed);
+        }
+        let uavs = std::mem::take(&mut *PENDING_UAVS.lock().unwrap_or_else(|e| e.into_inner()));
+        for resource in uavs {
+            crate::capture::note_writer(resource as This, self.pipeline as This, executed);
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1101,7 +1133,10 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
-            list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            {
+                list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+                self.note_watched_writers(true);
+            }
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -1114,7 +1149,10 @@ impl State {
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
-            dropped(self.pipeline);
+            {
+                dropped(self.pipeline);
+                self.note_watched_writers(false);
+            }
         }
     }
 
@@ -1535,7 +1573,13 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
-            crate::capture::note_target(*resource as This);
+            {
+                crate::capture::note_target(*resource as This);
+                PENDING_UAVS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(*resource);
+            }
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}

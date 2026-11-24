@@ -238,3 +238,4 @@ fn varying_values(p: &Program, order: &[usize], uniform_control: bool) -> HashSe
         }
     }
 }
+

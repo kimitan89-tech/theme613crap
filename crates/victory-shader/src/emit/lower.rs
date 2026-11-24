@@ -631,36 +631,13 @@ impl<'a> Lower<'a> {
             } else {
                 32
             };
-            // Cross-32: anything that needs a console lane id in 0..63 or a
-            // value from the other half. DPP / ds_swizzle alone stay intra-32.
+            // Cross-32: ops that need a value or mask bit from the other
+            // 32-lane half (mbcnt / readlane / permute / mask-as-data). DPP
+            // and constant lane-bit tests stay intra-32 under WaveSize(32)
+            // with console lane remapping — they must not force WaveSize(64).
             let cross32 = console_lanes
                 && x.native.wave64
-                && (insts().any(|i| cross32_wave_op(x.st, x.res, i)) || {
-                    let whens = x.st.exits.iter().filter_map(|e| match *e {
-                        LaneExit::Branch { when, .. } => Some(when),
-                        _ => None,
-                    });
-                    let selectors =
-                        insts().filter_map(|i| x.st.valu_mask(i, valu_mask_operand(i)?));
-                    let mut all: Vec<Bool> = x
-                        .st
-                        .guards
-                        .iter()
-                        .flatten()
-                        .flatten()
-                        .copied()
-                        .chain(whens)
-                        .chain(selectors)
-                        .collect();
-                    all.sort_unstable();
-                    all.dedup();
-                    all.into_iter().any(|g| {
-                        x.st.bools
-                            .support(g)
-                            .iter()
-                            .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
-                    })
-                });
+                && insts().any(|i| cross32_wave_op(x.st, x.res, i));
             let divergent_s_barrier = analysis
                 .as_ref()
                 .is_some_and(|a| super::lds::has_divergent_s_barrier(p, x.st, a));
@@ -898,6 +875,9 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if let Some(op) = name.strip_prefix("global_atomic_") {
+            return self.global_atomic(inst, b, i, op, data);
+        }
         let store = name.starts_with("global_store_");
         let rest = name
             .strip_prefix("global_load_")
@@ -1023,6 +1003,138 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
+    }
+
+    /// `global_atomic_*` on a tracked root address (raw buffer UAV).
+    fn global_atomic(
+        &mut self,
+        inst: &Inst,
+        b: usize,
+        i: usize,
+        op: &str,
+        data: &Option<Operand>,
+    ) -> Result<(), Why> {
+        // DXIL has no float min/max atomics: map fmin/fmax through the
+        // total-order bit transform, then umin/umax on the raw buffer.
+        let float_order = matches!(op, "fmin" | "fmax");
+        let mut code = match op {
+            "add" | "sub" => 0u32,
+            "and" => 1,
+            "or" => 2,
+            "xor" => 3,
+            "smin" => 4,
+            "smax" => 5,
+            "umin" | "fmin" => 6,
+            "umax" | "fmax" => 7,
+            "swap" => 8,
+            "cmpswap" => u32::MAX,
+            _ => return Err(inst.name()),
+        };
+        let a = *self
+            .scalar
+            .get(&(b, i))
+            .ok_or("an untracked global address")?;
+        if a.param == CODE {
+            return Err("an atomic on the code table");
+        }
+        let Fields::Flat { dst, cache, .. } = &inst.fields else {
+            unreachable!()
+        };
+        let guard = self.guard(b, i)?;
+        let c = self.cur;
+        let mut off = self.s.m.i32(a.offset);
+        if let Some(d) = a.dynamic {
+            let d = self.i32_of(d)?;
+            off = self.s.m.bin(c, Bin::Add, off, d);
+        }
+        let src = Source::Built {
+            address: a,
+            bits: 0,
+            words: [0, 0],
+        };
+        let h = self.handle((b, i), &src, false, (11 | 0x1000, 0))?;
+        let Some(d) = data.as_ref() else {
+            return Err("a global atomic value");
+        };
+        let n = if code == u32::MAX { 2 } else { 1 };
+        let vals = self.vgprs(inst, d, n)?;
+        let mut value = vals[0];
+        if op == "sub" {
+            let z = self.s.m.i32(0);
+            value = self.s.m.bin(c, Bin::Sub, z, value);
+            code = 0;
+        }
+        if float_order {
+            value = self.float_atomic_order(c, value);
+        }
+        // Flat atomics write the old value to `dst` (often the address lo
+        // VGPR), not to `data`. Buffer atomics reuse the data operand.
+        let returns = cache.glc;
+        let dst_reg = match dst {
+            Some(Operand::Vector { reg, .. }) if returns => Some(*reg),
+            _ if returns => return Err("a global atomic result"),
+            _ => None,
+        };
+        let old = match dst_reg.and_then(|reg| inst.read(Reg::V(reg))) {
+            Some(v) => self.i32_of(v).unwrap_or_else(|_| self.s.m.i32(0)),
+            None => self.s.m.i32(0),
+        };
+        let at = self.begin_guarded(guard);
+        let i32t = self.s.t.i32;
+        let u = self.s.m.undef(i32t);
+        let coords = [off, u, u];
+        let r = if code == u32::MAX {
+            let mut args = vec![h];
+            args.extend(coords);
+            args.extend([vals[1], vals[0]]);
+            self.s.op(
+                self.cur,
+                "atomicCompareExchange.i32",
+                Attr::NoUnwind,
+                i32t,
+                79,
+                &args,
+            )
+        } else {
+            let mut args = vec![h, self.s.m.i32(code)];
+            args.extend(coords);
+            args.push(value);
+            self.s
+                .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+        };
+        let mut r = self.end_guarded(at, &[(r, old)])[0];
+        if float_order {
+            r = self.float_atomic_unorder(self.cur, r);
+        }
+        if let Some(reg) = dst_reg {
+            self.write(inst, Reg::V(reg), r, None);
+        }
+        Ok(())
+    }
+
+    /// Map a float bit pattern to a uint total order so umin/umax match
+    /// fmin/fmax (negatives sort below positives; NaN stays at the extremes).
+    fn float_atomic_order(&mut self, at: usize, bits: V) -> V {
+        let sign = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let all = self.s.m.i32(u32::MAX);
+        let neg = self.s.m.cmp(at, pred::SLT, bits, zero);
+        let flipped = self.s.m.bin(at, Bin::Xor, bits, all);
+        let positive = self.s.m.bin(at, Bin::Or, bits, sign);
+        self.s.m.select(at, neg, flipped, positive)
+    }
+
+    /// Inverse of [`Self::float_atomic_order`].
+    fn float_atomic_unorder(&mut self, at: usize, ordered: V) -> V {
+        let sign = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let all = self.s.m.i32(u32::MAX);
+        // After ordering, positives have the sign bit set (ordered < 0 as
+        // i32); negatives do not.
+        let was_pos = self.s.m.cmp(at, pred::SLT, ordered, zero);
+        let from_pos = self.s.m.bin(at, Bin::Xor, ordered, sign);
+        let from_neg = self.s.m.bin(at, Bin::Xor, ordered, all);
+        self.s.m.select(at, was_pos, from_pos, from_neg)
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -1366,6 +1478,9 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
+            // Loaded on first use: barycentric VGPRs also drive interp mode
+            // via `SPI_PS_INPUT_ADDR`, and declaring `SV_Barycentrics` for
+            // unused ones fails validation on sample-frequency-only shaders.
             Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
@@ -1519,6 +1634,11 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            Some(&Val::Missing("barycentrics read directly")) => {
+                let val = self.lower_barycentric_input(v)?;
+                self.vals.insert(v, val);
+                return Ok(val);
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -1529,6 +1649,53 @@ impl<'a> Lower<'a> {
             return Ok(val);
         }
         Err("a value defined after its use")
+    }
+
+    /// SM 6.1 `SV_Barycentrics`: console VGPRs hold i (index 0) and j (index 1).
+    fn lower_barycentric_input(&mut self, v: Value) -> Result<Val, Why> {
+        let Some(&Input::Barycentric { kind, index }) =
+            self.x.io.inputs.iter().find(|&&(val, _)| val == v).map(|(_, i)| i)
+        else {
+            return Err("barycentrics read directly");
+        };
+        let (sem_index, interp) = match kind {
+            Barycentric::PerspectiveSample => (0u32, 6u8),
+            Barycentric::PerspectiveCenter => (0, 2),
+            Barycentric::PerspectiveCentroid => (0, 3),
+            Barycentric::PerspectivePullModel => return Err("pull-model barycentrics"),
+            Barycentric::LinearSample => (1, 7),
+            Barycentric::LinearCenter => (1, 4),
+            Barycentric::LinearCentroid => (1, 5),
+        };
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && e.index == sem_index)
+        {
+            Some(id) => id,
+            None => {
+                // NotPacked: no signature packing location.
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: sem_index,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.flags |= flags::BARYCENTRICS;
+                self.s.inputs.len() - 1
+            }
+        };
+        if index > 2 {
+            return Err("a barycentric component");
+        }
+        Ok(self.load_input(id, index))
     }
 
     fn i32_of(&mut self, v: Value) -> Result<V, Why> {

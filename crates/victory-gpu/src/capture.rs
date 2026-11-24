@@ -258,10 +258,80 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// Watched scene-color / presentable formats for writer tracing (1280×720).
+fn watched_target(width: u64, height: u32, format: u32) -> bool {
+    width == 1280
+        && height == 720
+        && matches!(format, 10 | 27 | 28) // R16G16B16A16_FLOAT, R8G8B8A8_* 
+}
+
+/// Per watched target: executed vs dropped pipeline writers this capture frame.
+#[cfg(feature = "diagnostics")]
+type WriterMap = std::collections::HashMap<(usize, u32, u32, u32), WriterCounts>;
+
+#[cfg(feature = "diagnostics")]
+fn writers() -> &'static std::sync::Mutex<WriterMap> {
+    static WRITERS: std::sync::OnceLock<std::sync::Mutex<WriterMap>> = std::sync::OnceLock::new();
+    WRITERS.get_or_init(|| std::sync::Mutex::new(WriterMap::new()))
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct WriterCounts {
+    executed: std::collections::HashMap<String, u64>,
+    dropped: std::collections::HashMap<String, u64>,
+}
+
+/// Record that `pipeline` drew/dispatched (or was dropped) while targeting a
+/// watched 1280×720 f10/f27/f28 resource.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_writer(
+    resource: crate::object::This,
+    pipeline: crate::object::This,
+    executed: bool,
+) {
+    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+        return;
+    }
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return;
+    };
+    // SAFETY: live host texture.
+    let d = unsafe { texture.GetDesc() };
+    if !watched_target(d.Width, d.Height, d.Format.0 as u32) {
+        return;
+    }
+    let label = pipeline_writer_label(pipeline);
+    let key = (
+        resource as usize,
+        d.Width as u32,
+        d.Height,
+        d.Format.0 as u32,
+    );
+    let mut writers = writers().lock().unwrap_or_else(|e| e.into_inner());
+    let entry = writers.entry(key).or_default();
+    let map = if executed {
+        &mut entry.executed
+    } else {
+        &mut entry.dropped
+    };
+    *map.entry(label).or_default() += 1;
+}
+
+#[cfg(feature = "diagnostics")]
+fn pipeline_writer_label(pipeline: crate::object::This) -> String {
+    if pipeline.is_null() {
+        return "no-pipeline".into();
+    }
+    crate::pipeline::shader_hashes(pipeline).unwrap_or_else(|| format!("{pipeline:?}"))
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    #[cfg(feature = "diagnostics")]
+    let writers = std::mem::take(&mut *writers().lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
         let texture = &copy.texture;
@@ -273,7 +343,50 @@ pub(crate) fn dump_targets(frame: u64) {
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
         dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        #[cfg(feature = "diagnostics")]
+        if watched_target(d.Width, d.Height, d.Format.0 as u32) {
+            let key = (
+                *resource,
+                d.Width as u32,
+                d.Height,
+                d.Format.0 as u32,
+            );
+            if let Some(counts) = writers.get(&key) {
+                log_writer_summary(*resource, &d, counts);
+            } else {
+                tracing::info!(
+                    frame,
+                    resource = format_args!("{resource:#x}"),
+                    width = d.Width,
+                    height = d.Height,
+                    format = d.Format.0,
+                    "watched target had no recorded pipeline writers"
+                );
+            }
+        }
     }
+}
+
+#[cfg(feature = "diagnostics")]
+fn log_writer_summary(resource: usize, d: &D3D12_RESOURCE_DESC, counts: &WriterCounts) {
+    let top = |map: &std::collections::HashMap<String, u64>| {
+        let mut v: Vec<_> = map.iter().map(|(k, n)| (k.as_str(), *n)).collect();
+        v.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        v.into_iter()
+            .take(8)
+            .map(|(k, n)| format!("{k}×{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    tracing::info!(
+        resource = format_args!("{resource:#x}"),
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        executed = %top(&counts.executed),
+        dropped = %top(&counts.dropped),
+        "watched target writers"
+    );
 }
 
 fn dump_one(

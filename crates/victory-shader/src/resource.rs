@@ -621,6 +621,25 @@ impl<'a> Tracer<'a> {
             }
             Term::Value(v) => v,
         };
+        // Uniformized addresses: `v_readfirstlane_b32` of a VGPR that holds
+        // root+offset (often after `v_add_co_u32`) is still that address.
+        // Pure dynamic offsets keep the readfirstlane value so waterfall
+        // offset tracking still sees `first_lane_source`.
+        if let Some(src) = self.first_lane_source(v) {
+            let s = self.sum(self.vorigin(src));
+            return match s {
+                Sum {
+                    base: None,
+                    offset,
+                    dynamic: Some(_),
+                } => Sum {
+                    base: None,
+                    offset,
+                    dynamic: Some(v),
+                },
+                other => other,
+            };
+        }
         let dynamic = Sum {
             base: None,
             offset: 0,
@@ -873,6 +892,18 @@ impl<'a> Tracer<'a> {
         found
     }
 
+    /// Unwrap `v_readfirstlane_b32` (and VGPR moves) so high-half checks see
+    /// the same VALU / SOP chain the low half's [`Self::sum`] followed.
+    fn through_first_lane(&self, t: Term) -> Term {
+        let Term::Value(v) = t else {
+            return t;
+        };
+        if let Some(src) = self.first_lane_source(v) {
+            return self.through_first_lane(self.vorigin(src));
+        }
+        t
+    }
+
     /// Finish [`Self::address`] once `sum` has named the root `base`.
     fn address_from_base(
         &self,
@@ -881,6 +912,7 @@ impl<'a> Tracer<'a> {
         s: Sum,
     ) -> Option<Address> {
         let dynamic = s.dynamic;
+        let hi = self.through_first_lane(hi);
         if self.spill
             && self.inputs[base.0 as usize] == Some(Reg::S(self.stage.user_sgpr(0)))
             && self.spill_high(hi)
@@ -2223,6 +2255,27 @@ pub(crate) mod tests {
             dword: 0,
             shift: 0,
         }
+    }
+
+    #[test]
+    fn address_through_readfirstlane_of_root() {
+        // Root Constants moved into VGPRs, uniformized, then s_load.
+        let layout = [param(Constants, 0, 2)];
+        let words = [
+            0x7E00_0200u32, // v_mov_b32 v0, s0
+            0x7E02_0201,    // v_mov_b32 v1, s1
+            0x7E04_0500,    // v_readfirstlane_b32 s2, v0
+            0x7E06_0501,    // v_readfirstlane_b32 s3, v1
+            0xF408_0001,
+            0xFA00_0000, // s_load_dwordx4 s[0:3], s[2:3], null
+            S_ENDPGM,
+        ];
+        let r = track_words(&words, &layout, HwStage::Cs);
+        assert!(
+            r.scalar.iter().any(|(_, a)| a.param == 0),
+            "readfirstlane of a root address should track: {:?}",
+            r.scalar
+        );
     }
 
     #[test]
