@@ -101,7 +101,17 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{CONST_VIEW_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+
+/// A root-constant dword (or shifted dword) that holds a GPU virtual
+/// address the shader uses as a raw buffer view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConstView {
+    pub slot: u8,
+    pub dword: u16,
+    pub shift: u8,
+    pub uav: bool,
+}
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -163,6 +173,9 @@ pub struct HostShader {
     /// Root UAVs (raw/structured buffers) the shader writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// Views rebuilt from GPU addresses stored in root constants, bound in
+    /// [`CONST_VIEW_SPACE`] at sequential registers.
+    pub const_views: Vec<ConstView>,
 }
 
 impl HostShader {
@@ -316,6 +329,7 @@ pub fn emit(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        const_views: l.const_views,
     })
 }
 
@@ -574,6 +588,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            const_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -585,6 +600,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                const_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

@@ -31,6 +31,11 @@ pub struct Address {
     /// descriptor's address).
     pub offset: u32,
     pub dynamic: Option<Value>,
+    /// Dword within a [`RootType::Constants`] parameter holding a GPU
+    /// virtual address (0 for every other kind of address).
+    pub dword: u16,
+    /// Left shift applied to a 32-bit Constants address (0 or 8).
+    pub shift: u8,
 }
 
 /// [`Address::param`] of the program's own code: a constant table the
@@ -571,12 +576,21 @@ impl<'a> Tracer<'a> {
             offset: 0,
             dynamic: Some(v),
         };
-        if let Some((_, 0)) = self.value_param(v) {
-            return Sum {
-                base: Some(v),
-                offset: 0,
-                dynamic: None,
-            };
+        if let Some((param, dword)) = self.value_param(v) {
+            // Descriptor/table bases are dword 0; a Constants GPU address may
+            // sit at any dword of the parameter.
+            let constants = self
+                .layout
+                .get(param)
+                .is_some_and(|rp| rp.root == RootType::Constants);
+            if dword == 0 || constants {
+                return Sum {
+                    base: Some(v),
+                    offset: 0,
+                    dynamic: None,
+                };
+            }
+            return dynamic;
         }
         if self.spill
             && self.inputs[v.0 as usize] == Some(Reg::S(self.stage.user_sgpr(0)))
@@ -717,6 +731,9 @@ impl<'a> Tracer<'a> {
     /// The address `lo` and `hi` hold, plus `extra` (an instruction's
     /// immediate and offset register).
     fn address(&self, lo: Term, hi: Term, extra: Sum) -> Result<Address, &'static str> {
+        if let Some(a) = self.constants_shifted_address(lo, hi, &extra) {
+            return Ok(a);
+        }
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
@@ -730,6 +747,8 @@ impl<'a> Tracer<'a> {
                 param: SPILL,
                 offset: s.offset.wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dword: 0,
+                shift: 0,
             });
         }
         if let Some(pc) = self.getpc(base) {
@@ -744,15 +763,35 @@ impl<'a> Tracer<'a> {
                     .wrapping_add(s.offset)
                     .wrapping_add(extra.offset),
                 dynamic: s.dynamic.or(extra.dynamic),
+                dword: 0,
+                shift: 0,
             });
         }
-        let (param, _) = self
+        let (param, dword) = self
             .value_param(base)
             .or_else(|| {
                 let reg = self.inputs[base.0 as usize]?;
                 self.param_of(reg)
             })
             .ok_or("an address not from a root parameter")?;
+        let dynamic = s.dynamic.or(extra.dynamic);
+        if self.layout[param].root == RootType::Constants {
+            let high = self
+                .param_dword(param, dword + 1)
+                .ok_or("a Constants address without its high half")?;
+            if !self.high_half(hi, Some(high))
+                && !(dynamic.is_some() && self.carried(hi, high))
+            {
+                return Err("an address with an untracked high half");
+            }
+            return Ok(Address {
+                param,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic,
+                dword: dword as u16,
+                shift: 0,
+            });
+        }
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
             RootType::Descriptor => Some(
@@ -763,7 +802,6 @@ impl<'a> Tracer<'a> {
         };
         // shortcut: with a computed term, a high half that adds anything to the
         // base's is taken as the carry of that term (offsets below 4 GB).
-        let dynamic = s.dynamic.or(extra.dynamic);
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
@@ -772,8 +810,93 @@ impl<'a> Tracer<'a> {
         Ok(Address {
             param,
             offset: s.offset.wrapping_add(extra.offset),
-            dynamic: s.dynamic.or(extra.dynamic),
+            dynamic,
+            dword: 0,
+            shift: 0,
         })
+    }
+
+    /// Value holding layout parameter `param` dword `dword`.
+    fn param_dword(&self, param: usize, dword: u32) -> Option<Value> {
+        self.params.iter().enumerate().find_map(|(i, p)| {
+            matches!(p, Some((p, d)) if *p == param && *d == dword).then_some(Value(i as u32))
+        })
+    }
+
+    /// `s_lshl_b64 [lo:hi], [src:0], 8` of a Constants dword, optionally
+    /// `s_or_b32 lo, lo, imm` (`imm < 256`) and/or a constant `s_add_u32`.
+    fn constants_shifted_address(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: &Sum,
+    ) -> Option<Address> {
+        let Term::Value(mut lo_v) = lo else {
+            return None;
+        };
+        let mut add_imm = 0u32;
+        // Peel trailing constant `s_or_b32` / `s_add_u32` (or is +imm when
+        // bits 0..7 are clear after the << 8).
+        for _ in 0..4 {
+            if let Some((_, [a, b])) = self.sop2(lo_v, &["s_or_b32", "s_add_u32", "s_add_i32"])
+            {
+                let (src, imm) = match (a, b) {
+                    (Term::Value(v), Term::Const(c)) => (v, c),
+                    (Term::Const(c), Term::Value(v)) => (v, c),
+                    _ => break,
+                };
+                add_imm = add_imm.wrapping_add(imm);
+                lo_v = src;
+                continue;
+            }
+            break;
+        }
+        let (param, dword, l_hi) = self.lshl8_constants(lo_v)?;
+        let dynamic = extra.dynamic;
+        if !self.high_half(hi, Some(l_hi)) && !(dynamic.is_some() && self.carried(hi, l_hi)) {
+            return None;
+        }
+        Some(Address {
+            param,
+            offset: add_imm.wrapping_add(extra.offset),
+            dynamic,
+            dword: dword as u16,
+            shift: 8,
+        })
+    }
+
+    /// `lo` is the low result of `s_lshl_b64` by 8 of Constants dword `d`.
+    fn lshl8_constants(&self, lo: Value) -> Option<(usize, u32, Value)> {
+        let inst = self.def(lo)?;
+        if inst.name() != "s_lshl_b64" || inst.writes.first()?.1 != lo {
+            return None;
+        }
+        let Fields::Sop { src, .. } = &inst.fields else {
+            return None;
+        };
+        // Shift amount must be 8.
+        let shift = self.term(inst, src.get(1)?)?;
+        if shift != Term::Const(8) {
+            return None;
+        }
+        // Low source: a Constants dword; high source: constant 0.
+        let Operand::Scalar { code, .. } = *src.first()? else {
+            return None;
+        };
+        let src_lo = self.origin(inst.read(Reg::S(code))?);
+        let src_hi = self.origin(inst.read(Reg::S(code + 1))?);
+        if src_hi != Term::Const(0) {
+            return None;
+        }
+        let Term::Value(v) = src_lo else {
+            return None;
+        };
+        let (param, dword) = self.value_param(v)?;
+        if self.layout.get(param)?.root != RootType::Constants {
+            return None;
+        }
+        let l_hi = inst.writes.get(1)?.1;
+        Some((param, dword, l_hi))
     }
 
     /// High dword of root descriptor `param`: an entry input or a spill load.
@@ -1921,6 +2044,8 @@ pub(crate) mod tests {
             param,
             offset,
             dynamic: None,
+            dword: 0,
+            shift: 0,
         }
     }
 
@@ -3287,7 +3412,8 @@ pub(crate) mod tests {
                     address: Address {
                         param: 1,
                         offset: 0,
-                        dynamic: None
+                        dynamic: None,
+                        ..
                     },
                     ..
                 }

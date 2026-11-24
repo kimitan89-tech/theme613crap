@@ -136,6 +136,56 @@ pub(crate) fn dispatched() -> u64 {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
+/// A tiny zeroed default buffer used when a Constants GPU address is null
+/// or not in shadowed memory, so the root parameter stays valid.
+fn null_const_view() -> u64 {
+    use std::sync::OnceLock;
+    use windows::Win32::Graphics::Direct3D12::*;
+    static BUF: OnceLock<Option<(ID3D12Resource, u64)>> = OnceLock::new();
+    BUF.get_or_init(|| {
+        let host = crate::host::host()?;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let mut res: Option<ID3D12Resource> = None;
+        // SAFETY: a live device; the resource is retained for the process.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut res,
+                )
+                .ok()?;
+        }
+        let r = res?;
+        // SAFETY: a live committed buffer.
+        let gpu = unsafe { r.GetGPUVirtualAddress() };
+        Some((r, gpu))
+    })
+    .as_ref()
+    .map(|(_, gpu)| *gpu)
+    .unwrap_or(0)
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
@@ -553,6 +603,46 @@ impl State {
                     }
                 }
                 shadow.gpu_writes(list, *address, len);
+            }
+            for &(cv, param) in &stage.const_views {
+                let addr = match self.roots_ref(compute).get(usize::from(cv.slot)) {
+                    Some(Root::Constants(words)) => {
+                        let d = cv.dword as usize;
+                        if cv.shift == 0 {
+                            let lo = words.get(d).copied().unwrap_or(0);
+                            let hi = words.get(d + 1).copied().unwrap_or(0);
+                            u64::from(lo) | (u64::from(hi) << 32)
+                        } else {
+                            u64::from(words.get(d).copied().unwrap_or(0)) << cv.shift
+                        }
+                    }
+                    _ => 0,
+                };
+                let gpu = if addr != 0 {
+                    if let Some(shadow) = crate::shadow::find(addr, 1) {
+                        let len = shadow.left(addr).min(1 << 20);
+                        shadow.refresh(list, addr, len);
+                        let gpu = shadow.gpu(addr);
+                        if cv.uav {
+                            shadow.gpu_writes(list, addr, len);
+                        }
+                        Some(gpu)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let gpu = gpu.unwrap_or_else(null_const_view);
+                // SAFETY: an open list; the address is a live buffer.
+                unsafe {
+                    match (compute, cv.uav) {
+                        (true, false) => l.SetComputeRootShaderResourceView(param, gpu),
+                        (true, true) => l.SetComputeRootUnorderedAccessView(param, gpu),
+                        (false, false) => l.SetGraphicsRootShaderResourceView(param, gpu),
+                        (false, true) => l.SetGraphicsRootUnorderedAccessView(param, gpu),
+                    }
+                }
             }
         }
         true

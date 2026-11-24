@@ -2,6 +2,7 @@
 //! the `dx.op` declarations it calls, its signatures and bound resources,
 //! and the metadata and container that wrap it up (SM 6.6, validator 1.6).
 
+use super::ConstView;
 use super::bitcode::{Attr, Md, Module, Ty, V};
 use super::container::{self, Binding, Psv, SigElement};
 
@@ -12,6 +13,9 @@ pub const SAMPLER_SPACE: u32 = 0;
 /// Where root CBVs and SRVs are bound: `b<root parameter index>` and
 /// `t<root parameter index>` in this space.
 pub const ROOT_CBV_SPACE: u32 = 1;
+/// Where views rebuilt from GPU addresses stored in root constants are
+/// bound: sequential `t`/`u` registers in this space.
+pub const CONST_VIEW_SPACE: u32 = 2;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -67,6 +71,8 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw/structured byte-address buffers) written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Views from root-constant GPU addresses: (view, register, handle).
+    pub const_views: Vec<(ConstView, u32, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -123,6 +129,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            const_views: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -236,6 +243,42 @@ impl Shader {
         let h = self.annotate(block, h, 11, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_srvs.push((slot, h));
+        h
+    }
+
+    /// A raw buffer view rebuilt from a GPU address stored in root constants.
+    pub fn const_view_handle(&mut self, view: ConstView, structured_stride: u32) -> V {
+        if let Some(&(_, _, h)) = self.const_views.iter().find(|(v, _, _)| *v == view) {
+            return h;
+        }
+        let reg = self.const_views.len() as u32;
+        let r = self.m.i32(reg);
+        let class = if view.uav { 1u8 } else { 0 };
+        let bind = [r, r, self.m.i32(CONST_VIEW_SPACE), self.m.i8(class)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, r, f],
+        );
+        let (kind, stride) = if structured_stride != 0 {
+            (
+                if view.uav { 12 | 0x1000 } else { 12 },
+                structured_stride,
+            )
+        } else if view.uav {
+            (11 | 0x1000, 0)
+        } else {
+            (11, 0)
+        };
+        let h = self.annotate(block, h, kind, stride);
+        self.flags |= flags::RAW_BUFFERS;
+        self.const_views.push((view, reg, h));
         h
     }
 
@@ -353,6 +396,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || !self.const_views.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -407,7 +451,13 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
-            if !self.root_srvs.is_empty() {
+            let const_srvs: Vec<(ConstView, u32)> = self
+                .const_views
+                .iter()
+                .filter(|(v, _, _)| !v.uav)
+                .map(|(v, r, _)| (*v, *r))
+                .collect();
+            if !self.root_srvs.is_empty() || !const_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
@@ -434,10 +484,37 @@ impl Shader {
                         dxil_kind: 11,
                     });
                 }
+                let base = list.len() as u32;
+                for (n, (_, reg)) in const_srvs.into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, base + n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, CONST_VIEW_SPACE)),
+                        Some(i32c(&mut self, reg)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i32c(&mut self, 0)),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 4,
+                        space: CONST_VIEW_SPACE,
+                        register: reg,
+                        dxil_kind: 11,
+                    });
+                }
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            let const_uavs: Vec<(ConstView, u32)> = self
+                .const_views
+                .iter()
+                .filter(|(v, _, _)| v.uav)
+                .map(|(v, r, _)| (*v, *r))
+                .collect();
+            if !self.root_uavs.is_empty() || !const_uavs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.RWByteAddressBuffer", vec![self.t.i32]);
@@ -470,6 +547,29 @@ impl Shader {
                         space: ROOT_CBV_SPACE,
                         register: u32::from(slot),
                         dxil_kind: 11, // RawBuffer
+                    });
+                }
+                let base = list.len() as u32;
+                for (n, (_, reg)) in const_uavs.into_iter().enumerate() {
+                    let ops = vec![
+                        Some(i32c(&mut self, base + n as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, CONST_VIEW_SPACE)),
+                        Some(i32c(&mut self, reg)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(i1f),
+                        Some(i1f),
+                        Some(i1f),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: CONST_VIEW_SPACE,
+                        register: reg,
+                        dxil_kind: 11,
                     });
                 }
                 uavs = Some(self.m.md_node(list));

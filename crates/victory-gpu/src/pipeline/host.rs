@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    CONST_VIEW_SPACE, ConstView, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -252,6 +254,8 @@ pub(crate) struct Stage {
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Views from root-constant GPU addresses: (view, our root parameter).
+    pub(crate) const_views: Vec<(ConstView, u32)>,
 }
 
 impl Stage {
@@ -348,6 +352,7 @@ fn refused_compute_diag(cs: &Shader) {
         wave_ops = %wave_ops.join(", "),
         "refused compute diag"
     );
+    cs.dump_diag("refused");
 }
 
 impl HostPipeline {
@@ -402,6 +407,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                const_views: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -449,6 +455,24 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            for (n, &v) in t.const_views.iter().enumerate() {
+                stage.const_views.push((v, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: if v.uav {
+                        D3D12_ROOT_PARAMETER_TYPE_UAV
+                    } else {
+                        D3D12_ROOT_PARAMETER_TYPE_SRV
+                    },
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n as u32,
+                            RegisterSpace: CONST_VIEW_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {

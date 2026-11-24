@@ -482,6 +482,7 @@ fn non_active_mask_read_as_data_on_device() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        const_views: lowered.const_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -685,6 +686,7 @@ fn spill_table_root_uav_store_on_device() {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs.clone(),
+        const_views: lowered.const_views,
     };
     assert_eq!(shader.root_uavs, vec![1]);
 
@@ -728,6 +730,154 @@ fn spill_table_root_uav_store_on_device() {
         )
         .expect("dispatch failed");
     assert_eq!(out[0][0], expected);
+}
+
+#[test]
+fn subdword_lds_read_write_lower() {
+    // ds_write_b16 v1, v2 offset:10; ds_read_u16 v0, v1 offset:10; ds_write_b8; ds_read_i8
+    let words = [
+        0xD87C_000A,
+        0x0000_0201, // ds_write_b16 v1, v2 offset:10
+        0xD8F0_000A,
+        0x0000_0001, // ds_read_u16 v0, v1 offset:10
+        0xD878_0004,
+        0x0000_0201, // ds_write_b8 v1, v2 offset:4
+        0xD8E4_0004,
+        0x0000_0001, // ds_read_i8 v0, v1 offset:4
+        0xD8E8_0004,
+        0x0000_0001, // ds_read_u8 v0, v1 offset:4
+        0xD8EC_000A,
+        0x0000_0001, // ds_read_i16 v0, v1 offset:10
+        S_ENDPGM,
+    ];
+    lower_words(&words, false, false, vec![], vec![])
+        .expect("sub-dword LDS read/write should lower");
+}
+
+#[test]
+fn subdword_buffer_load_lower() {
+    let (layout, used) = buffer_table(Some(0));
+    // Same skeleton as dword loads; MUBUF op 0x0a = ushort, 0x08 = ubyte.
+    let load = |op: u32| {
+        [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xE030_2000 ^ ((0x0Cu32 ^ op) << 18),
+            0x8002_0100, // buffer_load_* v1, off=0, s[8:11], 0
+            LDS_STORE_V1[0],
+            LDS_STORE_V1[1],
+            S_ENDPGM,
+        ]
+    };
+    for (name, op) in [("ushort", 0x0Au32), ("ubyte", 0x08), ("sshort", 0x0B), ("sbyte", 0x09)] {
+        lower_words(&load(op), false, false, layout.clone(), used.clone())
+            .unwrap_or_else(|e| panic!("buffer_load_{name} should lower: {e}"));
+    }
+}
+
+#[test]
+fn constants_gpu_address_64bit_and_shifted_track() {
+    use crate::resource::{self, Address};
+    // 64-bit pointer in Constants dword 0:1, then s_load_dword from it.
+    let r = {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0301,    // s_mov_b32 s3, s1
+            0xF400_0001,
+            0xFA00_0000, // s_load_dword s0, s[2:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = ir::build(&code, false, 16).unwrap();
+        let layout = [RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 4,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        resource::track(&p, &layout, HwStage::Cs, None).unwrap()
+    };
+    assert!(
+        r.scalar.iter().any(|(_, a)| {
+            *a == Address {
+                param: 0,
+                offset: 0,
+                dynamic: None,
+                dword: 0,
+                shift: 0,
+            }
+        }),
+        "expected 64-bit Constants address: {:?}",
+        r.scalar
+    );
+
+    // s_mov_b32 lo, c; s_mov_b32 hi, 0; s_lshl_b64 [lo:hi], [lo:hi], 8; s_or_b32 lo, lo, 12
+    // then s_load_dword from [lo:hi]
+    let r = {
+        let code: Vec<u8> = [
+            0xBE82_0300u32, // s_mov_b32 s2, s0
+            0xBE83_0380,    // s_mov_b32 s3, 0
+            0x8F82_FF02,
+            0x0000_0008, // s_lshl_b64 s[2:3], s[2:3], lit(8)
+            0x8802_8C02, // s_or_b32 s2, s2, 12 (inline 140=12)
+            0xF400_0001,
+            0xFA00_0000, // s_load_dword s0, s[2:3], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = ir::build(&code, false, 16).unwrap();
+        let layout = [RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }];
+        resource::track(&p, &layout, HwStage::Cs, None).unwrap()
+    };
+    assert!(
+        r.scalar.iter().any(|(_, a)| a.param == 0 && a.shift == 8 && a.dword == 0 && a.offset == 12),
+        "expected shifted Constants address: {:?}",
+        r.scalar
+    );
+}
+
+#[test]
+fn constants_gpu_address_lowers_const_view() {
+    let words = [
+        0xBE82_0300u32, // s_mov_b32 s2, s0
+        0xBE83_0301,    // s_mov_b32 s3, s1
+        0xF400_0201,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[2:3], null
+        0x7E02_0208, // v_mov_b32 v1, s8
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    let layout = vec![RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let lowered = lower_words(&words, false, false, layout, vec![])
+        .expect("Constants GPU address s_load should lower");
+    assert!(
+        !lowered.const_views.is_empty(),
+        "expected ConstView binding: {:?}",
+        lowered.const_views
+    );
 }
 
 #[test]

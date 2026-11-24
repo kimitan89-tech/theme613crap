@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use super::UserData;
+use super::{ConstView, UserData};
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
@@ -36,6 +36,7 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    pub const_views: Vec<ConstView>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -1015,12 +1016,14 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let const_views = self.s.const_views.iter().map(|(v, _, _)| *v).collect();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
+            const_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -2493,6 +2496,32 @@ impl<'a> Lower<'a> {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
+            } else if matches!(rest, "_u8" | "_i8" | "_u16" | "_i16") {
+                let reg = dst_reg.ok_or("an LDS read result")?;
+                let bits: u32 = if rest.ends_with('8') { 8 } else { 16 };
+                let signed = rest.starts_with("_i");
+                let c = self.cur;
+                let o = self.s.m.i32(offset);
+                let byte = self.s.m.bin(c, Bin::Add, a, o);
+                let two = self.s.m.i32(2);
+                let three = self.s.m.i32(3);
+                let index = self.s.m.bin(c, Bin::LShr, byte, two);
+                let lane = self.s.m.bin(c, Bin::And, byte, three);
+                let sh = self.s.m.bin(c, Bin::Shl, lane, three);
+                let lds = self.s.lds();
+                let p = self.s.m.element(c, lds, index);
+                let mut x = self.s.m.load(c, p);
+                x = self.s.m.bin(c, Bin::LShr, x, sh);
+                if signed {
+                    let left = self.s.m.i32(32 - bits);
+                    x = self.s.m.bin(c, Bin::Shl, x, left);
+                    x = self.s.m.bin(c, Bin::AShr, x, left);
+                } else {
+                    let mask = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
+                    x = self.s.m.bin(c, Bin::And, x, mask);
+                }
+                self.write(inst, Reg::V(reg), x, guard);
+                return Ok(());
             } else {
                 return Err("an LDS read of bytes or halves");
             };
@@ -2513,6 +2542,40 @@ impl<'a> Lower<'a> {
                 pair(name)
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
+            } else if matches!(
+                rest,
+                "_b8" | "_b16" | "_b8_d16_hi" | "_b16_d16_hi"
+            ) {
+                use super::bitcode::Rmw;
+                let hi = rest.contains("d16_hi");
+                let bits: u32 = if rest.contains("b8") { 8 } else { 16 };
+                let width_mask = if bits == 8 { 0xffu32 } else { 0xffff };
+                let mut val = self.vgprs(inst, data.first().ok_or("an LDS write")?, 1)?[0];
+                let c = self.cur;
+                if hi {
+                    let k16 = self.s.m.i32(16);
+                    val = self.s.m.bin(c, Bin::LShr, val, k16);
+                }
+                let o = self.s.m.i32(offset);
+                let byte = self.s.m.bin(c, Bin::Add, a, o);
+                let two = self.s.m.i32(2);
+                let three = self.s.m.i32(3);
+                let index = self.s.m.bin(c, Bin::LShr, byte, two);
+                let lane = self.s.m.bin(c, Bin::And, byte, three);
+                let sh = self.s.m.bin(c, Bin::Shl, lane, three);
+                let lds = self.s.lds();
+                let p = self.s.m.element(c, lds, index);
+                let mask = self.s.m.i32(width_mask);
+                let all = self.s.m.i32(u32::MAX);
+                let shifted = self.s.m.bin(c, Bin::Shl, mask, sh);
+                let clear = self.s.m.bin(c, Bin::Xor, shifted, all);
+                let bits = self.s.m.bin(c, Bin::And, val, mask);
+                let insert = self.s.m.bin(c, Bin::Shl, bits, sh);
+                let at = self.begin_guarded(guard);
+                self.s.m.atomic(self.cur, Rmw::And, p, clear);
+                self.s.m.atomic(self.cur, Rmw::Or, p, insert);
+                self.end_guarded(at, &[]);
+                return Ok(());
             } else {
                 return Err("an LDS write of bytes or halves");
             };
@@ -3169,12 +3232,9 @@ impl<'a> Lower<'a> {
         }
         if name.starts_with("s_load_dword")
             && let Some(a) = self.scalar.get(&site).copied()
-            && self
-                .x
-                .native
-                .layout
-                .get(a.param)
-                .is_some_and(|rp| rp.root == RootType::Descriptor)
+            && self.x.native.layout.get(a.param).is_some_and(|rp| {
+                matches!(rp.root, RootType::Descriptor | RootType::Constants)
+            })
         {
             return self.root_smem(inst, site, a);
         }
@@ -3369,7 +3429,13 @@ impl<'a> Lower<'a> {
             let d = self.i32_of(d)?;
             addr = self.s.m.bin(c, Bin::Add, addr, d);
         }
-        if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
+        let constants = self
+            .x
+            .native
+            .layout
+            .get(a.param)
+            .is_some_and(|rp| rp.root == RootType::Constants);
+        if constants || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, &src, false, (11, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
@@ -3960,6 +4026,18 @@ impl<'a> Lower<'a> {
                     .layout
                     .get(address.param)
                     .ok_or("a descriptor built around a table in the code")?;
+                if rp.root == RootType::Constants {
+                    // UAV bit in ResourceProperties (0x1000), else raw SRV.
+                    let uav = props.0 & 0x1000 != 0;
+                    let view = ConstView {
+                        slot: rp.slot,
+                        dword: address.dword,
+                        shift: address.shift,
+                        uav,
+                    };
+                    let stride = if props.0 & 0xff == 12 { props.1 } else { 0 };
+                    return Ok(self.s.const_view_handle(view, stride));
+                }
                 let kind = self
                     .x
                     .native
@@ -6840,12 +6918,21 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
+        // Sub-dword raw loads: (bits, signed).
+        let subdword: Option<(u32, bool)> = match plain.strip_prefix("buffer_load_") {
+            Some("ubyte") => Some((8, false)),
+            Some("sbyte") => Some((8, true)),
+            Some("ushort") => Some((16, false)),
+            Some("sshort") => Some((16, true)),
+            _ => None,
+        };
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
             .or(plain.strip_prefix("buffer_store_"))
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
+            _ if subdword.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7035,6 +7122,55 @@ impl<'a> Lower<'a> {
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
+            return Ok(());
+        }
+        if let Some((bits, signed)) = subdword {
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            let not3 = self.s.m.i32(!3);
+            let three = self.s.m.i32(3);
+            let aligned = self.s.m.bin(c, Bin::And, off, not3);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mask = self.s.m.i8(1);
+            let al = self.s.m.i32(4);
+            let r = match index {
+                Some(index) => {
+                    let h = self.handle(site, src, false, (12 | u, structured_stride(used)?))?;
+                    self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, index, aligned, mask, al],
+                    )
+                }
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    self.s.op(
+                        c,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, aligned, iu, mask, al],
+                    )
+                }
+            };
+            let word = self.s.m.extract(c, r, 0);
+            let mut x = self.as_int(word);
+            x = self.s.m.bin(c, Bin::LShr, x, sh);
+            if signed {
+                let left = self.s.m.i32(32 - bits);
+                x = self.s.m.bin(c, Bin::Shl, x, left);
+                x = self.s.m.bin(c, Bin::AShr, x, left);
+            } else {
+                let m = self.s.m.i32(if bits == 8 { 0xff } else { 0xffff });
+                x = self.s.m.bin(c, Bin::And, x, m);
+            }
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         let r = if typed {

@@ -212,6 +212,32 @@ fn failed_shader_diag(shader: &Shader, err: &str) {
         isa = %isa.join(" | "),
         "failed shader diag"
     );
+    shader.dump_diag("failed");
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+impl Shader {
+    /// When `VICTORY_DUMP_FAILED_SHADERS` is set, write the console
+    /// container once to `<dir>/{kind}_{stage}_{hash}.bin`.
+    pub(crate) fn dump_diag(&self, kind: &str) {
+        use std::path::PathBuf;
+        static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+        let Some(dir) = DIR.get_or_init(|| {
+            let path = std::env::var_os("VICTORY_DUMP_FAILED_SHADERS")?;
+            let dir = PathBuf::from(path);
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir)
+        }) else {
+            return;
+        };
+        let path = dir.join(format!("{kind}_{}_{}.bin", self.stage, self.hash));
+        if path.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, &self.container) {
+            tracing::warn!(error = %e, path = %path.display(), "failed shader dump");
+        }
+    }
 }
 
 #[cfg(windows)]

@@ -160,6 +160,26 @@ impl Host {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // Registers match `Shader::const_view_handle` first-use order.
+        for s in stages.iter().map(|(s, _)| *s) {
+            for (n, v) in s.const_views.iter().enumerate() {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: if v.uav {
+                        D3D12_ROOT_PARAMETER_TYPE_UAV
+                    } else {
+                        D3D12_ROOT_PARAMETER_TYPE_SRV
+                    },
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: n as u32,
+                            RegisterSpace: super::CONST_VIEW_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+            }
+        }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
             for (n, d) in s.static_samplers.iter().enumerate() {
@@ -531,6 +551,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        const_views: Vec::new(),
     }
 }
 

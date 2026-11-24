@@ -210,6 +210,13 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
+    word(&mut out, s.const_views.len() as u32);
+    for v in &s.const_views {
+        word(&mut out, u32::from(v.slot));
+        word(&mut out, u32::from(v.dword));
+        word(&mut out, u32::from(v.shift));
+        word(&mut out, u32::from(v.uav));
+    }
     out
 }
 
@@ -266,12 +273,24 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
-    // Older cache entries omit root UAVs; treat a trailing empty list as none.
+    // Older cache entries omit root UAVs / const_views.
     let root_uavs = if r.0.is_empty() {
         Vec::new()
     } else {
         r.list()?
     };
+    let mut const_views = Vec::new();
+    if !r.0.is_empty() {
+        let n = r.word()? as usize;
+        for _ in 0..n {
+            const_views.push(victory_shader::emit::ConstView {
+                slot: u8::try_from(r.word()?).ok()?,
+                dword: u16::try_from(r.word()?).ok()?,
+                shift: u8::try_from(r.word()?).ok()?,
+                uav: r.word()? != 0,
+            });
+        }
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -281,6 +300,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        const_views,
     })
 }
 
@@ -308,6 +328,12 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            const_views: vec![victory_shader::emit::ConstView {
+                slot: 0,
+                dword: 2,
+                shift: 8,
+                uav: false,
+            }],
         }
     }
 
