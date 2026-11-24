@@ -167,7 +167,10 @@ fn failed_shader_diag(shader: &Shader, err: &str) {
         .map(|r| {
             format!(
                 "{:?}(s{}..+{},slot={})",
-                r.root, r.base_register, r.sgprs, r.slot
+                r.root,
+                p.stage.user_sgpr(r.user_data),
+                r.sgprs,
+                r.slot
             )
         })
         .collect();
