@@ -45,9 +45,8 @@ pub enum Atom {
     /// `s_wqm` result: some lane of the quad is in the source mask.
     Quad(Value),
     /// A mask the pass cannot see into (loaded, built from scalars, an
-    /// EXEC write it does not follow): the lane's bit of the register pair
-    /// this value is a dword of.
-    Opaque(Value),
+    /// EXEC write it does not follow): the exact dwords at that use.
+    Opaque(Value, Option<Value>),
     /// A constant mask other than all lanes or none.
     Constant(u64),
 }
@@ -363,6 +362,43 @@ impl Structured {
         }
         .copied()
     }
+
+    /// The symbolic mask consumed by a select or carry-in, if tracked.
+    pub(crate) fn valu_mask(&self, inst: &Inst, op: &Operand) -> Option<Bool> {
+        let Operand::Scalar { code, dwords } = *op else {
+            return None;
+        };
+        let lo = inst.read(Reg::S(code))?;
+        let hi = if dwords == 2 {
+            Some(inst.read(Reg::S(code + 1))?)
+        } else {
+            None
+        };
+        self.mask_bits(lo, hi)
+    }
+}
+
+/// The VALU operand that reads this lane's bit of a mask.
+pub(crate) fn valu_mask_operand(inst: &Inst) -> Option<&Operand> {
+    match &inst.fields {
+        Fields::Valu(v)
+            if inst.name() == "v_cndmask_b32" || inst.name().ends_with("_co_ci_u32") =>
+        {
+            v.src.get(2)
+        }
+        _ => None,
+    }
+}
+
+/// The lane bits of an immediate mask. Inline integers sign-extend in wave64.
+pub(crate) fn mask_constant(op: &Operand, wave64: bool) -> Option<u64> {
+    let v = match *op {
+        Operand::Scalar { code: NULL, .. } => 0,
+        Operand::Const(c @ 128..=208) => i64::from(crate::resource::inline(c)? as i32) as u64,
+        Operand::Literal(x) => u64::from(x),
+        _ => return None,
+    };
+    Some(if wave64 { v } else { v & u64::from(u32::MAX) })
 }
 
 /// Builds the per-lane form of `program`.
@@ -695,8 +731,9 @@ impl<'a> Lanes<'a> {
                 };
                 let derived = exec_write(lo, k.0) || exec_write(hi, k.1);
                 let m = m.unwrap_or_else(|| {
-                    let born = self.born(k.0);
-                    self.b.atom(Atom::Opaque(k.0), born)
+                    let born = self.born(k.0).max(self.born(k.1));
+                    self.b
+                        .atom(Atom::Opaque(k.0, p.wave64.then_some(k.1)), born)
                 });
                 (m, derived)
             }
@@ -772,30 +809,20 @@ impl<'a> Lanes<'a> {
     }
 
     fn operand(&mut self, inst: &Inst, op: &Operand) -> Option<(Bool, bool)> {
-        let wave64 = self.p.wave64;
-        let constant = |b: &mut Bools, v: u64| {
-            let v = if wave64 { v } else { v & 0xFFFF_FFFF };
-            match v {
-                0 => Bool::FALSE,
-                _ if v == u64::MAX >> (32 * u8::from(!wave64)) => Bool::TRUE,
-                _ => b.atom(Atom::Constant(v), 0),
-            }
-        };
         Some(match *op {
             Operand::Scalar { code, .. } if code != NULL => {
                 let k = self.key(|r| inst.read(r), code)?;
                 self.mask(k)
             }
-            Operand::Const(c @ 128..=208) => {
-                let v = if c <= 192 {
-                    i64::from(c) - 128
-                } else {
-                    192 - i64::from(c)
+            _ => {
+                let v = mask_constant(op, self.p.wave64)?;
+                let m = match v {
+                    0 => Bool::FALSE,
+                    _ if v == u64::MAX >> (32 * u8::from(!self.p.wave64)) => Bool::TRUE,
+                    _ => self.b.atom(Atom::Constant(v), 0),
                 };
-                (constant(&mut self.b, v as u64), false)
+                (m, false)
             }
-            Operand::Literal(x) => (constant(&mut self.b, u64::from(x)), false),
-            _ => return None,
         })
     }
 
@@ -973,10 +1000,9 @@ impl<'a> Lanes<'a> {
                     l.masks.insert(k, m);
                     l.active.insert(k.0);
                 };
-                // A select reads a mask nothing else may: a join of compare
-                // results is resolved here, as for EXEC.
-                if name == "v_cndmask_b32"
-                    && let Some(&Operand::Scalar { code, .. }) = v.src.get(2)
+                // A select or carry-in can be the only use of a mask join.
+                // Numeric masks stay in `other` so their SGPRs keep their data values.
+                if let Some(&Operand::Scalar { code, .. }) = valu_mask_operand(inst)
                     && code != NULL
                     && let Some(k) = self.key(|r| inst.read(r), code)
                 {
