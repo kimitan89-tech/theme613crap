@@ -172,6 +172,14 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// Drops cached host bindings after an internal pass replaces heaps, root
+    /// signature or pipeline on the underlying command list.
+    pub(crate) fn invalidate_host(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {

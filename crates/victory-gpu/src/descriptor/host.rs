@@ -213,8 +213,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 const DYNAMIC: u32 = 1 << 18;
 
 /// The dynamic slots of a heap whose host would not take [`DYNAMIC`] more
-/// (a capped heap, NVIDIA): the title's slots keep their room first.
-const MIN_DYNAMIC: u32 = 1 << 16;
+/// (a capped heap, NVIDIA): reserve enough room for multi-list world frames
+/// while keeping static slots in place.
+const MIN_DYNAMIC: u32 = 3 << 16;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -618,7 +619,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
 
 fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
-    words[0] = crate::resource::pc_format(words[0]);
+    words[0] = crate::resource::pc_target_format(words[0]);
     // SAFETY: 40 bytes in the host's layout.
     unsafe {
         std::ptr::from_ref(&words)
@@ -809,12 +810,13 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     if view == 0 {
         return !typeless;
     }
-    if family(view) != family(own) {
+    let promoted = crate::resource::pc_target_format(view) == own;
+    if family(view) != family(own) && !promoted {
         once!(view, own, "view format of another family");
         return false;
     }
     if let Some(format) = format
-        && !typeless
+        && (!typeless || promoted)
     {
         *format = d.Format;
     }

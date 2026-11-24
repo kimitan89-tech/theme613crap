@@ -49,6 +49,7 @@ mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+pub mod upscale;
 #[cfg(windows)]
 mod watch;
 

@@ -201,7 +201,7 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RENDER_TARGET_VIEW_DESC> {
         const TEXTURE_2D: u32 = 4;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(TEXTURE_2D, true)
     }
 
     /// The depth view description in the host's type (the same layout).
@@ -210,14 +210,14 @@ impl RtvRecord {
         &self,
     ) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_DEPTH_STENCIL_VIEW_DESC> {
         const TEXTURE_2D: u32 = 3;
-        self.host_desc(TEXTURE_2D)
+        self.host_desc(TEXTURE_2D, false)
     }
 
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.
     #[cfg(windows)]
-    fn host_desc<T>(&self, dimension: u32) -> Option<T> {
+    fn host_desc<T>(&self, dimension: u32, target: bool) -> Option<T> {
         assert!(size_of::<T>() <= size_of::<[u32; 6]>());
         let mut words = if self.described != 0 {
             self.desc
@@ -231,7 +231,11 @@ impl RtvRecord {
                 0,
             ]
         };
-        words[0] = crate::resource::pc_format(words[0]);
+        words[0] = if target {
+            crate::resource::pc_target_format(words[0])
+        } else {
+            crate::resource::pc_format(words[0])
+        };
         // SAFETY: both host view descriptions are 24 bytes in this layout.
         Some(unsafe { (&raw const words).cast::<T>().read_unaligned() })
     }

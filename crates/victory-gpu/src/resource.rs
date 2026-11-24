@@ -237,6 +237,19 @@ pub(crate) fn pc_format(format: u32) -> u32 {
     }
 }
 
+/// A render-target or unordered-access format as the host has it. Console GPUs
+/// allow RTV/UAV on `R9G9B9E5_SHAREDEXP` (67), UAV on `B5G5R5A1_UNORM` (86),
+/// and RTV/UAV on `B4G4R4A4_UNORM` (115), which PC D3D12 forbids. Promote them
+/// to universally supported RTV+UAV+SRV equivalents so scene color targets and
+/// compute outputs are never dropped.
+pub(crate) fn pc_target_format(format: u32) -> u32 {
+    match pc_format(format) {
+        67 => 10,       // R9G9B9E5_SHAREDEXP -> R16G16B16A16_FLOAT
+        86 | 115 => 28, // B5G5R5A1 / B4G4R4A4 -> R8G8B8A8_UNORM
+        other => other,
+    }
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -280,7 +293,12 @@ pub(crate) const SRGB: [(u32, u32); 3] = [(29, 28), (91, 87), (93, 88)];
 /// typeless (see [`DEPTH_FORMATS`], [`SRGB`]): the title's own; `None` if
 /// the host copy is typed.
 pub(crate) fn view_format(this: This) -> Option<u32> {
-    let own = pc_format(resource(this).desc.format);
+    let desc = resource(this).desc;
+    let own = if desc.flags & 5 != 0 {
+        pc_target_format(desc.format)
+    } else {
+        pc_format(desc.format)
+    };
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
@@ -817,12 +835,18 @@ fn host_texture(
     // allows both; Grand Theft Auto VI's shadow maps ask for it).
     // shortcut: the host copy loses UAV use; give it a second view-only
     // copy if draws write it as a UAV.
+    const RENDER_TARGET: u32 = 1;
     const DEPTH: u32 = 2;
     const UNORDERED: u32 = 4;
     if d.flags & DEPTH != 0 {
         d.flags &= !UNORDERED;
     }
-    d.format = pc_format(d.format);
+    let is_target_or_uav = d.flags & (RENDER_TARGET | UNORDERED) != 0;
+    d.format = if is_target_or_uav {
+        pc_target_format(d.format)
+    } else {
+        pc_format(d.format)
+    };
     const DENY_SHADER_RESOURCE: u32 = 8;
     if d.flags & DENY_SHADER_RESOURCE == 0
         && let Some(&(_, typeless)) = DEPTH_FORMATS.iter().find(|&&(f, _)| f == d.format)
@@ -839,7 +863,11 @@ fn host_texture(
     let clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
-        value[0] = pc_format(value[0]);
+        value[0] = if is_target_or_uav {
+            pc_target_format(value[0])
+        } else {
+            pc_format(value[0])
+        };
         value
     });
     let heap = D3D12_HEAP_PROPERTIES {
