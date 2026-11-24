@@ -647,37 +647,82 @@ impl State {
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+        let mut slots: Vec<u8> = used.iter().filter(tables).map(|u| u.slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let mut fresh: Vec<u8> = Vec::new();
+        let mut in_place_cbv: Vec<u8> = Vec::new();
+        for &slot in &slots {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
+            let (Some(host), Some(base_index)) = (heap.host(), heap.index(table)) else {
                 continue;
             };
-            if index >= host.count() {
-                fresh.push(u.slot);
+            let entries: Vec<&UsedResource> = used
+                .iter()
+                .filter(tables)
+                .filter(|u| u.slot == slot)
+                .collect();
+            let has_cbv = entries.iter().any(|u| u.kind == ResourceType::Cbv);
+            let n = entries
+                .iter()
+                .map(|u| u.table_offset_dwords / 8 + 1)
+                .max()
+                .unwrap_or(1);
+            // Tables reaching past a host heap smaller than the title's (the
+            // host's limit, 1,000,000 views on NVIDIA) must be made afresh.
+            if base_index.saturating_add(n) > host.count() {
+                fresh.push(slot);
+                continue;
+            }
+            if !has_cbv {
+                continue;
+            }
+            // In-range CBV tables whose constant buffers are all 256-byte
+            // aligned inside their shadow copy can be mirrored in-place at
+            // the title's own host slots, saving NVIDIA's 64K dynamic pool.
+            let mut all_aligned = true;
+            for k in 0..n {
+                let at = table + u64::from(k) * 32;
+                if let Some(View::Constant(address, size)) = crate::descriptor::view(at) {
+                    let cbv_bytes = u64::from(size.max(1).next_multiple_of(256));
+                    let ok = crate::shadow::find(address, u64::from(size)).is_some_and(|s| {
+                        s.gpu(address).is_multiple_of(256) && cbv_bytes <= s.left(address)
+                    });
+                    if !ok {
+                        all_aligned = false;
+                        break;
+                    }
+                }
+            }
+            if all_aligned {
+                for k in 0..n {
+                    let at = table + u64::from(k) * 32;
+                    if let Some(View::Constant(address, size)) =
+                        host.mirror(base_index + k, at, true)
+                        && size > 0
+                        && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                    {
+                        shadow.refresh(list, address, u64::from(size));
+                    }
+                }
+                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                    let handle = table + u64::from(u.table_offset_dwords) * 4;
+                    if let Some(view) = crate::descriptor::view(handle) {
+                        readable(list, u, &view);
+                    }
+                }
+                in_place_cbv.push(slot);
+            } else {
+                fresh.push(slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(&u.slot) && !in_place_cbv.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }

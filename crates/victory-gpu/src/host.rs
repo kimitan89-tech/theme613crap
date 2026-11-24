@@ -519,19 +519,40 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
-        // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
+        // Split large multi-list submissions into smaller GPU batches so a
+        // heavy world frame (28-34 lists) stays well under Windows's 2 s TDR
+        // timeout per ExecuteCommandLists submission.
+        const LISTS_PER_SUBMIT: usize = 4;
         #[cfg(feature = "diagnostics")]
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing() {
+        let timing_mode = timing();
+        #[cfg(not(feature = "diagnostics"))]
+        let timing_mode = false;
+        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing_mode {
             firsts
                 .iter()
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
+        } else if firsts.len() > LISTS_PER_SUBMIT {
+            let mut chunks = Vec::with_capacity(firsts.len().div_ceil(LISTS_PER_SUBMIT));
+            let mut idx = 0;
+            while idx < firsts.len() {
+                let a = firsts[idx];
+                let next = (idx + LISTS_PER_SUBMIT).min(firsts.len());
+                let b = if next < firsts.len() {
+                    firsts[next]
+                } else {
+                    lists.len()
+                };
+                if a < b {
+                    chunks.push(&lists[a..b]);
+                }
+                idx = next;
+            }
+            chunks
         } else {
             vec![&lists[..]]
         };
-        #[cfg(not(feature = "diagnostics"))]
-        let groups = [&lists[..]];
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -550,7 +571,7 @@ impl Host {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
+            if timing_mode && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
                 let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
@@ -583,26 +604,29 @@ impl Host {
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
-        // which tell the title the GPU is done; each range once per
-        // submission, however many dispatches declared it (the world's
-        // passes declare the same big ranges dozens of times).
+        // which tell the title the GPU is done; coalesce overlapping ranges
+        // per buffer copy so no bytes are scanned or synced more than once.
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        let mut back: Vec<ShadowRefreshes> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
+                    && *len > 0
                 {
-                    back.push((shadow.clone(), *address, *len));
+                    let end = address.saturating_add(*len);
+                    match back
+                        .iter_mut()
+                        .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+                    {
+                        Some((_, ranges)) => merge_touching(ranges, *address, end),
+                        None => back.push((shadow.clone(), vec![(*address, end)])),
+                    }
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        for (shadow, ranges) in &back {
+            let written = shadow.copy_back_ranges(ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1230,9 +1254,7 @@ impl HostList {
                     continue;
                 }
                 Step::Texture(staging) => {
-                    if batch.texture_due(staging) {
-                        staging.refresh();
-                    }
+                    batch.queue_texture(staging);
                     continue;
                 }
             };
@@ -1257,8 +1279,33 @@ type ShadowRefreshes = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<ShadowRefreshes>,
-    /// Staging buffers (by address) refreshed since the last title write.
+    /// Staging buffers (by address) refreshed or queued since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Queued texture refreshes flushed in parallel before title writes or GPU submit.
+    pending_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// Inserts `[address, end)` into sorted non-overlapping `ranges`, merging
+/// only overlapping or directly touching intervals (zero gap).
+fn merge_touching(ranges: &mut Vec<(usize, usize)>, address: usize, end: usize) {
+    if address >= end {
+        return;
+    }
+    let mut pos = ranges.partition_point(|&(_, e)| e < address);
+    let mut from = address;
+    let mut to = end;
+    let start = pos;
+    while pos < ranges.len() && ranges[pos].0 <= to {
+        from = from.min(ranges[pos].0);
+        to = to.max(ranges[pos].1);
+        pos += 1;
+    }
+    if pos == start {
+        ranges.insert(start, (from, to));
+    } else {
+        ranges[start] = (from, to);
+        ranges.drain(start + 1..pos);
+    }
 }
 
 /// Inserts `[address, end)` into sorted non-overlapping `ranges`, coalescing
@@ -1331,6 +1378,14 @@ impl Batch {
         }
     }
 
+    /// Queues a texture staging refresh once per submission (until a title
+    /// write intervenes) so all queued textures can hash/detile in parallel.
+    fn queue_texture(&mut self, staging: &std::sync::Arc<crate::texture::Staging>) {
+        if self.texture_due(staging) {
+            self.pending_textures.push(staging.clone());
+        }
+    }
+
     /// Whether `staging` is still to be refreshed in this submission (and
     /// notes it refreshed).
     fn texture_due<T>(&mut self, staging: &std::sync::Arc<T>) -> bool {
@@ -1342,6 +1397,41 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+    }
+
+    fn flush_textures(&mut self) {
+        if self.pending_textures.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.pending_textures);
+        let started = std::time::Instant::now();
+        let bytes = if queued.len() == 1 {
+            queued[0].refresh_bytes() as u64
+        } else {
+            let workers = std::thread::available_parallelism()
+                .map_or(2, |n| (n.get() / 2).clamp(2, 6))
+                .min(queued.len());
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let total = std::sync::atomic::AtomicU64::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..workers {
+                    s.spawn(|| {
+                        let mut local = 0u64;
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            if i >= queued.len() {
+                                break;
+                            }
+                            local += queued[i].refresh_bytes() as u64;
+                        }
+                        total.fetch_add(local, Ordering::Relaxed);
+                    });
+                }
+            });
+            total.into_inner()
+        };
+        PREPARING[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        PREPARING[3].fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Flushes only pending refreshes of `shadow` that overlap
@@ -1381,6 +1471,7 @@ impl Batch {
                 Self::flush_range(&shadow, from, to);
             }
         }
+        self.flush_textures();
     }
 }
 
@@ -1404,7 +1495,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         2 => return,
         _ => {}
     }
-    if len == 0 || title_dst && !crate::texture::committed(dst, len) {
+    if len == 0 {
         return;
     }
     if title_dst {
@@ -1417,6 +1508,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
+        return;
+    }
+    // Only query committed destination memory on fallback: ReadProcessMemory
+    // already rejects uncommitted destinations without faulting, avoiding a
+    // ~2 ms VirtualQuery walk on every normal buffer copy.
+    if title_dst && !crate::texture::committed(dst, len) {
         return;
     }
     #[cfg(feature = "diagnostics")]

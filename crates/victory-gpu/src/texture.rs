@@ -171,14 +171,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
 
 impl Staging {
     /// Detiles the texture memory into the staging buffer if it changed
-    /// since the last time (and is mapped at all).
-    pub(crate) fn refresh(&self) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let started = std::time::Instant::now();
-        let read = self.refresh_now();
-        let preparing = &crate::host::PREPARING;
-        preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
-        preparing[3].fetch_add(read as u64, Relaxed);
+    /// since the last time (and is mapped at all), returning title bytes read.
+    pub(crate) fn refresh_bytes(&self) -> usize {
+        self.refresh_now()
     }
 
     /// Returns the bytes of title memory read.
