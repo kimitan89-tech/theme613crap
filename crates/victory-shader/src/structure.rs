@@ -466,6 +466,8 @@ struct SopMasks {
     exec: Option<(Key, Bool)>,
     /// Some operand derives from EXEC or a VALU result.
     derived: bool,
+    /// Result has no bits set outside active lanes (safe to read via ballot).
+    active: bool,
     /// For branches: SCC ("result is not zero") per lane.
     scc: Option<Bool>,
 }
@@ -860,9 +862,19 @@ impl<'a> Lanes<'a> {
                 dst: dst.map(|d| (d, saved)),
                 exec: exec_out.map(|e| (e, new)),
                 derived,
+                active: true,
                 scc: Some(new),
             });
         }
+        let is_active = |n: usize, l: &Self| match src.get(n) {
+            Some(&Operand::Scalar { code: NULL, .. })
+            | Some(&Operand::Const(128))
+            | Some(&Operand::Literal(0)) => true,
+            Some(&Operand::Scalar { code, .. }) => {
+                inst.read(Reg::S(code)).is_some_and(|v| l.active.contains(&v))
+            }
+            _ => false,
+        };
         let (result, scc) = match op {
             "mov" => (arg(0, self)?, None),
             "not" => {
@@ -891,10 +903,19 @@ impl<'a> Lanes<'a> {
                 (r, Some(r))
             }
         };
+        let active = match op {
+            "mov" => is_active(0, self),
+            "and" => is_active(0, self) || is_active(1, self),
+            "andn2" => is_active(0, self),
+            "andn1" => is_active(1, self),
+            "or" | "xor" | "cselect" => is_active(0, self) && is_active(1, self),
+            _ => false,
+        };
         Some(SopMasks {
             dst: dst.map(|d| (d, result)),
             exec: exec_out.map(|e| (e, result)),
             derived,
+            active,
             scc,
         })
     }
@@ -961,7 +982,7 @@ impl<'a> Lanes<'a> {
                         self.masks.insert(k, m);
                         // EXEC itself holds the lanes that run here.
                         if r.exec.is_some_and(|e| e.0 == k)
-                            || exec.is_some_and(|e| self.b.implies(m, e))
+                            || r.active && exec.is_some_and(|e| self.b.implies(m, e))
                         {
                             self.active.insert(k.0);
                         }

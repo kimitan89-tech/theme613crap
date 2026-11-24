@@ -4,8 +4,8 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
@@ -176,12 +176,19 @@ fn create() -> windows::core::Result<Host> {
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
         // address and instruction) instead of a GPU fault and driver reset.
+        let adapter_name;
         if cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_WARP").is_some() {
             let adapter = warp_adapter()?;
+            adapter_name = adapter_label(&adapter);
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
-            tracing::info!("host device on the software adapter (WARP)");
+            tracing::info!(adapter = %adapter_name, "host device on the software adapter (WARP)");
         } else {
-            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            // Laptops often default to Intel UHD when CreateDevice(None) —
+            // pick the high-performance GPU (RTX 3050) explicitly.
+            let adapter = preferred_adapter()?;
+            adapter_name = adapter_label(&adapter);
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(adapter = %adapter_name, "host D3D12 device on preferred adapter");
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
         let messages = debug
@@ -207,7 +214,7 @@ fn create() -> windows::core::Result<Host> {
                 ..Default::default()
             })?;
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
-        tracing::info!("host D3D12 device ready");
+        tracing::info!(adapter = %adapter_name, "host D3D12 device ready");
         Ok(Host {
             device,
             queue,
@@ -245,6 +252,76 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
             ));
         }
         Ok(adapter)
+    }
+}
+
+fn adapter_label(adapter: &IDXGIAdapter) -> String {
+    // SAFETY: live DXGI adapter.
+    unsafe {
+        adapter
+            .cast::<IDXGIAdapter1>()
+            .ok()
+            .and_then(|a| a.GetDesc1().ok())
+            .map(|d| {
+                let name: String = d
+                    .Description
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| char::from_u32(c as u32).unwrap_or('?'))
+                    .collect();
+                format!(
+                    "{name} (vendor {:#x}, {:.0} MB dedicated)",
+                    d.VendorId,
+                    d.DedicatedVideoMemory as f64 / (1024.0 * 1024.0)
+                )
+            })
+            .unwrap_or_else(|| "unknown adapter".into())
+    }
+}
+
+/// Discrete / high-performance GPU (e.g. RTX 3050), not the laptop iGPU.
+fn preferred_adapter() -> windows::core::Result<IDXGIAdapter> {
+    // SAFETY: plain DXGI factory / adapter queries.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        if let Ok(factory6) = factory.cast::<IDXGIFactory6>() {
+            match factory6.EnumAdapterByGpuPreference::<IDXGIAdapter>(
+                0,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) {
+                Ok(adapter) => {
+                    let desc = adapter.cast::<IDXGIAdapter1>()?.GetDesc1()?;
+                    if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                        return Ok(adapter);
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "EnumAdapterByGpuPreference failed"),
+            }
+        }
+        // Fallback: largest dedicated VRAM among hardware adapters.
+        let mut best: Option<(usize, IDXGIAdapter)> = None;
+        let mut i = 0u32;
+        loop {
+            let adapter = match factory.EnumAdapters(i) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            i += 1;
+            let Ok(a1) = adapter.cast::<IDXGIAdapter1>() else {
+                continue;
+            };
+            let Ok(desc) = a1.GetDesc1() else {
+                continue;
+            };
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                continue;
+            }
+            let vram = desc.DedicatedVideoMemory;
+            if best.as_ref().is_none_or(|(b, _)| vram > *b) {
+                best = Some((vram, adapter));
+            }
+        }
+        best.map(|(_, a)| a).ok_or_else(windows::core::Error::empty)
     }
 }
 
@@ -295,6 +372,9 @@ pub(crate) struct HostList {
     /// Upload memory for data the list's draws make (expanded vertices),
     /// reused after a reset.
     scratch: Mutex<Scratch>,
+    /// Default-heap UAV memory for GPU-transformed indirect arguments
+    /// (expanded rectangle draw records), reused after a reset.
+    uav_scratch: Mutex<UavScratch>,
     /// Host texture states the list assumes, by host copy: at its start and
     /// at its end. Lists are recorded on many threads and run in submission
     /// order, so the transitions from a texture's real state are made at
@@ -306,6 +386,10 @@ pub(crate) struct HostList {
     prelude: (ID3D12CommandAllocator, ID3D12GraphicsCommandList),
     /// The pipelines the list binds, for reports of slow submissions.
     pipelines: Mutex<std::collections::BTreeSet<String>>,
+    /// Successful graphics draws/mesh (kept during PresentX scene overlay).
+    graphics_ops: AtomicU32,
+    /// Successful compute dispatches (skipped + not prepared under overlay).
+    compute_ops: AtomicU32,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -332,12 +416,19 @@ type States = std::collections::HashMap<
     (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
-/// Whether device-removed data is on (`VICTORY_D3D12_DRED`, diagnostics
-/// builds).
+/// Whether device-removed data is on (diagnostics builds). Opt out with
+/// `VICTORY_D3D12_DRED_OFF`; `VICTORY_D3D12_DRED` still forces it on.
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        if !cfg!(feature = "diagnostics") {
+            return false;
+        }
+        if std::env::var_os("VICTORY_D3D12_DRED_OFF").is_some() {
+            return false;
+        }
+        // Default on for diag: cutscene TDRs were reporting "no breadcrumbs".
+        true
     })
 }
 
@@ -374,6 +465,17 @@ struct Scratch {
 unsafe impl Send for Scratch {}
 
 const SCRATCH_CHUNK: u64 = 4 << 20;
+
+/// Default-heap UAV chunks handed out front to back for GPU-rewritten
+/// indirect argument buffers; always left in `UNORDERED_ACCESS`.
+#[derive(Default)]
+struct UavScratch {
+    chunks: Vec<(ID3D12Resource, u64)>,
+    current: usize,
+    used: u64,
+}
+
+const UAV_SCRATCH_CHUNK: u64 = 256 << 10;
 
 /// One piece of submission-time work, in recorded order.
 enum Step {
@@ -485,9 +587,12 @@ impl Host {
                 list,
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
+                uav_scratch: Mutex::default(),
                 states: Mutex::default(),
                 prelude: (prelude_allocator, prelude),
                 pipelines: Mutex::default(),
+                graphics_ops: AtomicU32::new(0),
+                compute_ops: AtomicU32::new(0),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -505,11 +610,42 @@ impl Host {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
+        // Under PresentX scene overlay, drop compute-only lists before the
+        // expensive shadow/texture prepare — that was the CPU peg after GPU
+        // spikes (prepare still ran for dispatches we then skipped).
+        let overlay = scene_overlay_active();
+        let runs: Vec<&HostList> = if overlay {
+            let kept: Vec<_> = runs
+                .iter()
+                .copied()
+                .filter(|l| {
+                    let g = l.graphics_ops.load(Ordering::Relaxed);
+                    let c = l.compute_ops.load(Ordering::Relaxed);
+                    !(c > 0 && g == 0)
+                })
+                .collect();
+            if kept.len() < runs.len() {
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        skipped = runs.len() - kept.len(),
+                        kept = kept.len(),
+                        "dropped compute-only lists under PresentX scene overlay"
+                    );
+                }
+            }
+            kept
+        } else {
+            runs.to_vec()
+        };
+        if runs.is_empty() {
+            return;
+        }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
-        for list in runs {
+        for list in &runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -520,9 +656,10 @@ impl Host {
         batch.flush();
         let prepared = std::time::Instant::now();
         // Split large multi-list submissions into smaller GPU batches so a
-        // heavy world frame (28-34 lists) stays well under Windows's 2 s TDR
-        // timeout per ExecuteCommandLists submission.
-        const LISTS_PER_SUBMIT: usize = 4;
+        // heavy world/cutscene frame stays under Windows's 2 s TDR timeout
+        // per ExecuteCommandLists. Larger chunks when overlay already dropped
+        // the hanging compute; smaller otherwise.
+        let lists_per_submit: usize = if overlay { 4 } else { 2 };
         #[cfg(feature = "diagnostics")]
         let timing_mode = timing();
         #[cfg(not(feature = "diagnostics"))]
@@ -533,12 +670,12 @@ impl Host {
                 .zip(firsts.iter().skip(1).chain([&lists.len()]))
                 .map(|(&a, &b)| &lists[a..b])
                 .collect()
-        } else if firsts.len() > LISTS_PER_SUBMIT {
-            let mut chunks = Vec::with_capacity(firsts.len().div_ceil(LISTS_PER_SUBMIT));
+        } else if firsts.len() > lists_per_submit {
+            let mut chunks = Vec::with_capacity(firsts.len().div_ceil(lists_per_submit));
             let mut idx = 0;
             while idx < firsts.len() {
                 let a = firsts[idx];
-                let next = (idx + LISTS_PER_SUBMIT).min(firsts.len());
+                let next = (idx + lists_per_submit).min(firsts.len());
                 let b = if next < firsts.len() {
                     firsts[next]
                 } else {
@@ -599,8 +736,8 @@ impl Host {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
-                self.removal_data(runs),
-                last_notes(runs)
+                self.removal_data(&runs),
+                last_notes(&runs)
             ));
         }
         // What shaders wrote goes back before the bottom-of-pipe writes,
@@ -609,7 +746,7 @@ impl Host {
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
         let mut back: Vec<ShadowRefreshes> = Vec::new();
-        for list in runs {
+        for list in &runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
                     && *len > 0
@@ -630,7 +767,7 @@ impl Host {
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        for list in runs {
+        for list in &runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
             }
@@ -915,10 +1052,16 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.graphics_ops.store(0, Ordering::Relaxed);
+        self.compute_ops.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+            (scratch.current, scratch.used) = (0, 0);
+        }
+        {
+            let mut scratch = self.uav_scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
         // SAFETY: the list is not executing.
@@ -1040,6 +1183,14 @@ impl HostList {
         }
     }
 
+    pub(crate) fn note_graphics_op(&self) {
+        self.graphics_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_compute_op(&self) {
+        self.compute_ops.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1137,6 +1288,38 @@ impl HostList {
         let at = s.used;
         s.used += len;
         Some((gpu + at, (data + at as usize) as *mut u8))
+    }
+
+    /// A `len`-byte slice of a default-heap UAV buffer (256-byte aligned,
+    /// starting in `UNORDERED_ACCESS`), reused after `reset`. Callers that
+    /// transition it away from `UNORDERED_ACCESS` must transition it back.
+    pub(crate) fn indirect_scratch(&self, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+        let host = host()?;
+        let mut s = self.uav_scratch.lock().unwrap_or_else(|e| e.into_inner());
+        let len = len.max(1).next_multiple_of(256);
+        if len > UAV_SCRATCH_CHUNK {
+            let buffer = host.uav_buffer(len)?;
+            name(&buffer, || format!("list indirect scratch {len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            self.deferred().uploads.push(buffer.clone());
+            return Some((buffer, 0, gpu));
+        }
+        if s.used + len > UAV_SCRATCH_CHUNK && s.current < s.chunks.len() {
+            (s.current, s.used) = (s.current + 1, 0);
+        }
+        if s.current == s.chunks.len() {
+            let buffer = host.uav_buffer(UAV_SCRATCH_CHUNK)?;
+            name(&buffer, || "list indirect scratch".into());
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            s.chunks.push((buffer, gpu));
+            s.used = 0;
+        }
+        let (buffer, gpu) = s.chunks[s.current].clone();
+        let at = s.used;
+        s.used += len;
+        Some((buffer, at, gpu + at))
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -1649,6 +1832,130 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// Color RTVs that received real draws — candidates when PresentX is black.
+struct SceneColor {
+    ptr: usize,
+    host: Arc<crate::resource::HostTexture>,
+    format: DXGI_FORMAT,
+    width: u32,
+    height: u32,
+    /// How many draws targeted this RT (mesh-heavy cutscene color wins).
+    draws: u64,
+}
+
+static SCENES: Mutex<Vec<SceneColor>> = Mutex::new(Vec::new());
+static PREV_PRESENT_BLACK: AtomicBool = AtomicBool::new(false);
+
+/// True while PresentX is black and we stretch-blit a scene RT — cutscene
+/// survival path. Heavy compute that was TDRing the GPU is skipped then.
+pub(crate) fn scene_overlay_active() -> bool {
+    PREV_PRESENT_BLACK.load(Ordering::Relaxed)
+}
+
+/// Remembers a color RTV the title just bound, for present fallback.
+pub(crate) fn note_scene_color(resource: crate::object::This, format: u32, width: u32, height: u32) {
+    // Cutscene/world color is 720p–1080p. Ignore 4K UI planes — those crashed
+    // the old CopyResource present fallback.
+    if resource.is_null() || !(640..=1920).contains(&width) || !(360..=1080).contains(&height) {
+        return;
+    }
+    // UNORM color the compositor can sample as float4 (incl. 10:10:10:2).
+    if !(23..=32).contains(&format) && !matches!(format, 87 | 90 | 91) {
+        return;
+    }
+    let Some(host) = crate::resource::host_copy(resource) else {
+        return;
+    };
+    // SAFETY: live host texture.
+    let flags = unsafe { host.texture.GetDesc().Flags.0 };
+    if flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 != 0 {
+        return;
+    }
+    let ptr = resource as usize;
+    let mut scenes = SCENES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(s) = scenes.iter_mut().find(|s| s.ptr == ptr) {
+        s.host = host;
+        s.format = DXGI_FORMAT(format as i32);
+        s.width = width;
+        s.height = height;
+        return;
+    }
+    scenes.push(SceneColor {
+        ptr,
+        host,
+        format: DXGI_FORMAT(format as i32),
+        width,
+        height,
+        draws: 0,
+    });
+    const MAX: usize = 16;
+    if scenes.len() > MAX {
+        // Drop least-drawn first so the mesh color RT survives.
+        let i = scenes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| s.draws)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        scenes.remove(i);
+    }
+}
+
+/// Marks currently bound color targets as having received a real draw.
+pub(crate) fn mark_scene_drawn(targets: &[usize]) {
+    if targets.is_empty() {
+        return;
+    }
+    let mut scenes = SCENES.lock().unwrap_or_else(|e| e.into_inner());
+    for &t in targets {
+        if let Some(s) = scenes.iter_mut().find(|s| s.ptr == t) {
+            s.draws = s.draws.saturating_add(1);
+        }
+    }
+}
+
+fn scene_overlay(plane0: usize) -> Option<SceneColor> {
+    // Only after a real black PresentX probe (cutscene/world). Menus keep
+    // plane 0 lit so this stays off. Stretch-blits via compositor — never
+    // CopyResource a differently sized texture.
+    if !PREV_PRESENT_BLACK.load(Ordering::Relaxed) {
+        return None;
+    }
+    let scenes = SCENES.lock().unwrap_or_else(|e| e.into_inner());
+    // Ignore near-empty RTs (boot/fade 1080p with a couple of draws) — those
+    // were what showed as sparse dots instead of the mesh color.
+    const MIN_DRAWS: u64 = 32;
+    let cands: Vec<_> = scenes
+        .iter()
+        .filter(|s| s.draws >= MIN_DRAWS && s.ptr != plane0)
+        .collect();
+    if cands.is_empty() {
+        return None;
+    }
+    // Series S cutscene color is 1280×720 — once any exists, never fall back
+    // to a 1080 present sibling.
+    let cutscene: Vec<_> = cands
+        .iter()
+        .copied()
+        .filter(|s| s.width == 1280 && s.height == 720)
+        .collect();
+    let pool = if cutscene.is_empty() { cands } else { cutscene };
+    pool.into_iter().max_by_key(|s| s.draws).cloned()
+}
+
+impl Clone for SceneColor {
+    fn clone(&self) -> Self {
+        Self {
+            ptr: self.ptr,
+            host: Arc::clone(&self.host),
+            format: self.format,
+            width: self.width,
+            height: self.height,
+            draws: self.draws,
+        }
+    }
+}
+
 const BUFFERS: u32 = 2;
 
 struct Presenter {
@@ -1668,7 +1975,10 @@ struct Presenter {
 struct Compositor {
     format: DXGI_FORMAT,
     root: ID3D12RootSignature,
+    /// Premultiplied-alpha overlays (Series S UI planes).
     pso: ID3D12PipelineState,
+    /// Opaque stretch-blit of the last scene color over a black PresentX plane.
+    opaque_pso: ID3D12PipelineState,
     srvs: ID3D12DescriptorHeap,
     srv_size: u32,
 }
@@ -1739,14 +2049,25 @@ impl Compositor {
             let ps_bytes =
                 std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
             let root: ID3D12RootSignature = device.CreateRootSignature(0, vs_bytes)?;
-            let mut blend = D3D12_BLEND_DESC::default();
-            blend.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            let alpha_rt = D3D12_RENDER_TARGET_BLEND_DESC {
                 BlendEnable: true.into(),
                 SrcBlend: D3D12_BLEND_ONE,
                 DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
                 BlendOp: D3D12_BLEND_OP_ADD,
                 SrcBlendAlpha: D3D12_BLEND_ONE,
                 DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+                BlendOpAlpha: D3D12_BLEND_OP_ADD,
+                LogicOp: D3D12_LOGIC_OP_NOOP,
+                RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                ..Default::default()
+            };
+            let opaque_rt = D3D12_RENDER_TARGET_BLEND_DESC {
+                BlendEnable: false.into(),
+                SrcBlend: D3D12_BLEND_ONE,
+                DestBlend: D3D12_BLEND_ZERO,
+                BlendOp: D3D12_BLEND_OP_ADD,
+                SrcBlendAlpha: D3D12_BLEND_ONE,
+                DestBlendAlpha: D3D12_BLEND_ZERO,
                 BlendOpAlpha: D3D12_BLEND_OP_ADD,
                 LogicOp: D3D12_LOGIC_OP_NOOP,
                 RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
@@ -1760,29 +2081,35 @@ impl Compositor {
             };
             let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
             rtv_formats[0] = format;
-            let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
-                VS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: vs_bytes.as_ptr().cast(),
-                    BytecodeLength: vs_bytes.len(),
-                },
-                PS: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: ps_bytes.as_ptr().cast(),
-                    BytecodeLength: ps_bytes.len(),
-                },
-                BlendState: blend,
-                SampleMask: u32::MAX,
-                RasterizerState: raster,
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
-                NumRenderTargets: 1,
-                RTVFormats: rtv_formats,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                ..Default::default()
+            let make_pso = |rt: D3D12_RENDER_TARGET_BLEND_DESC| {
+                let mut blend = D3D12_BLEND_DESC::default();
+                blend.RenderTarget[0] = rt;
+                let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    VS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs_bytes.as_ptr().cast(),
+                        BytecodeLength: vs_bytes.len(),
+                    },
+                    PS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: ps_bytes.as_ptr().cast(),
+                        BytecodeLength: ps_bytes.len(),
+                    },
+                    BlendState: blend,
+                    SampleMask: u32::MAX,
+                    RasterizerState: raster,
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: rtv_formats,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    ..Default::default()
+                };
+                device.CreateGraphicsPipelineState(&pso_desc)
             };
-            let pso: ID3D12PipelineState = device.CreateGraphicsPipelineState(&pso_desc)?;
+            let pso: ID3D12PipelineState = make_pso(alpha_rt)?;
+            let opaque_pso: ID3D12PipelineState = make_pso(opaque_rt)?;
             let srvs: ID3D12DescriptorHeap =
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
@@ -1796,6 +2123,7 @@ impl Compositor {
                 format,
                 root,
                 pso,
+                opaque_pso,
                 srvs,
                 srv_size,
             })
@@ -1939,6 +2267,21 @@ impl Host {
             return None;
         };
         let (width, height) = (desc.Width as u32, desc.Height);
+        // When PresentX is black, stretch-blit the last 720p/1080p scene RT
+        // over the back buffer via the compositor (never CopyResource a
+        // different-sized texture — that invalidates the command list).
+        let scene = scene_overlay(texture.as_raw() as usize);
+        if let Some(s) = &scene {
+            tracing::info!(
+                scene = format_args!("{:#x}", s.ptr),
+                scene_w = s.width,
+                scene_h = s.height,
+                draws = s.draws,
+                present_w = width,
+                present_h = height,
+                "compositing drawn scene color over black PresentX plane"
+            );
+        }
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
@@ -1964,12 +2307,18 @@ impl Host {
                 }
             }
         }
-        // Filter overlay planes (skipping duplicates of plane 0 and textures
-        // that deny shader resource access).
-        let overlays: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = planes
-            .iter()
-            .skip(1)
-            .filter_map(|&(ov, ov_state)| {
+        // Scene fallback is drawn first. While PresentX is black, skip the
+        // title's extra planes — they were covering the stretch-blit with
+        // near-opaque UI and leaving only sparse dots.
+        let mut overlays: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = Vec::new();
+        if let Some(s) = &scene {
+            overlays.push((
+                &s.host.texture,
+                s.host.state.load(Ordering::Relaxed),
+                s.format,
+            ));
+        } else {
+            overlays.extend(planes.iter().skip(1).filter_map(|&(ov, ov_state)| {
                 if ov.as_raw() == texture.as_raw() {
                     return None;
                 }
@@ -1980,8 +2329,8 @@ impl Host {
                 }
                 let srv_fmt = swap_format(od.Format)?;
                 Some((ov, ov_state, srv_fmt))
-            })
-            .collect();
+            }));
+        }
         if !overlays.is_empty()
             && p.compositor.as_ref().is_none_or(|c| c.format != format)
         {
@@ -2051,13 +2400,20 @@ impl Host {
                 list.RSSetScissorRects(&[sc]);
                 list.SetDescriptorHeaps(&[Some(comp.srvs.clone())]);
                 list.SetGraphicsRootSignature(&comp.root);
-                list.SetPipelineState(&comp.pso);
                 list.IASetPrimitiveTopology(
                     windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
                 );
                 let cpu_start = comp.srvs.GetCPUDescriptorHandleForHeapStart();
                 let gpu_start = comp.srvs.GetGPUDescriptorHandleForHeapStart();
+                let scene_first = scene.is_some();
                 for (i, &(ov, _, srv_fmt)) in overlays.iter().take(8).enumerate() {
+                    // First overlay is the remembered scene color: replace the
+                    // black PresentX base. Later planes stay premultiplied UI.
+                    list.SetPipelineState(if i == 0 && scene_first {
+                        &comp.opaque_pso
+                    } else {
+                        &comp.pso
+                    });
                     let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
                         Format: srv_fmt,
                         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -2111,7 +2467,14 @@ impl Host {
                     }
                     let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     p.meter.frame(p.hwnd);
-                    return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+                    let black = probe.is_some_and(|b| crate::capture::black(&b));
+                    // Learn blackness only from a plain PresentX copy. While
+                    // we overlay a scene, keep the flag set so every frame
+                    // keeps showing the model over the black plane.
+                    if scene.is_none() {
+                        PREV_PRESENT_BLACK.store(black, Ordering::Relaxed);
+                    }
+                    return Some(black);
                 }
                 #[cfg(not(feature = "diagnostics"))]
                 {
@@ -2154,9 +2517,18 @@ impl Host {
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
-            return Some(probe.is_some_and(|b| crate::capture::black(&b)));
+            {
+                let black = probe.is_some_and(|b| crate::capture::black(&b));
+                if scene.is_none() {
+                    PREV_PRESENT_BLACK.store(black, Ordering::Relaxed);
+                }
+                return Some(black);
+            }
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            {
+                let _ = &scene;
+                Some(false)
+            }
         }
     }
 
@@ -2301,6 +2673,47 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// A default-heap UAV buffer, created in `UNORDERED_ACCESS`.
+    pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a default-heap UAV buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no uav buffer");
                 None
             }
         }
