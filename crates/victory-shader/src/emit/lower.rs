@@ -22,6 +22,26 @@ use crate::structure::{Atom, Bool, LaneExit, Structured, mask_constant, valu_mas
 
 type Why = &'static str;
 
+/// Scratch plan for emulating a console Wave64 on a host Wave32.
+#[derive(Debug, Clone, Copy)]
+struct Wave64Emu {
+    /// First dword of the `threads`-dword scratch region in LDS.
+    scratch: u32,
+}
+
+/// Entry-block ids shared by every Wave64-on-Wave32 sequence.
+#[derive(Debug, Clone, Copy)]
+struct Wave64Ids {
+    /// Remapped flat thread index (`0..N-1`).
+    flat: V,
+    /// Console lane within the wave (`flat & 63`).
+    console_lane: V,
+    /// Base of this console wave (`flat & !63`).
+    console_wave_base: V,
+    /// Host lane within the Wave32 (`waveGetLaneIndex`).
+    host_lane: V,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum Val {
     I32(V),
@@ -199,6 +219,10 @@ struct Lower<'a> {
     no_barrier: HashSet<usize>,
     /// Some when replacing implicit wave64 LDS ordering with explicit fences.
     lds_barriers: Option<HashSet<Site>>,
+    /// Wave64 compute lowered for a host WaveSize(32) via LDS scratch.
+    wave64_emu: Option<Wave64Emu>,
+    /// Lazy ids for [`Self::wave64_emu`] (built in the entry block).
+    wave64_ids: Option<Wave64Ids>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -268,6 +292,70 @@ const LANE_MASK: Why = "a lane mask read as data";
 
 /// Dword 3 of a rebuilt buffer descriptor: the identity swizzle (`XYZW`).
 const BUFFER_SWIZZLE_DWORD3: u32 = 0xFAC;
+
+/// Ops that need values or masks spanning both 32-lane halves of a Wave64.
+fn cross32_wave_op(st: &Structured, res: &Resources, i: &Inst) -> bool {
+    let n = i.name();
+    if n == "v_readfirstlane_b32" {
+        // Waterfall descriptor reads are lowered to the lane's own value.
+        return !i
+            .writes
+            .first()
+            .is_some_and(|w| res.waterfall.reads.contains(&w.1));
+    }
+    n.contains("permute")
+        || n.starts_with("v_mbcnt")
+        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+        || reads_mask_as_data(st, i)
+}
+
+/// Cross-32 ops whose lowering inserts group barriers (must be uniform CFG).
+fn cross32_needs_barrier(st: &Structured, res: &Resources, i: &Inst) -> bool {
+    let n = i.name();
+    // writelane is a select on the console lane; mbcnt / mask-as-data use the
+    // console lane index and ballots taken at the mask's def site.
+    if n == "v_writelane_b32" || n.starts_with("v_mbcnt") || reads_mask_as_data(st, i) {
+        return false;
+    }
+    cross32_wave_op(st, res, i)
+}
+
+/// Whether a wave64 compute group can run as WaveSize(32) with LDS scratch.
+/// Returns the user-LDS fence sites and the scratch base dword on success.
+fn try_wave64_on_wave32(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+    threads: u32,
+    orig_lds: u32,
+) -> Option<(HashSet<Site>, u32)> {
+    // One scratch dword per thread; 32 KiB TGSM = 8192 dwords.
+    if threads < 64 || !threads.is_multiple_of(64) || orig_lds.saturating_add(threads) > 8192 {
+        return None;
+    }
+    let analysis = super::lds::analyze(p, st);
+    // Scratch store/barrier/load must run in lockstep: refuse only when a
+    // cross-32-lane wave op itself sits in a divergent block.
+    for (b, insts) in p.blocks.iter().enumerate() {
+        for inst in &insts.insts {
+            if cross32_needs_barrier(st, res, inst) && analysis.divergent[b] {
+                return None;
+            }
+        }
+    }
+    let barriers = if orig_lds > 0 {
+        match super::lds::split_barriers(p, st) {
+            Some(b) => b,
+            // User LDS has divergent accesses: still emulate wave ops (their
+            // barriers stay in uniform blocks) and fence only the uniform
+            // LDS sites so we never insert a barrier that would deadlock.
+            None => super::lds::uniform_split_barriers(p, st, &analysis),
+        }
+    } else {
+        HashSet::new()
+    };
+    Some((barriers, orig_lds))
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -387,6 +475,7 @@ impl<'a> Lower<'a> {
         });
         let mut console_lanes = false;
         let mut lds_barriers = None;
+        let mut wave64_emu = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -444,19 +533,71 @@ impl<'a> Lower<'a> {
                 })
             };
             // Host wave32 GPUs (e.g. many NVIDIA cards) cannot take WaveSize(64).
-            // Small groups use WaveSize(32); larger wave64 groups with only
-            // uniform LDS get explicit group fences instead.
+            // Small groups use WaveSize(32). Larger wave64 groups with only
+            // uniform LDS get explicit group fences; those that also need
+            // cross-32-lane ops may run as WaveSize(32) with LDS scratch when
+            // every required barrier is group-uniform.
             let threads = cs.threads.iter().product::<u32>();
             let wave = if x.native.wave64 && threads > 32 {
                 64
             } else {
                 32
             };
-            if console_lanes || threads <= wave && s.lds_dwords > 0 {
+            // Cross-32: anything that needs a console lane id in 0..63 or a
+            // value from the other half. DPP / ds_swizzle alone stay intra-32.
+            let cross32 = console_lanes
+                && x.native.wave64
+                && (insts().any(|i| cross32_wave_op(x.st, x.res, i)) || {
+                    let whens = x.st.exits.iter().filter_map(|e| match *e {
+                        LaneExit::Branch { when, .. } => Some(when),
+                        _ => None,
+                    });
+                    let selectors =
+                        insts().filter_map(|i| x.st.valu_mask(i, valu_mask_operand(i)?));
+                    let mut all: Vec<Bool> = x
+                        .st
+                        .guards
+                        .iter()
+                        .flatten()
+                        .flatten()
+                        .copied()
+                        .chain(whens)
+                        .chain(selectors)
+                        .collect();
+                    all.sort_unstable();
+                    all.dedup();
+                    all.into_iter().any(|g| {
+                        x.st.bools
+                            .support(g)
+                            .iter()
+                            .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
+                    })
+                });
+            if console_lanes && wave == 64 {
+                if !cross32 {
+                    // DPP / ds_swizzle stay inside a 32-lane half: WaveSize(32)
+                    // with thread remapping matches the console bit for bit.
+                    s.wave_size = Some(32);
+                } else if let Some((barriers, scratch)) =
+                    try_wave64_on_wave32(p, x.st, x.res, threads, s.lds_dwords)
+                {
+                    s.wave_size = Some(32);
+                    s.lds_dwords += threads;
+                    lds_barriers = Some(barriers);
+                    wave64_emu = Some(Wave64Emu { scratch });
+                } else {
+                    s.wave_size = Some(64);
+                }
+            } else if console_lanes || threads <= wave && s.lds_dwords > 0 {
                 if !console_lanes && wave == 64 {
                     lds_barriers = super::lds::split_barriers(p, x.st);
                 }
-                if lds_barriers.is_none() {
+                // When uniform LDS fences work, leave WaveSize unset so a
+                // Wave32 host can run. When they do not (divergent LDS) and
+                // the program needs no console lane layout, also leave it
+                // unset: forcing WaveSize(64) only refuses on Wave32 GPUs.
+                // Console-lane programs take the branch above instead.
+                if lds_barriers.is_none() && (console_lanes || wave == 32) {
                     s.wave_size = Some(wave);
                 }
             }
@@ -547,6 +688,8 @@ impl<'a> Lower<'a> {
             flat: None,
             no_barrier,
             lds_barriers,
+            wave64_emu,
+            wave64_ids: None,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -922,7 +1065,12 @@ impl<'a> Lower<'a> {
                 )
             }
         };
-        Ok(if float { self.as_int(r) } else { r })
+        let r = if float { self.as_int(r) } else { r };
+        if self.wave64_emu.is_some() {
+            let id = self.s.m.i32(ident);
+            return Ok(self.combine_wave64_op(r, on, op, prefix, id, float, c));
+        }
+        Ok(r)
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
@@ -1008,7 +1156,12 @@ impl<'a> Lower<'a> {
         self.fill_phis()?;
         // A surviving read-first-lane or wave intrinsic still depends on the
         // original wave. Descriptor waterfalls may eliminate these operations.
-        if self.lds_barriers.is_some() && self.s.flags & flags::WAVE_OPS != 0 {
+        // Wave64-on-Wave32 emulation already chose WaveSize(32) and uses host
+        // wave ops inside each half; do not upgrade those shaders.
+        if self.lds_barriers.is_some()
+            && self.wave64_emu.is_none()
+            && self.s.flags & flags::WAVE_OPS != 0
+        {
             self.s.wave_size = Some(64);
         }
         let user_data = self.user_reads.values().copied().collect();
@@ -1361,6 +1514,9 @@ impl<'a> Lower<'a> {
             Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
         let bit = self.boolean(m, at)?;
+        if self.wave64_emu.is_some() && self.x.p.wave64 {
+            return Ok(self.ballot_64(bit, at));
+        }
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
         let r = self
@@ -2240,7 +2396,9 @@ impl<'a> Lower<'a> {
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index(e);
+        // Remapping keys off the host lane; console lane ids differ when
+        // Wave64 is emulated on Wave32.
+        let lane = self.host_lane(e);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -2326,15 +2484,10 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        self.s.flags |= flags::WAVE_OPS;
-        self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        )
+        if self.wave64_emu.is_some() {
+            return self.wave64_ids().console_lane;
+        }
+        self.host_lane(at)
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -2431,7 +2584,8 @@ impl<'a> Lower<'a> {
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
-            let lane = self.lane_index(c);
+            // Swizzles stay inside a 32-lane half: use the host lane index.
+            let lane = self.host_lane(c);
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
             let src = if offset & 0x8000 != 0 {
                 let (three, one) = (k(self, 3), k(self, 1));
@@ -2711,15 +2865,242 @@ impl<'a> Lower<'a> {
     }
 
     fn group_barrier(&mut self, fence_uavs: bool) {
+        self.group_barrier_at(self.cur, fence_uavs);
+    }
+
+    fn group_barrier_at(&mut self, at: usize, fence_uavs: bool) {
         let mode = self.s.m.i32(if fence_uavs { 1 | 2 | 8 } else { 1 | 8 });
         self.s.op(
-            self.cur,
+            at,
             "barrier",
             Attr::NoDuplicate,
             self.s.t.void,
             80,
             &[mode],
         );
+    }
+
+    /// Host Wave32 lane index (`0..31`).
+    fn host_lane(&mut self, at: usize) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        self.s.op(
+            at,
+            "waveGetLaneIndex",
+            Attr::ReadOnly,
+            self.s.t.i32,
+            111,
+            &[],
+        )
+    }
+
+    /// Entry ids for Wave64-on-Wave32 sequences (built once).
+    fn wave64_ids(&mut self) -> Wave64Ids {
+        if let Some(ids) = self.wave64_ids {
+            return ids;
+        }
+        let e = self.s.entry;
+        let i32t = self.s.t.i32;
+        let flat_raw = self.s.op(
+            e,
+            "flattenedThreadIdInGroup.i32",
+            Attr::ReadNone,
+            i32t,
+            96,
+            &[],
+        );
+        let first = self.s.op(
+            e,
+            "waveReadLaneFirst.i32",
+            Attr::NoUnwind,
+            i32t,
+            118,
+            &[flat_raw],
+        );
+        self.s.flags |= flags::WAVE_OPS;
+        let host = self.host_lane(e);
+        let mask = self.s.m.i32(!31);
+        let k63 = self.s.m.i32(63);
+        let kn63 = self.s.m.i32(!63);
+        let base = self.s.m.bin(e, Bin::And, first, mask);
+        let flat = self.s.m.bin(e, Bin::Add, base, host);
+        let console_lane = self.s.m.bin(e, Bin::And, flat, k63);
+        let console_wave_base = self.s.m.bin(e, Bin::And, flat, kn63);
+        let ids = Wave64Ids {
+            flat,
+            console_lane,
+            console_wave_base,
+            host_lane: host,
+        };
+        self.wave64_ids = Some(ids);
+        ids
+    }
+
+    fn scratch_ptr(&mut self, at: usize, index: V) -> V {
+        let scratch = self.wave64_emu.expect("wave64 emu").scratch;
+        let base = self.s.m.i32(scratch);
+        let idx = self.s.m.bin(at, Bin::Add, base, index);
+        let lds = self.s.lds();
+        self.s.m.element(at, lds, idx)
+    }
+
+    fn scratch_load(&mut self, at: usize, index: V) -> V {
+        let p = self.scratch_ptr(at, index);
+        self.s.m.load(at, p)
+    }
+
+    /// Cross-32-lane read via LDS scratch (uniform control flow only).
+    fn read_lane_64(&mut self, x: V, src_lane: V, at: usize) -> V {
+        let ids = self.wave64_ids();
+        let k63 = self.s.m.i32(63);
+        let lane = self.s.m.bin(at, Bin::And, src_lane, k63);
+        let src = self.s.m.bin(at, Bin::Add, ids.console_wave_base, lane);
+        let p_store = self.scratch_ptr(at, ids.flat);
+        self.s.m.store(at, p_store, x);
+        self.group_barrier_at(at, false);
+        let r = self.scratch_load(at, src);
+        self.group_barrier_at(at, false);
+        r
+    }
+
+    /// Exact 64-bit ballot of `bit` across the console wave via LDS.
+    fn ballot_64(&mut self, bit: V, at: usize) -> (V, V) {
+        let ids = self.wave64_ids();
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self
+            .s
+            .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let b = self.s.m.extract(at, r, 0);
+        let p_store = self.scratch_ptr(at, ids.flat);
+        self.s.m.store(at, p_store, b);
+        self.group_barrier_at(at, false);
+        let k0 = self.s.m.i32(0);
+        let k32 = self.s.m.i32(32);
+        let lo_i = self.s.m.bin(at, Bin::Add, ids.console_wave_base, k0);
+        let hi_i = self.s.m.bin(at, Bin::Add, ids.console_wave_base, k32);
+        let lo = self.scratch_load(at, lo_i);
+        let hi = self.scratch_load(at, hi_i);
+        self.group_barrier_at(at, false);
+        (lo, hi)
+    }
+
+    fn first_set_lane_64(&mut self, lo: V, hi: V, at: usize) -> V {
+        let z = self.s.m.i32(0);
+        let k32 = self.s.m.i32(32);
+        let lo_first = self
+            .s
+            .op(at, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[lo]);
+        let hi_first = self
+            .s
+            .op(at, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, 32, &[hi]);
+        let hi_lane = self.s.m.bin(at, Bin::Add, k32, hi_first);
+        let lo_nz = self.s.m.cmp(at, pred::NE, lo, z);
+        let hi_nz = self.s.m.cmp(at, pred::NE, hi, z);
+        let from_hi = self.s.m.select(at, hi_nz, hi_lane, z);
+        self.s.m.select(at, lo_nz, lo_first, from_hi)
+    }
+
+    /// Combine a per-half waveActive*/Prefix result into a 64-lane value.
+    #[allow(clippy::too_many_arguments)]
+    fn combine_wave64_op(
+        &mut self,
+        half_val: V,
+        active: V,
+        op: super::wave::Op,
+        prefix: Option<bool>,
+        ident: V,
+        float: bool,
+        at: usize,
+    ) -> V {
+        use super::wave::Op;
+        let ids = self.wave64_ids();
+        let z = self.s.m.i32(0);
+        let one = self.s.m.i32(1);
+        let k32 = self.s.m.i32(32);
+        let k33 = self.s.m.i32(33);
+        let k5 = self.s.m.i32(5);
+        let i32t = self.s.t.i32;
+        // Publish half_val at lane 0 of the half and half_any at lane 1.
+        let half_any = self.s.op(
+            at,
+            "waveAnyTrue",
+            Attr::NoUnwind,
+            self.s.t.i1,
+            113,
+            &[active],
+        );
+        self.s.flags |= flags::WAVE_OPS;
+        let any_i = self.s.m.cast(at, Cast::ZExt, half_any, i32t);
+        let is0 = self.s.m.cmp(at, pred::EQ, ids.host_lane, z);
+        let payload = self.s.m.select(at, is0, half_val, any_i);
+        let p = self.scratch_ptr(at, ids.flat);
+        self.s.m.store(at, p, payload);
+        self.group_barrier_at(at, false);
+        let i0 = self.s.m.bin(at, Bin::Add, ids.console_wave_base, z);
+        let i1 = self.s.m.bin(at, Bin::Add, ids.console_wave_base, one);
+        let i32b = self.s.m.bin(at, Bin::Add, ids.console_wave_base, k32);
+        let i33 = self.s.m.bin(at, Bin::Add, ids.console_wave_base, k33);
+        let v0 = self.scratch_load(at, i0);
+        let a0 = self.scratch_load(at, i1);
+        let v1 = self.scratch_load(at, i32b);
+        let a1 = self.scratch_load(at, i33);
+        self.group_barrier_at(at, false);
+        let a0b = self.s.m.cmp(at, pred::NE, a0, z);
+        let a1b = self.s.m.cmp(at, pred::NE, a1, z);
+        let both = self.s.m.bin(at, Bin::And, a0b, a1b);
+        let combine = |l: &mut Self, a: V, b: V| -> V {
+            let (x, y) = if float {
+                (l.as_float(a), l.as_float(b))
+            } else {
+                (a, b)
+            };
+            let r = match op {
+                Op::AddU | Op::AddF => l.s.m.bin(at, Bin::Add, x, y),
+                Op::Or => l.s.m.bin(at, Bin::Or, x, y),
+                Op::And => l.s.m.bin(at, Bin::And, x, y),
+                Op::Xor => l.s.m.bin(at, Bin::Xor, x, y),
+                Op::MinU => {
+                    let c = l.s.m.cmp(at, pred::IULT, x, y);
+                    l.s.m.select(at, c, x, y)
+                }
+                Op::MaxU => {
+                    let c = l.s.m.cmp(at, pred::IUGE, x, y);
+                    l.s.m.select(at, c, x, y)
+                }
+                Op::MinI | Op::MinF => {
+                    let c = l.s.m.cmp(at, if float { pred::OLT } else { pred::SLT }, x, y);
+                    l.s.m.select(at, c, x, y)
+                }
+                Op::MaxI | Op::MaxF => {
+                    let c = l.s.m.cmp(at, if float { pred::OGE } else { pred::SGE }, x, y);
+                    l.s.m.select(at, c, x, y)
+                }
+            };
+            if float { l.as_int(r) } else { r }
+        };
+        let both_v = combine(self, v0, v1);
+        let only0 = self.s.m.select(at, a0b, v0, ident);
+        let only1 = self.s.m.select(at, a1b, v1, only0);
+        let active_total = self.s.m.select(at, both, both_v, only1);
+        match prefix {
+            None => active_total,
+            Some(_) => {
+                // Low half keeps its 32-lane prefix; high half adds the low total.
+                let half = self.s.m.bin(at, Bin::LShr, ids.console_lane, k5);
+                let high = self.s.m.cmp(at, pred::NE, half, z);
+                let low_total = self.s.m.select(at, a0b, v0, ident);
+                let add = if float {
+                    let a = self.as_float(half_val);
+                    let b = self.as_float(low_total);
+                    let s = self.s.m.bin(at, Bin::Add, a, b);
+                    self.as_int(s)
+                } else {
+                    self.s.m.bin(at, Bin::Add, half_val, low_total)
+                };
+                self.s.m.select(at, high, add, half_val)
+            }
+        }
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -4397,7 +4778,8 @@ impl<'a> Lower<'a> {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
-        let lane = self.lane_index(c);
+        // DPP patterns stay inside a 32-lane half: use the host lane index.
+        let lane = self.host_lane(c);
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
@@ -4977,7 +5359,11 @@ impl<'a> Lower<'a> {
                 } else {
                     self.cross_lane(false)?;
                 }
-                let r = self.read_lane(a, lane);
+                let r = if self.wave64_emu.is_some() {
+                    self.read_lane_64(a, lane, c)
+                } else {
+                    self.read_lane(a, lane)
+                };
                 int(self, r)
             }
             "v_writelane_b32" => {
@@ -4992,6 +5378,12 @@ impl<'a> Lower<'a> {
                 };
                 self.cross_lane(false)?;
                 let me = self.lane_index(c);
+                let lane = if self.wave64_emu.is_some() {
+                    let k63 = self.s.m.i32(63);
+                    self.s.m.bin(c, Bin::And, lane, k63)
+                } else {
+                    lane
+                };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -5009,14 +5401,21 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let a = s(self, 0)?;
                 self.s.flags |= flags::WAVE_OPS;
-                let r = self.s.op(
-                    c,
-                    "waveReadLaneFirst.i32",
-                    Attr::NoUnwind,
-                    self.s.t.i32,
-                    118,
-                    &[a],
-                );
+                let r = if self.wave64_emu.is_some() {
+                    let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+                    let (lo, hi) = self.ballot_64(bit, c);
+                    let first = self.first_set_lane_64(lo, hi, c);
+                    self.read_lane_64(a, first, c)
+                } else {
+                    self.s.op(
+                        c,
+                        "waveReadLaneFirst.i32",
+                        Attr::NoUnwind,
+                        self.s.t.i32,
+                        118,
+                        &[a],
+                    )
+                };
                 int(self, r)
             }
             _ => {

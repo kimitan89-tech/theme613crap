@@ -3,11 +3,34 @@
 use crate::gfx10::Fields;
 use crate::ir::{Program, Reg, Value, reverse_postorder};
 use crate::resource::Site;
-use crate::structure::{Atom, LaneExit, Structured};
+use crate::structure::{Atom, Bool, LaneExit, Structured};
+
+/// Reconvergence analysis for splitting a console wave across host waves.
+pub(super) struct Analysis {
+    /// Blocks that only some threads of the group reach after a divergent
+    /// branch. Barriers in these blocks deadlock.
+    pub divergent: Vec<bool>,
+    varying: HashSet<Value>,
+}
+
+impl Analysis {
+    /// Whether a lane boolean is group-uniform under this analysis.
+    pub fn uniform(&self, st: &Structured, g: Bool) -> bool {
+        st.bools
+            .support(g)
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(v) if !self.varying.contains(v)))
+    }
+}
 
 /// Fences needed to split a single console wave across host waves. None means
 /// at least one access or existing barrier cannot be proved group-uniform.
 pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Site>> {
+    let a = analyze(p, st);
+    barriers_for(p, st, &a)
+}
+
+pub(super) fn analyze(p: &Program, st: &Structured) -> Analysis {
     let blocks = &p.blocks;
     let order = reverse_postorder(blocks);
     let mut rank = vec![usize::MAX; blocks.len()];
@@ -30,7 +53,6 @@ pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Sit
     {
         varying = varying_values(p, &order, false);
     }
-    let uniform_condition = |g| uniform(g, &varying);
     // Compute the first guaranteed reconvergence in reverse execution order.
     // A back edge can also exit at the emitted loop limit, so it guarantees
     // no later block. 'end' represents a return or such a loop exit.
@@ -54,7 +76,7 @@ pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Sit
                         f = join[f];
                     }
                 }
-                if !uniform_condition(when) {
+                if !uniform(when, &varying) {
                     let mut visited = HashSet::new();
                     let mut todo = vec![taken, not_taken];
                     while let Some(q) = todo.pop() {
@@ -69,16 +91,46 @@ pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Sit
             LaneExit::End | LaneExit::Indirect => end,
         };
     }
+    Analysis { divergent, varying }
+}
+
+fn barriers_for(p: &Program, st: &Structured, a: &Analysis) -> Option<HashSet<Site>> {
+    let blocks = &p.blocks;
+    let order = reverse_postorder(blocks);
 
     for &b in &order {
         for (i, inst) in blocks[b].insts.iter().enumerate() {
-            if (matches!(inst.fields, Fields::Ds { .. }) || inst.name() == "s_barrier")
-                && (divergent[b] || st.guards[b][i].is_some_and(|g| !uniform_condition(g)))
-            {
+            let name = inst.name();
+            if a.divergent[b] && (matches!(inst.fields, Fields::Ds { .. }) || name == "s_barrier") {
+                return None;
+            }
+            // An `s_barrier` with a non-uniform guard is divergent even in a
+            // reconverged block: only some threads execute it. A `ds_*` with
+            // a non-uniform inline guard is fine when `!divergent[b]`: the
+            // inserted group fence runs before `begin_guarded`, so every
+            // thread that reached the block hits it in lockstep.
+            if name == "s_barrier" && st.guards[b][i].is_some_and(|g| !a.uniform(st, g)) {
                 return None;
             }
         }
     }
+    Some(fence_sites(p, a, false))
+}
+
+/// Fences for LDS accesses that sit in group-uniform blocks only. Divergent
+/// `ds_*` are skipped (never insert a barrier there) so Wave64-on-Wave32
+/// emulation can still sync the uniform part of the group's own LDS.
+pub(super) fn uniform_split_barriers(
+    p: &Program,
+    _st: &Structured,
+    a: &Analysis,
+) -> HashSet<Site> {
+    fence_sites(p, a, true)
+}
+
+fn fence_sites(p: &Program, a: &Analysis, skip_divergent: bool) -> HashSet<Site> {
+    let blocks = &p.blocks;
+    let order = reverse_postorder(blocks);
     // Order RAW, WAR and WAW, including dependencies across loop edges.
     // Otherwise a wave can reuse a tile while the other is still reading it.
     let mut out = vec![0u8; blocks.len()];
@@ -91,6 +143,9 @@ pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Sit
                 if inst.name() == "s_barrier" {
                     pending = 0;
                 } else if matches!(inst.fields, Fields::Ds { .. }) {
+                    if skip_divergent && a.divergent[b] {
+                        continue;
+                    }
                     let read_only = inst.name().starts_with("ds_read");
                     if pending & 2 != 0 || (!read_only && pending != 0) {
                         barriers.insert((b, i));
@@ -102,7 +157,7 @@ pub(super) fn split_barriers(p: &Program, st: &Structured) -> Option<HashSet<Sit
             out[b] = pending;
         }
         if !changed {
-            return Some(barriers);
+            return barriers;
         }
     }
 }

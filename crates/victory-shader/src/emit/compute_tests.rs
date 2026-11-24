@@ -1243,10 +1243,19 @@ fn wave(shader: &HostShader) -> (u32, u32) {
 }
 
 #[test]
-fn divergent_lds_keeps_wave64() {
-    let masked = [0x7da4_0080, WRITE[0], WRITE[1], END]; // v_cmpx, predicated write
+fn predicated_lds_in_uniform_block_can_split() {
+    // v_cmpx predicates the write, but every thread still reaches the block:
+    // the inserted group fence runs outside begin_guarded, so WaveSize(64)
+    // is unnecessary.
+    let masked = [0x7da4_0080, WRITE[0], WRITE[1], END];
+    assert_eq!(wave(&shader(&masked, compute([64, 1, 1]))), (0, u32::MAX));
+}
+
+#[test]
+fn divergent_lds_avoids_wave64_refusal() {
+    // Divergent LDS cannot get safe split fences, but forcing WaveSize(64)
+    // only refuses the shader on Wave32 hosts. Leave WaveSize unset instead.
     let branch = [0x7da4_0080, 0xbf88_0002, WRITE[0], WRITE[1], END];
-    // Remove lanes from EXEC on each iteration; LDS inside the loop.
     let varying_loop = [
         0xbe82_0480,
         WRITE[0],
@@ -1259,8 +1268,8 @@ fn divergent_lds_keeps_wave64() {
         0x88fe_027e,
         END,
     ];
-    for words in [&masked[..], &branch, &varying_loop] {
-        assert_eq!(wave(&shader(words, compute([64, 1, 1]))), (64, 64));
+    for words in [&branch[..], &varying_loop] {
+        assert_eq!(wave(&shader(words, compute([64, 1, 1]))), (0, u32::MAX));
     }
 }
 
@@ -1550,6 +1559,124 @@ mod lds_wave_device {
             }
         }
     }
+
+    /// Wave64-on-Wave32: bit-exact cross-half reads, mbcnt, readfirstlane, and
+    /// predicated LDS without WaveSize(64).
+    #[test]
+    fn wave64_on_wave32_bit_exact_on_device() {
+        let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // VOP3 readlane: src0=v0 is operand 256, src1=inline lane (128+n).
+        let readlane = |sdst: u32, lane: u32| -> [u32; 2] {
+            [0xd760_0000 | sdst, 0x100 | ((128 + lane) << 9)]
+        };
+
+        // 1) v_readlane of lane 0 and lane 63 across Wave32 halves.
+        for (lane, expect) in [(0u32, 0u32), (63, 63)] {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9, // v0 = console lane
+            ]);
+            words.extend(readlane(2, lane));
+            words.extend([
+                0x7e06_0202, // v3 = s2
+                0x3404_0082, // v2 = 4 * tid.x
+            ]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (32, 32), "readlane({lane}) should emulate");
+            let out = dispatch(&cs, 64);
+            assert!(
+                out.iter().all(|&v| v == expect),
+                "readlane({lane}): expected {expect}, got {out:?}"
+            );
+        }
+
+        // 2) mbcnt_lo + mbcnt_hi over all-ones → console lane index 0..63.
+        {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0003,
+                193 | 128 << 9,
+                0xd766_0003,
+                193 | 259 << 9,
+                0x3404_0082,
+            ]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (32, 32));
+            assert_eq!(dispatch(&cs, 64), (0..64).collect::<Vec<_>>());
+        }
+
+        // 3) v_readfirstlane where only lanes >= 32 are active → value 32.
+        {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9, // v0 = lane
+                0x7d82_009f,    // v_cmp_lt_u32 vcc, 31, v0  (v0 > 31)
+                0xbe82_246a,    // s_and_saveexec_b64 s[2:3], vcc
+                0x7e00_0500,    // v_readfirstlane_b32 s0, v0
+                0x7e06_0200,    // v3 = s0
+                0x3404_0082,
+            ]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (32, 32));
+            let out = dispatch(&cs, 64);
+            for (i, &v) in out.iter().enumerate() {
+                if i >= 32 {
+                    assert_eq!(v, 32, "lane {i} expected readfirstlane=32, got {v}");
+                }
+            }
+        }
+
+        // 4) Cross-half v_readlane(32) (DPP+readlane style reduction).
+        {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9,
+            ]);
+            words.extend(readlane(2, 32));
+            words.extend([0x7e06_0202, 0x3404_0082]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (32, 32));
+            assert!(
+                dispatch(&cs, 64).iter().all(|&v| v == 32),
+                "expected readlane(32)=32"
+            );
+        }
+
+        // 5) Predicated ds_write + ds_read in a uniform block: no WaveSize(64).
+        {
+            let mut words = UAV.to_vec();
+            words.push(0x3404_0082);
+            words.push(0x7e00_0202);
+            words.push(0x7da4_0080);
+            words.extend(WRITE);
+            words.push(SYNC);
+            words.extend(READ);
+            words.push(0x3404_0082);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_ne!(wave(&cs), (64, 64));
+            host().compute_pipeline(&cs).expect("predicated LDS PSO");
+        }
+    }
+
 }
 
 #[test]
