@@ -1707,12 +1707,157 @@ mod lds_wave_device {
 #[test]
 fn dumped_global_atomic_shader_translates() {
     // Top failed_compute hit: root VA via readfirstlane + global_atomic_*
-    // (including fmin/fmax via float-order umin/umax) and glc into dst.
+    // (including fmin/fmax via bounded IEEE CAS) and glc into dst.
     let path = r"D:\gta6\failed_shaders\failed_compute_f6e47efa50226beb.bin";
     let Ok(bytes) = std::fs::read(path) else {
         return;
     };
     translate(&bytes).expect("global_atomic root-address shader should translate");
+}
+
+/// `global_atomic_fmin` / `fmax` must leave exact IEEE-754 f32 bits in the
+/// buffer (not a bit-flipped total-order encoding).
+#[cfg(all(windows, feature = "host"))]
+#[test]
+fn global_atomic_fmin_fmax_preserve_ieee_bits() {
+    use crate::emit::host::{Dispatch, Host, Root};
+    use crate::emit::{HostShader, validator};
+    use crate::emit::valu_tests::ONE_AT_A_TIME;
+
+    // Root UAV in s[0:1]. v[0:1] = address; v2 = value.
+    // Offsets 0/4/8/12: fmin(-1), fmax(-2), fmax(-1), fmin(1) against
+    // inits +FLT_MAX, 0.0, -5.0, 3.0.
+    let fmin = |off: u32, lit: u32| {
+        [
+            0x7E00_0200u32, // v_mov_b32 v0, s0
+            0x7E02_0201,    // v_mov_b32 v1, s1
+            0x7E04_02FF,    // v_mov_b32 v2, lit
+            lit,
+            0xDCFC_8000 | (off & 0x1FFF), // global_atomic_fmin
+            0x007D_0200,                  // data=v2, addr=v0, saddr=null
+        ]
+    };
+    let fmax = |off: u32, lit: u32| {
+        [
+            0x7E00_0200u32,
+            0x7E02_0201,
+            0x7E04_02FF,
+            lit,
+            0xDD00_8000 | (off & 0x1FFF), // global_atomic_fmax
+            0x007D_0200,
+        ]
+    };
+    let mut words = Vec::new();
+    words.extend(fmin(0, (-1.0f32).to_bits()));
+    words.extend(fmax(4, (-2.0f32).to_bits()));
+    words.extend(fmax(8, (-1.0f32).to_bits()));
+    words.extend(fmin(12, 1.0f32.to_bits()));
+    words.push(S_ENDPGM);
+
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, false, 8).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let lowered = lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+    })
+    .expect("float atomic CAS should lower");
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs.clone(),
+        const_views: lowered.const_views,
+    };
+    assert_eq!(shader.root_uavs, vec![0]);
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+
+    let _guard = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        return;
+    };
+    let (root, pso) = host
+        .compute_pipeline(&shader)
+        .expect("float atomic compute PSO");
+    let init = [
+        f32::MAX.to_bits(),
+        0.0f32.to_bits(),
+        (-5.0f32).to_bits(),
+        3.0f32.to_bits(),
+    ];
+    // Root signature: param 0 = user-data constants, param 1 = root UAV slot 0.
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (0, Root::Constants(ud)),
+                    (1, Root::UavView { data: init.to_vec() }),
+                ],
+                views: &[],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("float atomic dispatch");
+    let got = &out[0][..4];
+    let want = [
+        (-1.0f32).to_bits(),
+        0.0f32.to_bits(),
+        (-1.0f32).to_bits(),
+        1.0f32.to_bits(),
+    ];
+    assert_eq!(
+        got, want,
+        "IEEE bits mismatch: got {:08x?} want {:08x?}",
+        got, want
+    );
 }
 
 #[test]

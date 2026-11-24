@@ -321,7 +321,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 Some(&uav_desc),
                 uav_cpu,
             );
-            let l = &host_list.list;
+            let l = host_list.cmd();
             l.ResourceBarrier(&[uav_barrier()]);
             l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
             l.SetComputeRootSignature(&pass.root);
@@ -543,7 +543,7 @@ mod tests {
                 },
             };
             host_list
-                .list
+                .cmd()
                 .CopyTextureRegion(&to, 0, 0, 0, &from, None);
         }
         assert_eq!(slot::<extern "system" fn(This) -> crate::object::HRESULT>(list, 0x48)(list), S_OK);

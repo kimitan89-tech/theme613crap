@@ -365,10 +365,27 @@ mod tests {
     }
 }
 
+/// Active allocator + command list pair (recording is single-threaded per
+/// [`HostList`]; compute segment splits swap the pair under that lock).
+struct ActiveList {
+    allocator: ID3D12CommandAllocator,
+    list: ID3D12GraphicsCommandList,
+}
+
+/// Max compute dispatches recorded into one host command-list segment
+/// before a TDR-safe split (outside graphics render passes).
+const COMPUTE_SEGMENT_DISPATCHES: u32 = 128;
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
-    allocator: ID3D12CommandAllocator,
-    pub(crate) list: ID3D12GraphicsCommandList,
+    /// Current recording segment (may be swapped by compute segment splits).
+    active: Mutex<ActiveList>,
+    /// Closed compute segments that run before the active list on submit.
+    segments: Mutex<Vec<ActiveList>>,
+    /// Idle segments recycled on [`HostList::reset`].
+    segment_pool: Mutex<Vec<ActiveList>>,
+    /// Compute dispatches recorded into the current active segment.
+    segment_dispatches: AtomicU32,
     /// Work for submission time, in recorded order.
     deferred: Mutex<Deferred>,
     /// Upload memory for data the list's draws make (expanded vertices),
@@ -585,8 +602,10 @@ impl Host {
             )?;
             prelude.Close()?;
             Ok(HostList {
-                allocator,
-                list,
+                active: Mutex::new(ActiveList { allocator, list }),
+                segments: Mutex::default(),
+                segment_pool: Mutex::default(),
+                segment_dispatches: AtomicU32::new(0),
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 uav_scratch: Mutex::default(),
@@ -643,18 +662,32 @@ impl Host {
         if runs.is_empty() {
             return;
         }
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(4 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
+        // Keep segment COM refs alive across ExecuteCommandLists.
+        let mut segment_keep: Vec<ID3D12GraphicsCommandList> = Vec::new();
         for list in &runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
-            lists.push(list.list.cast().ok());
+            // Closed compute segments first (in record order), then the
+            // active list — each becomes its own TDR-chunkable entry.
+            {
+                let segs = list.segments.lock().unwrap_or_else(|e| e.into_inner());
+                for seg in segs.iter() {
+                    segment_keep.push(seg.list.clone());
+                    lists.push(seg.list.cast().ok());
+                }
+            }
+            let active = list.cmd();
+            segment_keep.push(active.clone());
+            lists.push(active.cast().ok());
         }
+        let _ = &segment_keep;
         batch.flush();
         let prepared = std::time::Instant::now();
         // Split large multi-list submissions into smaller GPU batches so a
@@ -871,7 +904,14 @@ impl Host {
             while let Some(p) = node.as_ref() {
                 let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
-                let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let index = runs.iter().position(|r| {
+                    Some(r.cmd().as_raw()) == ours
+                        || r.segments
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .any(|s| Some(s.list.as_raw()) == ours)
+                });
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
@@ -887,7 +927,14 @@ impl Host {
                         p.BreadcrumbCount, history[done as usize].0
                     ));
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
-                    let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
+                    let run = runs.iter().find(|r| {
+                        Some(r.cmd().as_raw()) == list
+                            || r.segments
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .iter()
+                                .any(|s| Some(s.list.as_raw()) == list)
+                    });
                     // The k-th marker command is the k-th note.
                     #[cfg(feature = "diagnostics")]
                     let markers: Vec<(u32, String)> = run.map_or_else(Vec::new, |r| {
@@ -989,6 +1036,84 @@ impl Host {
 }
 
 impl HostList {
+    /// Clone of the active recording command list (COM AddRef).
+    pub(crate) fn cmd(&self) -> ID3D12GraphicsCommandList {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list
+            .clone()
+    }
+
+    /// Close the current segment when it has recorded enough compute
+    /// dispatches and we are outside a graphics render pass, then open a
+    /// fresh segment so `execute` can TDR-chunk the work. Returns whether
+    /// a split happened (caller should invalidate cached host bindings).
+    pub(crate) fn maybe_split_compute_segment(
+        &self,
+        in_graphics_pass: bool,
+    ) -> bool {
+        if in_graphics_pass {
+            return false;
+        }
+        let n = self.segment_dispatches.load(Ordering::Relaxed);
+        if n < COMPUTE_SEGMENT_DISPATCHES {
+            return false;
+        }
+        let Some(host) = host() else {
+            return false;
+        };
+        let fresh = {
+            let mut pool = self.segment_pool.lock().unwrap_or_else(|e| e.into_inner());
+            pool.pop().or_else(|| {
+                // SAFETY: plain object creation on our device.
+                unsafe {
+                    let allocator: ID3D12CommandAllocator = host
+                        .device
+                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                        .ok()?;
+                    let list: ID3D12GraphicsCommandList = host
+                        .device
+                        .CreateCommandList(
+                            0,
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            &allocator,
+                            None,
+                        )
+                        .ok()?;
+                    Some(ActiveList { allocator, list })
+                }
+            })
+        };
+        let Some(fresh) = fresh else {
+            return false;
+        };
+        // Close the filled segment and swap in the fresh one.
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: our open list.
+        if unsafe { active.list.Close() }.is_err() {
+            // Put the unused fresh segment back so it is not leaked.
+            self.segment_pool
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(fresh);
+            return false;
+        }
+        let filled = std::mem::replace(&mut *active, fresh);
+        drop(active);
+        self.segments
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(filled);
+        self.segment_dispatches.store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// Count a compute dispatch toward the current segment's TDR budget.
+    pub(crate) fn note_segment_dispatch(&self) {
+        self.segment_dispatches.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -1066,17 +1191,18 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let list = self.cmd();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
             // SAFETY: an open list, our heap and read-back buffer.
             unsafe {
-                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
-                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+                list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
         // SAFETY: our list.
-        if let Err(e) = unsafe { self.list.Close() } {
+        if let Err(e) = unsafe { list.Close() } {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -1091,6 +1217,7 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.graphics_ops.store(0, Ordering::Relaxed);
         self.compute_ops.store(0, Ordering::Relaxed);
+        self.segment_dispatches.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
@@ -1101,11 +1228,33 @@ impl HostList {
             let mut scratch = self.uav_scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+        // Recycle closed compute segments into the pool (no COM leak).
+        {
+            let mut segs = self.segments.lock().unwrap_or_else(|e| e.into_inner());
+            let mut pool = self.segment_pool.lock().unwrap_or_else(|e| e.into_inner());
+            for seg in segs.drain(..) {
+                // SAFETY: segments finished with the last submit.
+                let _ = unsafe { seg.allocator.Reset() };
+                pool.push(seg);
+            }
+            for seg in pool.iter() {
+                // SAFETY: pooled lists stay closed until reused by a split.
+                let _ = unsafe {
+                    seg.list
+                        .Reset(&seg.allocator, None)
+                        .and_then(|()| seg.list.Close())
+                };
+            }
+        }
+        let reset = {
+            let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: the list is not executing (every submission is waited for).
+            unsafe {
+                active
+                    .allocator
+                    .Reset()
+                    .and_then(|()| active.list.Reset(&active.allocator, None))
+            }
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));
@@ -1193,17 +1342,18 @@ impl HostList {
     #[cfg(feature = "diagnostics")]
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
+            let list = self.cmd();
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
             if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
                 // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+                unsafe { list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
             }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
             const UNICODE: u32 = 0;
             // SAFETY: an open list; the marker is copied when recorded.
             unsafe {
-                self.list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
+                list.SetMarker(UNICODE, Some(text.as_ptr().cast()), 2 * text.len() as u32)
             };
             self.notes
                 .lock()
@@ -2431,7 +2581,7 @@ impl Host {
                 return None;
             };
             p.copy.reset();
-            let list = &p.copy.list;
+            let list = p.copy.cmd();
             list.ResourceBarrier(&[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
@@ -2532,9 +2682,9 @@ impl Host {
                     ));
                     list.ResourceBarrier(&restore);
                     let capture = crate::capture::wanted(frame)
-                        .then(|| crate::capture::read_back(&self.device, list, &back))
+                        .then(|| crate::capture::read_back(&self.device, &list, &back))
                         .flatten();
-                    let probe = crate::capture::probe(&self.device, list, &back);
+                    let probe = crate::capture::probe(&self.device, &list, &back);
                     list.ResourceBarrier(&[transition(
                         &back,
                         D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -2569,10 +2719,10 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, &list, texture))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = crate::capture::probe(&self.device, list, texture);
+            let probe = crate::capture::probe(&self.device, &list, texture);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[

@@ -387,7 +387,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { list.cmd().ResourceBarrier(host) };
         }
     }
     0
@@ -401,7 +401,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.cmd().ResourceBarrier(&[barrier]) };
     }
 }
 
@@ -462,7 +462,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { list.cmd().CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -585,7 +585,7 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
-            list.list.CopyTextureRegion(
+            list.cmd().CopyTextureRegion(
                 (&raw const to_location).cast(),
                 x,
                 y,
@@ -646,9 +646,9 @@ extern "system" fn resolve(
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(crate::resource::pc_target_format(format) as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
-                list.list
+                list.cmd()
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
-            } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+            } else if let Ok(list1) = list.cmd().cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
                     left: 0,
@@ -715,13 +715,13 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                list.cmd().ResourceBarrier(&[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            list.cmd().ClearRenderTargetView(rtv, color, rects);
         }
     }
     #[cfg(not(windows))]
@@ -761,7 +761,7 @@ extern "system" fn clear_dsv(
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
+            list.cmd()
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
     }
@@ -1250,7 +1250,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { list.cmd().ResourceBarrier(&[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

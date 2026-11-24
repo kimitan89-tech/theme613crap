@@ -248,7 +248,7 @@ impl State {
         };
         // SAFETY: an open list.
         unsafe {
-            list.list
+            list.cmd()
                 .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
         };
     }
@@ -361,7 +361,7 @@ impl State {
         });
         // SAFETY: an open list; the views were just made.
         unsafe {
-            list.list.OMSetRenderTargets(
+            list.cmd().OMSetRenderTargets(
                 rtvs.len() as u32,
                 (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
                 false,
@@ -429,7 +429,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
-        let l = &list.list;
+        let l = list.cmd();
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -495,7 +495,7 @@ impl State {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        let l = &list.list;
+        let l = list.cmd();
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -707,9 +707,16 @@ impl State {
             self.note_watched_writers(true);
         }
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.cmd().Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         list.note_compute_op();
+        list.note_segment_dispatch();
+        // Outside a graphics pass, split mega compute lists so Windows's
+        // 2 s TDR limit cannot be hit by 1k–4k dispatches in one list.
+        let in_graphics = !self.targets.is_empty() || self.depth != 0;
+        if list.maybe_split_compute_segment(in_graphics) {
+            self.invalidate_host();
+        }
     }
 
     /// Record this pipeline against watched 1280×720 f10/f27/f28 targets.
@@ -772,7 +779,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = self.prepare_for(list, false, true)
-            && match list.list.cast::<ID3D12GraphicsCommandList6>() {
+            && match list.cmd().cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
@@ -1139,7 +1146,7 @@ impl State {
             }
             // SAFETY: an open list with everything set.
             unsafe {
-                list.list
+                list.cmd()
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1206,7 +1213,7 @@ impl State {
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { list.cmd().IASetVertexBuffers(slot, Some(&[view])) };
         }
         true
     }
@@ -1294,7 +1301,7 @@ impl State {
                 StrideInBytes: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { list.cmd().IASetVertexBuffers(slot, Some(&[view])) };
         }
         true
     }
@@ -1319,7 +1326,7 @@ impl State {
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
-                list.list
+                list.cmd()
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -1472,7 +1479,7 @@ impl State {
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {
-            list.list.ExecuteIndirect(
+            list.cmd().ExecuteIndirect(
                 &signature,
                 max,
                 &exec_args.0,
@@ -1636,20 +1643,20 @@ const QUAD_STRIP: u32 = 20;
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
+    unsafe { list.cmd().RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
     // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
+    unsafe { list.cmd().RSSetScissorRects(rects) };
 }
 
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
+    unsafe { list.cmd().OMSetBlendFactor(factor) };
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
+    unsafe { list.cmd().OMSetStencilRef(reference) };
 }

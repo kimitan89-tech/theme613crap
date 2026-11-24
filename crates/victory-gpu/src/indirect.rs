@@ -205,7 +205,7 @@ pub(crate) fn bound(
     if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
         return false;
     }
-    let l = &list.list;
+    let l = list.cmd();
     let constants = [kind, stride, records, 0];
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.
@@ -248,7 +248,7 @@ pub(crate) fn bound_rects(
     }
     let len = u64::from(stride) * u64::from(records.max(1));
     let (dst, dst_offset, dst_gpu) = list.indirect_scratch(len)?;
-    let l = &list.list;
+    let l = list.cmd();
     let constants = [stride, records, max_verts, 0];
     // SAFETY: an open list; our root signature, pipeline and live buffers
     // the caller's list holds.
@@ -278,7 +278,7 @@ pub(crate) fn bound_rects(
 pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
     // SAFETY: an open list and a live buffer.
     unsafe {
-        list.list.ResourceBarrier(&[transition(
+        list.cmd().ResourceBarrier(&[transition(
             buffer,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -334,18 +334,18 @@ mod tests {
         let (dst, dst_off) = bound_rects(&list, src_gpu, (16, 3, 24)).expect("bound_rects");
         // SAFETY: transition dst to COPY_SOURCE, copy to readback, restore UAV.
         unsafe {
-            list.list.ResourceBarrier(&[transition(
+            list.cmd().ResourceBarrier(&[transition(
                 &dst,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            list.list.CopyBufferRegion(&rb, 0, &dst, dst_off, 48);
-            list.list.ResourceBarrier(&[transition(
+            list.cmd().CopyBufferRegion(&rb, 0, &dst, dst_off, 48);
+            list.cmd().ResourceBarrier(&[transition(
                 &dst,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
-            list.list.Close().expect("close");
+            list.cmd().Close().expect("close");
         }
         host.execute(&[&list]);
         let mut out = [[0u32; 4]; 3];

@@ -1014,9 +1014,10 @@ impl<'a> Lower<'a> {
         op: &str,
         data: &Option<Operand>,
     ) -> Result<(), Why> {
-        // DXIL has no float min/max atomics: map fmin/fmax through the
-        // total-order bit transform, then umin/umax on the raw buffer.
-        let float_order = matches!(op, "fmin" | "fmax");
+        // DXIL has no float min/max atomics. Keep real IEEE-754 f32 bits in
+        // the buffer via a bounded CAS loop (bit-flipped umin/umax would
+        // poison shared float buffers that later passes read as f32).
+        let float_atomic = matches!(op, "fmin" | "fmax");
         let mut code = match op {
             "add" | "sub" => 0u32,
             "and" => 1,
@@ -1024,10 +1025,11 @@ impl<'a> Lower<'a> {
             "xor" => 3,
             "smin" => 4,
             "smax" => 5,
-            "umin" | "fmin" => 6,
-            "umax" | "fmax" => 7,
+            "umin" => 6,
+            "umax" => 7,
             "swap" => 8,
             "cmpswap" => u32::MAX,
+            "fmin" | "fmax" => u32::MAX - 1,
             _ => return Err(inst.name()),
         };
         let a = *self
@@ -1064,9 +1066,6 @@ impl<'a> Lower<'a> {
             value = self.s.m.bin(c, Bin::Sub, z, value);
             code = 0;
         }
-        if float_order {
-            value = self.float_atomic_order(c, value);
-        }
         // Flat atomics write the old value to `dst` (often the address lo
         // VGPR), not to `data`. Buffer atomics reuse the data operand.
         let returns = cache.glc;
@@ -1075,7 +1074,7 @@ impl<'a> Lower<'a> {
             _ if returns => return Err("a global atomic result"),
             _ => None,
         };
-        let old = match dst_reg.and_then(|reg| inst.read(Reg::V(reg))) {
+        let outside = match dst_reg.and_then(|reg| inst.read(Reg::V(reg))) {
             Some(v) => self.i32_of(v).unwrap_or_else(|_| self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
@@ -1083,7 +1082,9 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let u = self.s.m.undef(i32t);
         let coords = [off, u, u];
-        let r = if code == u32::MAX {
+        let r = if float_atomic {
+            self.float_atomic_cas(h, off, value, op == "fmax")
+        } else if code == u32::MAX {
             let mut args = vec![h];
             args.extend(coords);
             args.extend([vals[1], vals[0]]);
@@ -1102,39 +1103,79 @@ impl<'a> Lower<'a> {
             self.s
                 .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
         };
-        let mut r = self.end_guarded(at, &[(r, old)])[0];
-        if float_order {
-            r = self.float_atomic_unorder(self.cur, r);
-        }
+        let r = self.end_guarded(at, &[(r, outside)])[0];
         if let Some(reg) = dst_reg {
             self.write(inst, Reg::V(reg), r, None);
         }
         Ok(())
     }
 
-    /// Map a float bit pattern to a uint total order so umin/umax match
-    /// fmin/fmax (negatives sort below positives; NaN stays at the extremes).
-    fn float_atomic_order(&mut self, at: usize, bits: V) -> V {
-        let sign = self.s.m.i32(0x8000_0000);
+    /// Bounded CAS loop for `global_atomic_fmin` / `fmax`: memory always
+    /// holds real IEEE-754 `f32` bits (never a bit-flipped total order).
+    fn float_atomic_cas(&mut self, h: V, byte: V, val: V, max: bool) -> V {
+        const RETRIES: u32 = 64;
+        let i32t = self.s.t.i32;
+        let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
+        let u = self.s.m.undef(i32t);
+        let start = self.cur;
+        let loaded = self.s.op(
+            start,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            139,
+            &[h, byte, u, mask, align],
+        );
+        let extracted = self.s.m.extract(start, loaded, 0);
+        let old0 = self.as_int(extracted);
+        let (head, body, exit) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(start, Term::Br(head));
+        self.cur = head;
+        let old = self.s.m.phi(head, i32t);
+        let tries = self.s.m.phi(head, i32t);
+        let old_f = self.as_float(old);
+        let val_f = self.as_float(val);
+        // GFX10 fmin/fmax: FMin/FMax with RDNA -0 ordering via max_min.
+        let want_f = self.max_min(max, old_f, val_f);
+        let want = self.as_int(want_f);
+        let same = self.s.m.cmp(head, pred::EQ, want, old);
+        let cap = self.s.m.i32(RETRIES);
+        let exhausted = self.s.m.cmp(head, pred::EQ, tries, cap);
+        // leave when already at the extremum or the retry cap is hit
+        let t = self.s.m.bool(true);
+        let stop = self.s.m.select(head, same, t, exhausted);
+        self.s.m.terminate(head, Term::CondBr(stop, exit, body));
+        self.cur = body;
+        // atomicCompareExchange(handle, coord0..2, compare, new)
+        let mut args = vec![h];
+        args.extend([byte, u, u]);
+        args.extend([old, want]);
+        let prev = self.s.op(
+            body,
+            "atomicCompareExchange.i32",
+            Attr::NoUnwind,
+            i32t,
+            79,
+            &args,
+        );
+        let ok = self.s.m.cmp(body, pred::EQ, prev, old);
+        self.s.m.terminate(body, Term::CondBr(ok, exit, head));
+        let one = self.s.m.i32(1);
+        let next_tries = self.s.m.bin(body, Bin::Add, tries, one);
         let zero = self.s.m.i32(0);
-        let all = self.s.m.i32(u32::MAX);
-        let neg = self.s.m.cmp(at, pred::SLT, bits, zero);
-        let flipped = self.s.m.bin(at, Bin::Xor, bits, all);
-        let positive = self.s.m.bin(at, Bin::Or, bits, sign);
-        self.s.m.select(at, neg, flipped, positive)
-    }
-
-    /// Inverse of [`Self::float_atomic_order`].
-    fn float_atomic_unorder(&mut self, at: usize, ordered: V) -> V {
-        let sign = self.s.m.i32(0x8000_0000);
-        let zero = self.s.m.i32(0);
-        let all = self.s.m.i32(u32::MAX);
-        // After ordering, positives have the sign bit set (ordered < 0 as
-        // i32); negatives do not.
-        let was_pos = self.s.m.cmp(at, pred::SLT, ordered, zero);
-        let from_pos = self.s.m.bin(at, Bin::Xor, ordered, sign);
-        let from_neg = self.s.m.bin(at, Bin::Xor, ordered, all);
-        self.s.m.select(at, was_pos, from_pos, from_neg)
+        self.s
+            .m
+            .set_phi(old, vec![(old0, start), (prev, body)]);
+        self.s
+            .m
+            .set_phi(tries, vec![(zero, start), (next_tries, body)]);
+        self.cur = exit;
+        // `old` dominates both exits (unchanged on CAS success / early leave).
+        old
     }
 
     /// Finds the whole-wave sections and the values they leave.
@@ -2396,8 +2437,17 @@ impl<'a> Lower<'a> {
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
-            // the lane tests its own bit.
-            Atom::Opaque(lo, hi) if self.console_lanes || self.s.mesh.is_some() => {
+            // the lane tests its own bit. Pixel and vertex shaders use host
+            // lanes within a quad.
+            Atom::Opaque(lo, hi)
+                if self.console_lanes || self.s.mesh.is_some() || self.mask_data == MaskData::Host =>
+            {
+                // Host (pixel/vertex) ballots use the host lane index; flag
+                // WaveOps like v_readlane of a computed lane — do not call
+                // cross_lane(false), which pixels reject.
+                if self.mask_data == MaskData::Host {
+                    self.s.flags |= flags::WAVE_OPS;
+                }
                 let word = |l: &mut Self, v| match l.get(v)? {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
@@ -2406,7 +2456,12 @@ impl<'a> Lower<'a> {
                 let hi = hi.map(|h| word(self, h)).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes || self.s.mesh.is_some() => {
+            Atom::Constant(k)
+                if self.console_lanes || self.s.mesh.is_some() || self.mask_data == MaskData::Host =>
+            {
+                if self.mask_data == MaskData::Host {
+                    self.s.flags |= flags::WAVE_OPS;
+                }
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
@@ -5730,9 +5785,9 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
-                // A computed lane in a pixel or vertex program is a host lane
-                // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                // Pixel/vertex host waves: lane index is the host's (constant
+                // or computed). Console compute still needs cross_lane.
+                if self.mask_data == MaskData::Host {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
@@ -5754,7 +5809,11 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                self.cross_lane(false)?;
+                if self.mask_data == MaskData::Host {
+                    self.s.flags |= flags::WAVE_OPS;
+                } else {
+                    self.cross_lane(false)?;
+                }
                 let me = self.lane_index(c);
                 let lane = if self.wave64_emu.is_some() {
                     let k63 = self.s.m.i32(63);
@@ -7404,8 +7463,14 @@ impl<'a> Lower<'a> {
             let first =
                 usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
-            // gradients (x then y) come before the coordinates.
-            let spatial = coords - usize::from(kind == 6 || kind == 7);
+            // gradients (x then y) come before the coordinates. Cubes carry
+            // face-space (s,t) derivatives only — the face id has none — so
+            // sample_d / sample_d_cl use 4 grads + 3 coords (+ clamp).
+            let spatial = if kind == 5 {
+                2
+            } else {
+                coords - usize::from(kind == 6 || kind == 7)
+            };
             let grads = if op == 63 { 2 * spatial } else { 0 };
             let mut cs = vec![fu; 4];
             // With a16, sampling coordinates and LOD are f16.
@@ -7421,11 +7486,18 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
-                if *unorm || op == 63 || op == 81 {
-                    return Err("a cube sample with texel coordinates, gradients or a level query");
+            // Face (s, t, face_id) before conversion — needed to lift
+            // face-space gradients into 3D direction gradients.
+            let cube_stf = if kind == 5 {
+                if *unorm || op == 81 {
+                    return Err("a cube sample with texel coordinates or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                Some((cs[0], cs[1], cs[2]))
+            } else {
+                None
+            };
+            if let Some((s, t, face)) = cube_stf {
+                let dir = self.cube_direction(s, t, face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -7539,6 +7611,25 @@ impl<'a> Lower<'a> {
                         g[k] = to_float(self, x);
                         let y = addr_val(self, first + spatial + k)?;
                         g[3 + k] = to_float(self, y);
+                    }
+                    // Cube SampleGrad: GFX10 grads are face-space (ds, dt);
+                    // DXIL wants d(dir)/dx and d(dir)/dy in 3D. Finite
+                    // difference through cube_direction matches the face.
+                    if let Some((s, t, face)) = cube_stf {
+                        let c = self.cur;
+                        let lift = |l: &mut Self, ds: V, dt: V| {
+                            let s2 = l.s.m.bin(c, Bin::Add, s, ds);
+                            let t2 = l.s.m.bin(c, Bin::Add, t, dt);
+                            let d2 = l.cube_direction(s2, t2, face);
+                            [
+                                l.s.m.bin(c, Bin::Sub, d2[0], cs[0]),
+                                l.s.m.bin(c, Bin::Sub, d2[1], cs[1]),
+                                l.s.m.bin(c, Bin::Sub, d2[2], cs[2]),
+                            ]
+                        };
+                        let ddx = lift(self, g[0], g[1]);
+                        let ddy = lift(self, g[3], g[4]);
+                        g = vec![ddx[0], ddx[1], ddx[2], ddy[0], ddy[1], ddy[2]];
                     }
                     args.extend(&os);
                     args.extend(g);

@@ -810,7 +810,15 @@ impl<'a> Tracer<'a> {
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
-        let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
+        let base = s.base.ok_or_else(|| {
+            if let Term::Value(v) = lo
+                && self.phis[v.0 as usize].is_some()
+                && self.phi_mixed_loaded_va(v)
+            {
+                return "a phi of addresses loaded from different memory";
+            }
+            self.why_no_base(s.dynamic)
+        })?;
         self.address_from_base(
             base,
             hi,
@@ -861,35 +869,123 @@ impl<'a> Tracer<'a> {
             if self.term_is_null(arm_lo) && self.term_is_null(arm_hi) {
                 continue;
             }
-            // Avoid re-entering choice resolution on nested phis of the same value.
-            let a = {
-                if let Some(shifted) = self.constants_shifted_address(arm_lo, arm_hi, extra) {
-                    shifted
-                } else {
-                    let s = self.sum(arm_lo);
-                    if s.dynamic.is_some() && extra.dynamic.is_some() {
-                        return None;
-                    }
-                    let base = s.base?;
-                    self.address_from_base(
-                        base,
-                        arm_hi,
-                        Sum {
-                            base: s.base,
-                            offset: s.offset.wrapping_add(extra.offset),
-                            dynamic: s.dynamic.or(extra.dynamic),
-                        },
-                    )?
-                }
-            };
+            let a = self.resolve_address_pair(arm_lo, arm_hi, extra)?;
             match &found {
                 None => found = Some(a),
                 // Identical root address (null vs root, or duplicated arms).
-                Some(prev) if *prev == a => {}
+                Some(prev) if *prev == a || self.same_address_root(*prev, a) => {}
                 Some(_) => return None,
             }
         }
         found
+    }
+
+    /// Same root parameter and static offset; dynamic induction may differ.
+    fn same_address_root(&self, a: Address, b: Address) -> bool {
+        a.param == b.param
+            && a.dword == b.dword
+            && a.shift == b.shift
+            && a.offset == b.offset
+    }
+
+    /// One phi / cndmask arm of a 64-bit address, peeling `v_mov` over exec
+    /// guards so the root before the mov is still visible.
+    fn resolve_address_pair(
+        &self,
+        arm_lo: Term,
+        arm_hi: Term,
+        extra: &Sum,
+    ) -> Option<Address> {
+        let mut lo_alts = vec![arm_lo];
+        let mut hi_alts = vec![arm_hi];
+        if let Term::Value(v) = arm_lo
+            && let Some(t) = self.vmov_bypass(v)
+        {
+            lo_alts.push(t);
+        }
+        if let Term::Value(v) = arm_hi
+            && let Some(t) = self.vmov_bypass(v)
+        {
+            hi_alts.push(t);
+        }
+        for &lo in &lo_alts {
+            for &hi in &hi_alts {
+                if let Some(a) = self.resolve_address_pair_once(lo, hi, extra) {
+                    return Some(a);
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_address_pair_once(
+        &self,
+        arm_lo: Term,
+        arm_hi: Term,
+        extra: &Sum,
+    ) -> Option<Address> {
+        if let Some(shifted) = self.constants_shifted_address(arm_lo, arm_hi, extra) {
+            return Some(shifted);
+        }
+        let s = self.sum(arm_lo);
+        if s.dynamic.is_some() && extra.dynamic.is_some() {
+            return None;
+        }
+        let base = s.base?;
+        self.address_from_base(
+            base,
+            arm_hi,
+            Sum {
+                base: s.base,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            },
+        )
+    }
+
+    /// Value of VGPR `reg` immediately before instruction `i` in block `b`.
+    fn vgpr_before(&self, b: usize, i: usize, reg: u8) -> Option<Value> {
+        let r = Reg::V(reg);
+        for inst in self.p.blocks[b].insts[..i].iter().rev() {
+            if let Some((_, v)) = inst.writes.iter().find(|w| w.0 == r) {
+                return Some(*v);
+            }
+        }
+        None
+    }
+
+    /// The address still in a VGPR before a `v_mov_b32` clobber (exec guard).
+    fn vmov_bypass(&self, v: Value) -> Option<Term> {
+        let (b, i) = self.defs[v.0 as usize]?;
+        let inst = &self.p.blocks[b].insts[i];
+        if inst.name() != "v_mov_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let Operand::Vector { reg, .. } = f.dst? else {
+            return None;
+        };
+        let prev = self
+            .vgpr_before(b, i, reg)
+            .or_else(|| {
+                let preds = &self.p.blocks[b].preds;
+                (preds.len() == 1).then(|| {
+                    let r = Reg::V(reg);
+                    self.p.blocks[preds[0]]
+                        .insts
+                        .iter()
+                        .rev()
+                        .find_map(|inst| {
+                            inst.writes
+                                .iter()
+                                .find(|w| w.0 == r)
+                                .map(|w| w.1)
+                        })
+                })?
+            })?;
+        Some(self.vorigin(prev))
     }
 
     /// Unwrap `v_readfirstlane_b32` (and VGPR moves) so high-half checks see
@@ -982,7 +1078,16 @@ impl<'a> Tracer<'a> {
     fn choice_arms(&self, v: Value) -> Option<Vec<Term>> {
         if let Some((b, i)) = self.phis[v.0 as usize] {
             let phi = &self.p.blocks[b].phis[i];
-            return Some(phi.args.iter().map(|&a| self.origin(a)).collect());
+            return Some(
+                phi
+                    .args
+                    .iter()
+                    .map(|&a| match phi.reg {
+                        Reg::V(_) => Term::Value(a),
+                        _ => self.origin(a),
+                    })
+                    .collect(),
+            );
         }
         let inst = self.def(v)?;
         if inst.name() != "v_cndmask_b32" {
@@ -1154,6 +1259,37 @@ impl<'a> Tracer<'a> {
             && f.src[..2.min(f.src.len())]
                 .iter()
                 .any(|o| self.vterm(inst, o).is_some_and(|t| self.carried(t, high)))
+    }
+
+    /// Phi arms that each trace to an `s_load_*` base with different roots
+    /// (table vs constants, or different parameters). Cannot pick one resource.
+    fn phi_mixed_loaded_va(&self, v: Value) -> bool {
+        let Some((b, i)) = self.phis[v.0 as usize] else {
+            return false;
+        };
+        let phi = &self.p.blocks[b].phis[i];
+        let mut keys = std::collections::BTreeSet::new();
+        let mut any = false;
+        for &a in &phi.args {
+            let empty = Sum {
+                base: None,
+                offset: 0,
+                dynamic: None,
+            };
+            let Some(a) = self
+                .resolve_address_pair(Term::Value(a), Term::Const(0), &empty)
+                .or_else(|| {
+                    self.vmov_bypass(a).and_then(|lo| {
+                        self.resolve_address_pair(lo, Term::Const(0), &empty)
+                    })
+                })
+            else {
+                continue;
+            };
+            any = true;
+            keys.insert((a.param, a.dword, a.shift));
+        }
+        any && keys.len() > 1
     }
 
     fn why_no_base(&self, dynamic: Option<Value>) -> &'static str {

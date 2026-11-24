@@ -170,7 +170,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
             },
         };
         // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { list.cmd().CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     // Once per submission however many of its lists sample the texture.
     list.defer_texture(staging);

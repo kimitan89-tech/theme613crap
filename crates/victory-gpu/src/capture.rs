@@ -403,14 +403,13 @@ fn dump_one(
     let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
     // SAFETY: an open list of ours and a live texture.
     let read = unsafe {
+        let cmd = list.cmd();
         if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+            cmd.ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back(&host.device, &cmd, texture);
         if state != copy {
-            list.list
-                .ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+            cmd.ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
         }
         read
     };
