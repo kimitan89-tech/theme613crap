@@ -263,7 +263,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::list::ensure_state(host_list, output, UNORDERED_ACCESS);
         crate::texture::host_written(output);
         #[cfg(feature = "diagnostics")]
-        crate::capture::note_target(output);
+        {
+            crate::capture::note_upscale();
+            crate::capture::note_target(color);
+            crate::capture::note_target(output);
+        }
 
         let pair = pass.next.fetch_add(1, Ordering::Relaxed) % PAIRS;
         let base_slot = pair * 2;

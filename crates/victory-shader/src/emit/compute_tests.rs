@@ -831,3 +831,391 @@ fn inverted_mask_in_a_mesh_shader_refuses_with_its_reason() {
         Err(e) => panic!("{e}"),
     }
 }
+
+// --- Wave32 / uniform-LDS / gather+grad (Codex) ---
+use super::container::{self, SigElement};
+use super::{HostShader, emit, lower};
+use crate::dxbc::{Container, FourCC};
+
+const END: u32 = 0xbf81_0000;
+const WRITE: [u32; 2] = [0xd834_0000, 0x0000_0002]; // ds_write_b32 v2, v0
+const READ: [u32; 2] = [0xd8d8_0000, 0x0300_0002]; // ds_read_b32 v3, v2
+const SYNC: u32 = 0xbf8a_0000;
+const UAV: [u32; 4] = [0xbe84_0300, 0xbe85_0380, 0xf408_0a02, 0xfa00_0040];
+const STORE: [u32; 2] = [0xe070_1000, 0x800a_0302]; // raw[v2] = v3
+fn compute(threads: [u32; 3]) -> StageIo {
+    StageIo::Cs(ComputeIo {
+        threads,
+        rsrc2: 1 << 15 | 1 << 11 | 2 << 1, // LDS, thread x/y, two user SGPRs
+    })
+}
+
+fn shader(words: &[u32], stage_io: StageIo) -> HostShader {
+    let (layout, used) = lower::tests::texture_and_uav_tables();
+    let pixel = matches!(stage_io, StageIo::Ps { .. });
+    let native = NativeProgram {
+        stage: if pixel { HwStage::Ps } else { HwStage::Cs },
+        wave64: true,
+        vgprs: 32,
+        layout,
+        used,
+        io: stage_io,
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, true, 32).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    let output = container::signature(
+        &[SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 15,
+            half: false,
+        }],
+        false,
+    );
+    let bytes = if pixel {
+        crate::dxbc::build(&[(FourCC::OSG1, &output)])
+    } else {
+        crate::dxbc::build(&[])
+    };
+    emit(
+        &Container::parse(&bytes).unwrap(),
+        &native,
+        &p,
+        &st,
+        &io,
+        &res,
+    )
+    .unwrap()
+}
+
+fn wave(shader: &HostShader) -> (u32, u32) {
+    let psv = Container::parse(&shader.dxil)
+        .unwrap()
+        .part(FourCC::PSV0)
+        .unwrap()
+        .data;
+    (
+        crate::dxbc::u32_at(psv, 20).unwrap(),
+        crate::dxbc::u32_at(psv, 24).unwrap(),
+    )
+}
+
+#[test]
+fn divergent_lds_keeps_wave64() {
+    let masked = [0x7da4_0080, WRITE[0], WRITE[1], END]; // v_cmpx, predicated write
+    let branch = [0x7da4_0080, 0xbf88_0002, WRITE[0], WRITE[1], END];
+    // Remove lanes from EXEC on each iteration; LDS inside the loop.
+    let varying_loop = [
+        0xbe82_0480,
+        WRITE[0],
+        WRITE[1],
+        0x4a00_0081,
+        0x7d84_0080,
+        0x8882_026a,
+        0x8afe_027e,
+        0xbf89_fff9,
+        0x88fe_027e,
+        END,
+    ];
+    for words in [&masked[..], &branch, &varying_loop] {
+        assert_eq!(wave(&shader(words, compute([64, 1, 1]))), (64, 64));
+    }
+}
+
+#[test]
+fn lds_fences_order_atomics_and_stop_at_existing_sync() {
+    let atomic = [0xd800_0000, 0x0000_0002]; // ds_add_u32 v2, v0
+    let words = [
+        &WRITE[..],
+        &READ,
+        &READ,
+        &atomic,
+        &READ,
+        &[SYNC],
+        &WRITE,
+        &[END],
+    ]
+    .concat();
+    let code: Vec<_> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 32).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let sites = super::lds::split_barriers(&p, &st).unwrap();
+    assert_eq!(sites, [(0, 1), (0, 3), (0, 4)].into());
+}
+
+#[test]
+fn scalar_controlled_lds_loop_can_split() {
+    // s2 counts down to zero; the loop back edge carries a scalar phi.
+    let words = [
+        0xbe82_0384,
+        WRITE[0],
+        WRITE[1],
+        0x8082_8102,
+        0xbf06_8002,
+        0xbf84_fffb,
+        END,
+    ];
+    assert_eq!(wave(&shader(&words, compute([33, 1, 1]))), (0, u32::MAX));
+}
+
+#[cfg(windows)]
+mod lds_wave_device {
+    use super::*;
+    use crate::emit::{
+        host::{Dispatch, Host, Root, View, stub_vs},
+        validator,
+        valu_tests::ONE_AT_A_TIME,
+    };
+
+    /// Prefer the discrete adapter on hybrid systems.
+    fn host() -> Host {
+        use windows::Win32::Graphics::{
+            Direct3D::D3D_FEATURE_LEVEL_12_0,
+            Direct3D12::D3D12CreateDevice,
+            Dxgi::{
+                CreateDXGIFactory2, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IDXGIAdapter1,
+                IDXGIFactory6,
+            },
+        };
+        // SAFETY: DXGI owns the returned adapter; D3D12 initializes the device output.
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(Default::default()).unwrap();
+            if let Ok(adapter) = factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                0,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            ) {
+                let mut device = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                    let name = adapter.GetDesc1().unwrap().Description;
+                    let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                    eprintln!("D3D12 adapter: {}", String::from_utf16_lossy(&name[..len]));
+                    return Host {
+                        device: device.unwrap(),
+                    };
+                }
+            }
+        }
+        Host::new(true).expect("SM 6.6 WARP")
+    }
+
+    fn validate(shader: &HostShader) {
+        let path = validator::Validator::default_path();
+        if let Ok(mut v) = validator::Validator::load(path.as_deref()) {
+            v.validate(&mut shader.dxil.clone())
+                .expect("DXIL validator");
+        } else {
+            eprintln!("dxil.dll unavailable; skipping validator");
+        }
+    }
+
+    fn image_call(shader: &HostShader, intrinsic: &str) -> Option<(String, String)> {
+        let dxc = validator::Validator::default_path()?.with_file_name("dxc.exe");
+        if !dxc.is_file() {
+            return None;
+        }
+        let path =
+            std::env::temp_dir().join(format!("victory-image-test-{}.dxil", std::process::id()));
+        std::fs::write(&path, &shader.dxil).unwrap();
+        let output = std::process::Command::new(dxc)
+            .arg("-dumpbin")
+            .arg(&path)
+            .output();
+        std::fs::remove_file(path).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let ir = String::from_utf8(output.stdout).unwrap();
+        let call = ir
+            .lines()
+            .find(|l| l.contains("call ") && l.contains(intrinsic))
+            .unwrap()
+            .to_owned();
+        Some((ir, call))
+    }
+
+    fn dispatch(shader: &HostShader, count: u32) -> Vec<u32> {
+        validate(shader);
+        let host = host();
+        let (root, pso) = host.compute_pipeline(shader).expect("create compute PSO");
+        // The table starts at heap index zero; its UAV is entry two.
+        let constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        let views = [View::RawUav(1), View::RawUav(1), View::RawUav(count)];
+        host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                views: &views,
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch")
+        .pop()
+        .unwrap()
+    }
+
+    #[test]
+    fn small_wave64_masks_and_thread_ids_on_device() {
+        let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for [x, y] in [[32u32, 1], [8, 4], [4, 4]] {
+            let mut words = UAV.to_vec();
+            // v2 = 4 * (x * tid.y + tid.x).
+            words.extend([
+                0x3404_0200 | (128 + x.trailing_zeros()),
+                0x4a04_0500,
+                0x3404_0482,
+            ]);
+            // mbcnt_lo(-1, 0), mbcnt_hi(-1, lo), add high EXEC ballot.
+            words.extend([
+                0xd765_0003,
+                193 | 128 << 9,
+                0xd766_0003,
+                193 | 259 << 9,
+                0x4a06_067f,
+            ]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([x, y, 1]));
+            assert_eq!(wave(&cs), (32, 32));
+            assert_eq!(dispatch(&cs, x * y), (0..x * y).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn split_lds_exchanges_data_between_host_waves() {
+        let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for explicit in [false, true] {
+            let mut words = UAV.to_vec();
+            words.push(0x3404_0082); // v2 = 4 * tid.x
+            words.extend(WRITE);
+            if explicit {
+                words.push(SYNC);
+            }
+            words.extend([0x3a04_04ff, 128]); // exchange halves of the group
+            words.extend(READ);
+            words.push(0x3404_0082);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (0, u32::MAX));
+            assert_eq!(
+                dispatch(&cs, 64),
+                (0..64).map(|i| i ^ 32).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_gather_and_clamped_grad_create_pipelines() {
+        let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let host = host();
+        for (op, a16) in [0x44u32, 0x54, 0x23, 0x33]
+            .into_iter()
+            .flat_map(|op| [(op, false), (op, true)])
+        {
+            let gather = op & 0x40 != 0;
+            let offset = op & 0x10 != 0;
+            let mut words = vec![
+                0xbe84_0300,
+                0xbe85_0380,
+                0xbe86_0301,
+                0xbe87_0380,
+                0xf40c_0602,
+                0xfa00_0000,
+                0xf408_0203,
+                0xfa00_0000,
+            ]; // SRV s24, sampler s8
+            let mut operands = vec![];
+            if offset {
+                operands.push(0x3f01);
+            } // (+1,-1)
+            if a16 {
+                if !gather {
+                    operands.extend([0x0000_3800, 0x3400_0000]);
+                }
+                operands.extend([0x3a00_3400, 0x3c00]); // packed uv, then LOD/clamp
+            } else {
+                if !gather {
+                    operands.extend([0.5f32, 0., 0., 0.25].map(f32::to_bits));
+                }
+                operands.extend([0.25f32, 0.75, 1.0].map(f32::to_bits));
+            }
+            for (i, v) in operands.into_iter().enumerate() {
+                words.extend([0x7e00_02ff | (i as u32 + 4) << 17, v]);
+            }
+            words.extend([0xf000_0108 | op << 18, 0x0046_0c04 | u32::from(a16) << 30]);
+            let cs_or_ps = if gather {
+                words.extend([0xd834_0000, 0x0000_0c00, END]);
+                compute([8, 4, 1])
+            } else {
+                words.extend([0xf800_080f, 0x0c0c_0c0c, END]);
+                StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                }
+            };
+            let s = shader(&words, cs_or_ps);
+            validate(&s);
+            if !a16
+                && let Some((ir, call)) = image_call(
+                    &s,
+                    if gather {
+                        "@dx.op.textureGather."
+                    } else {
+                        "@dx.op.sampleGrad."
+                    },
+                )
+            {
+                // Validate the values in the intrinsic slots. Swapping uv,
+                // derivatives or clamp still produces perfectly legal DXIL.
+                let args: Vec<_> = call
+                    .split_once('(')
+                    .unwrap()
+                    .1
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .split(", ")
+                    .collect();
+                let check_float = |index: usize, expected: f32| {
+                    let reg = args[index].strip_prefix("float ").unwrap();
+                    let def = format!("{reg} = bitcast i32 {} to float", expected.to_bits());
+                    assert!(ir.lines().any(|l| l.trim() == def), "{def} in {call}");
+                };
+                check_float(3, 0.25);
+                check_float(4, 0.75);
+                if !gather {
+                    if offset && args.get(7) == Some(&"i32 1") {
+                        assert_eq!(&args[7..9], ["i32 1", "i32 -1"]);
+                    } else if !offset {
+                        assert_eq!(&args[7..9], ["i32 0", "i32 0"]);
+                    }
+                    for (i, f) in [(10, 0.5), (11, 0.), (13, 0.), (14, 0.25), (16, 1.)] {
+                        check_float(i, f);
+                    }
+                }
+            }
+            if gather {
+                host.compute_pipeline(&s).unwrap();
+            } else {
+                host.pipeline(&stub_vs(&s).unwrap(), &s).unwrap();
+            }
+        }
+    }
+}
+

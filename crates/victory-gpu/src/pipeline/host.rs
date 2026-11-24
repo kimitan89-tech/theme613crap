@@ -288,6 +288,67 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Compact context when CreateComputePipelineState refuses a translated CS.
+#[cfg(feature = "diagnostics")]
+fn refused_compute_diag(cs: &Shader) {
+    use victory_shader::{Container, FourCC, HwStage, gfx10, native_programs};
+    let Ok(c) = Container::parse(&cs.container) else {
+        return;
+    };
+    let Some(part) = c.part(FourCC::DXIL) else {
+        return;
+    };
+    let Ok(programs) = native_programs(part.data) else {
+        return;
+    };
+    let Some(p) = programs.into_iter().find(|p| p.stage == HwStage::Cs) else {
+        return;
+    };
+    let victory_shader::native::StageIo::Cs(cio) = &p.io else {
+        return;
+    };
+    let Ok(insts) = gfx10::decode(&p.code) else {
+        return;
+    };
+    let mut wave_ops = Vec::new();
+    for i in &insts {
+        let Some(n) = i.name() else {
+            continue;
+        };
+        let tag = if n.starts_with("ds_swizzle") {
+            Some("ds_swizzle*")
+        } else if n.contains("permute") {
+            Some("*permute*")
+        } else if n.starts_with("v_mbcnt") {
+            Some("v_mbcnt*")
+        } else if n == "v_readlane_b32" {
+            Some("v_readlane_b32")
+        } else if n == "v_writelane_b32" {
+            Some("v_writelane_b32")
+        } else if n == "v_readfirstlane_b32" {
+            Some("v_readfirstlane_b32")
+        } else if matches!(i.fields(p.wave64), victory_shader::gfx10::Fields::Valu(v) if v.dpp.is_some())
+        {
+            Some("DPP")
+        } else {
+            None
+        };
+        if let Some(tag) = tag
+            && !wave_ops.contains(&tag)
+        {
+            wave_ops.push(tag);
+        }
+    }
+    tracing::info!(
+        hash = %cs.hash,
+        wave64 = p.wave64,
+        threads = ?cio.threads,
+        lds = cio.lds_bytes(),
+        wave_ops = %wave_ops.join(", "),
+        "refused compute diag"
+    );
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -436,6 +497,10 @@ impl HostPipeline {
                 Ok(pso) => pso,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(cs) = compute {
+                        refused_compute_diag(cs);
+                    }
                     host.log_messages();
                     return None;
                 }

@@ -116,17 +116,99 @@ impl Shader {
                         samplers = t.host.samplers.len(),
                         "shader translated"
                     ),
-                    Err(e) => tracing::warn!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        error = %e,
-                        "shader does not translate; its pipelines' draws are dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            error = %e,
+                            "shader does not translate; its pipelines' draws are dropped"
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        failed_shader_diag(self, e);
+                    }
                 }
                 done.ok()
             })
             .as_ref()
     }
+}
+
+/// Compact one-line context for a translation failure (diagnostics builds).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn failed_shader_diag(shader: &Shader, err: &str) {
+    use victory_shader::{Container, FourCC, HwStage, gfx10, native_programs};
+    let offset = err
+        .rsplit_once("GFX10 code at ")
+        .and_then(|(_, rest)| rest.split_once(':'))
+        .and_then(|(hex, _)| {
+            let hex = hex.trim().trim_start_matches("0x");
+            usize::from_str_radix(hex, 16).ok()
+        });
+    let Ok(c) = Container::parse(&shader.container) else {
+        return;
+    };
+    let Some(part) = c.part(FourCC::DXIL) else {
+        return;
+    };
+    let Ok(programs) = native_programs(part.data) else {
+        return;
+    };
+    let Some(p) = programs.into_iter().find(|p| {
+        matches!(
+            p.stage,
+            HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
+        )
+    }) else {
+        return;
+    };
+    let layout: Vec<String> = p
+        .layout
+        .iter()
+        .map(|r| {
+            format!(
+                "{:?}(s{}..+{},slot={})",
+                r.root, r.base_register, r.sgprs, r.slot
+            )
+        })
+        .collect();
+    let (threads, lds_bytes, user_sgprs, init_sgprs) = match &p.io {
+        victory_shader::native::StageIo::Cs(cs) => (
+            Some(cs.threads),
+            Some(cs.lds_bytes()),
+            Some(cs.user_sgprs()),
+            Some(cs.initialized_sgprs()),
+        ),
+        victory_shader::native::StageIo::Ms(ms) => {
+            (Some([ms.threads, 1, 1]), Some(ms.lds_bytes), None, None)
+        }
+        _ => (None, None, None, None),
+    };
+    let isa = offset
+        .and_then(|at| {
+            let decoded = gfx10::decode(&p.code).ok()?;
+            let end = decoded.iter().position(|i| i.offset > at).unwrap_or(decoded.len());
+            let start = end.saturating_sub(5);
+            Some(
+                decoded[start..end]
+                    .iter()
+                    .map(|i| format!("{:#x}: {}", i.offset, i.text(p.wave64)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    tracing::info!(
+        stage = shader.stage,
+        hash = %shader.hash,
+        wave64 = p.wave64,
+        ?threads,
+        ?lds_bytes,
+        ?user_sgprs,
+        ?init_sgprs,
+        layout = %layout.join(", "),
+        fail_offset = offset.map(|o| format!("{o:#x}")).unwrap_or_default(),
+        isa = %isa.join(" | "),
+        "failed shader diag"
+    );
 }
 
 #[cfg(windows)]

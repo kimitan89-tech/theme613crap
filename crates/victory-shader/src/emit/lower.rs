@@ -193,6 +193,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Some when replacing implicit wave64 LDS ordering with explicit fences.
+    lds_barriers: Option<HashSet<Site>>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -380,6 +382,7 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut lds_barriers = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -436,10 +439,22 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
                 })
             };
-            let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+            // Host wave32 GPUs (e.g. many NVIDIA cards) cannot take WaveSize(64).
+            // Small groups use WaveSize(32); larger wave64 groups with only
+            // uniform LDS get explicit group fences instead.
+            let threads = cs.threads.iter().product::<u32>();
+            let wave = if x.native.wave64 && threads > 32 {
+                64
+            } else {
+                32
+            };
+            if console_lanes || threads <= wave && s.lds_dwords > 0 {
+                if !console_lanes && wave == 64 {
+                    lds_barriers = super::lds::split_barriers(p, x.st);
+                }
+                if lds_barriers.is_none() {
+                    s.wave_size = Some(wave);
+                }
             }
         }
         let mut no_barrier = HashSet::new();
@@ -526,6 +541,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
+            lds_barriers,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -941,6 +957,11 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        // A surviving read-first-lane or wave intrinsic still depends on the
+        // original wave. Descriptor waterfalls may eliminate these operations.
+        if self.lds_barriers.is_some() && self.s.flags & flags::WAVE_OPS != 0 {
+            self.s.wave_size = Some(64);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2516,6 +2537,13 @@ impl<'a> Lower<'a> {
             }
             MaskData::None => false,
         };
+        if self
+            .lds_barriers
+            .as_ref()
+            .is_some_and(|sites| sites.contains(&(b, i)))
+        {
+            self.group_barrier(false);
+        }
         let effect = matches!(inst.fields, Fields::Exp { .. })
             || matches!(inst.fields, Fields::Flat { .. }) && !name.starts_with("global_load_")
             || name.contains("store")
@@ -2532,11 +2560,7 @@ impl<'a> Lower<'a> {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
                 // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.group_barrier(self.writes_uavs);
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -2561,6 +2585,18 @@ impl<'a> Lower<'a> {
                 Ok(())
             }
         }
+    }
+
+    fn group_barrier(&mut self, fence_uavs: bool) {
+        let mode = self.s.m.i32(if fence_uavs { 1 | 2 | 8 } else { 1 | 8 });
+        self.s.op(
+            self.cur,
+            "barrier",
+            Attr::NoDuplicate,
+            self.s.t.void,
+            80,
+            &[mode],
+        );
     }
 
     fn is_mask(&self, v: Option<Value>) -> bool {
@@ -6411,6 +6447,23 @@ impl<'a> Lower<'a> {
                     )
                 }
                 63 => {
+                    if offset_word
+                        && let Ok(w) = addr_val(self, 0)
+                        && let Some(w) = self.s.m.int_value(w)
+                    {
+                        // Same immediate offsets as sample (`_o`): x in bits
+                        // 0-5, y in 8-13, signed 6-bit. Non-constant offsets
+                        // keep the zero defaults (DXIL immediates only).
+                        let w = w as u32;
+                        for (k, o) in os.iter_mut().enumerate().take(offsets) {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            let x = if x >= 32 { x - 64 } else { x };
+                            if !(-8..=7).contains(&x) {
+                                return Err("a sample offset past -8..7");
+                            }
+                            *o = self.s.m.i32(x as u32);
+                        }
+                    }
                     let mut g = vec![fu; 6];
                     for k in 0..spatial {
                         let x = addr_val(self, first + k)?;
@@ -7495,7 +7548,7 @@ impl<'a> Lower<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
