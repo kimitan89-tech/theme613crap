@@ -1,8 +1,8 @@
 //! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
-//! their operands. Lane masks exist only as the per-lane booleans of
-//! structurisation; branches and guards are built from them. A value the
+//! their operands. Branches and guards use structurisation's per-lane
+//! booleans. A VALU select or carry-in can also test a bit in scalar data. A value the
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
@@ -18,7 +18,7 @@ use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
-use crate::structure::{Atom, Bool, LaneExit, Structured};
+use crate::structure::{Atom, Bool, LaneExit, Structured, mask_constant, valu_mask_operand};
 
 type Why = &'static str;
 
@@ -271,17 +271,31 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
             return false;
         }
         Fields::Sop { src, .. } => src.iter().collect(),
-        Fields::Valu(v)
-            if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
-        {
-            v.src.iter().collect()
-        }
+        Fields::Valu(v) if valu_mask_operand(i).is_some() => v.src[..2].iter().collect(),
+        Fields::Valu(v) => v.src.iter().collect(),
         _ => return false,
     };
     ops.into_iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
+}
+
+fn uniform_mask(value: u64, wave64: bool) -> Option<bool> {
+    match value {
+        0 => Some(false),
+        _ if value == u64::MAX >> (32 * u8::from(!wave64)) => Some(true),
+        _ => None,
+    }
+}
+
+/// DXIL uses byte strides. Missing metadata defaults to four dwords.
+fn structured_stride(used: Option<&UsedResource>) -> Result<u32, Why> {
+    match used.map_or(0, |u| u.stride) {
+        0 => Ok(16),
+        stride if stride.is_multiple_of(4) => Ok(stride),
+        _ => Err("a structured buffer with an unaligned stride"),
+    }
 }
 
 /// Where half `h` (dword h / 2, the high half when odd) of a parameter
@@ -374,6 +388,12 @@ impl<'a> Lower<'a> {
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
+                    || valu_mask_operand(i).is_some_and(|op| {
+                        x.st.valu_mask(i, op).is_none()
+                            && mask_constant(op, x.native.wave64)
+                                .and_then(|m| uniform_mask(m, x.native.wave64))
+                                .is_none()
+                    })
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
                 // tests its own bit by its console lane.
@@ -381,6 +401,7 @@ impl<'a> Lower<'a> {
                     LaneExit::Branch { when, .. } => Some(when),
                     _ => None,
                 });
+                let selectors = insts().filter_map(|i| x.st.valu_mask(i, valu_mask_operand(i)?));
                 let mut all: Vec<Bool> =
                     x.st.guards
                         .iter()
@@ -388,6 +409,7 @@ impl<'a> Lower<'a> {
                         .flatten()
                         .copied()
                         .chain(whens)
+                        .chain(selectors)
                         .collect();
                 all.sort_unstable();
                 all.dedup();
@@ -395,7 +417,7 @@ impl<'a> Lower<'a> {
                     x.st.bools
                         .support(g)
                         .iter()
-                        .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
+                        .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
@@ -1620,89 +1642,95 @@ impl<'a> Lower<'a> {
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
             // With console lanes, a mask held as a number is the console's:
             // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
-                let hi = match self.pair_high(v) {
-                    Some(h) => Some(self.get(h)?),
-                    None => None,
-                };
-                let lo = self.get(v)?;
-                let word = |w: Val| match w {
+            Atom::Opaque(lo, hi) if self.console_lanes || self.s.mesh.is_some() => {
+                let word = |l: &mut Self, v| match l.get(v)? {
                     Val::I32(x) => Ok(x),
                     _ => Err("an opaque lane mask"),
                 };
-                let lo = word(lo)?;
-                let hi = hi.map(word).transpose()?;
+                let lo = word(self, lo)?;
+                let hi = hi.map(|h| word(self, h)).transpose()?;
                 Ok(self.lane_bit(at, lo, hi))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            Atom::Constant(k) if self.console_lanes || self.s.mesh.is_some() => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
+            Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
 
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
-        let (k31, k32, one, z) = (
-            self.s.m.i32(31),
-            self.s.m.i32(32),
-            self.s.m.i32(1),
-            self.s.m.i32(0),
-        );
+        let lane = self.lane_index(at);
         let word = match hi {
             Some(hi) => {
+                let k32 = self.s.m.i32(32);
                 let low = self.s.m.cmp(at, pred::IULT, lane, k32);
                 self.s.m.select(at, low, lo, hi)
             }
             None => lo,
         };
+        self.lane_bit_in_dword(at, lane, word)
+    }
+
+    fn lane_bit_in_dword(&mut self, at: usize, lane: V, word: V) -> V {
+        let k31 = self.s.m.i32(31);
+        let one = self.s.m.i32(1);
+        let z = self.s.m.i32(0);
         let sh = self.s.m.bin(at, Bin::And, lane, k31);
         let t = self.s.m.bin(at, Bin::LShr, word, sh);
         let t = self.s.m.bin(at, Bin::And, t, one);
         self.s.m.cmp(at, pred::NE, t, z)
     }
 
-    /// The value of the high dword of the wave64 register pair whose low
-    /// dword holds `lo` (none in wave32).
-    fn pair_high(&self, lo: Value) -> Option<Value> {
-        if !self.x.native.wave64 {
-            return None;
+    fn valu_mask(&mut self, inst: &Inst, untracked: Why) -> Result<V, Why> {
+        let op = valu_mask_operand(inst).ok_or(untracked)?;
+        let at = self.cur;
+        if let Some(m) = self.x.st.valu_mask(inst, op) {
+            return self.boolean(m, at);
         }
-        let p = self.x.p;
-        let pick = |reg: Reg| match reg {
-            Reg::S(c) => Some(Reg::S(c + 1)),
-            _ => None,
+        let wave64 = self.x.native.wave64;
+        let immediate = mask_constant(op, wave64);
+        if let Some(bit) = immediate.and_then(|k| uniform_mask(k, wave64)) {
+            return Ok(self.s.m.bool(bit));
+        }
+        if !self.console_lanes && self.s.mesh.is_none() {
+            return Err(untracked);
+        }
+        if let Some(k) = immediate {
+            let lo = self.s.m.i32(k as u32);
+            let hi = wave64.then(|| self.s.m.i32((k >> 32) as u32));
+            return Ok(self.lane_bit(at, lo, hi));
+        }
+
+        let Operand::Scalar { code, .. } = *op else {
+            return Err(untracked);
         };
-        if let Some(&(reg, _)) = p.inputs.iter().find(|i| i.1 == lo) {
-            let h = pick(reg)?;
-            return p.inputs.iter().find(|i| i.0 == h).map(|i| i.1);
+        let lane = self.lane_index(at);
+        let mut bit = |code, high| {
+            let word = inst.read(Reg::S(code)).ok_or(untracked)?;
+            // A partial write can leave one dword of a compare or carry intact.
+            let mask = if high {
+                self.x.st.highs.get(&word).copied()
+            } else {
+                Some(word)
+            };
+            if let Some(&m) = mask.and_then(|lo| self.x.st.masks.get(&lo)) {
+                return self.boolean(m, at);
+            }
+            let word = self.i32_of(word)?;
+            Ok(self.lane_bit_in_dword(at, lane, word))
+        };
+        let lo = bit(code, false)?;
+        if !wave64 {
+            return Ok(lo);
         }
-        if let Some(&(b, i)) = self.phi_at.get(&lo) {
-            let h = pick(p.blocks[b].phis[i].reg)?;
-            return p.blocks[b]
-                .phis
-                .iter()
-                .find(|q| q.reg == h)
-                .map(|q| q.value);
-        }
-        let b = *self.def_block.get(&lo)?;
-        let inst = p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
-        let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
-        inst.write(pick(reg)?)
+        let hi = bit(code + 1, true)?;
+        let k32 = self.s.m.i32(32);
+        let low = self.s.m.cmp(at, pred::IULT, lane, k32);
+        Ok(self.s.m.select(at, low, lo, hi))
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
@@ -1908,7 +1936,7 @@ impl<'a> Lower<'a> {
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
+        let lane = self.lane_index(e);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -1986,7 +2014,7 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
-    fn lane_index(&mut self) -> V {
+    fn lane_index(&mut self, at: usize) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
             // waves need not match the console's.
@@ -1994,8 +2022,9 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
+        self.s.flags |= flags::WAVE_OPS;
         self.s.op(
-            self.cur,
+            at,
             "waveGetLaneIndex",
             Attr::ReadOnly,
             self.s.t.i32,
@@ -2098,7 +2127,7 @@ impl<'a> Lower<'a> {
             }
             // The source sits in the address field.
             let x = self.vgprs(inst, addr.as_ref().ok_or("a swizzle source")?, 1)?[0];
-            let lane = self.lane_index();
+            let lane = self.lane_index(c);
             let k = |l: &mut Self, v: u32| l.s.m.i32(v);
             let src = if offset & 0x8000 != 0 {
                 let (three, one) = (k(self, 3), k(self, 1));
@@ -2980,13 +3009,12 @@ impl<'a> Lower<'a> {
                 ((kind | u, 0x409), Some(kind))
             }
             Fields::Buffer { idxen, format, .. } => {
-                let stride = used.map_or(0, |u| u.stride);
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
                     (10 | u, 0x409)
-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
-                    (12 | u, stride)
+                } else if *idxen && format.is_none() {
+                    (12 | u, structured_stride(used)?)
                 } else {
                     (11 | u, 0)
                 };
@@ -3617,7 +3645,7 @@ impl<'a> Lower<'a> {
             self.cross_lane(quad)?;
         }
         let c = self.cur;
-        let lane = self.lane_index();
+        let lane = self.lane_index(c);
         let k = |l: &mut Self, n: u32| l.s.m.i32(n);
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
@@ -4152,14 +4180,7 @@ impl<'a> Lower<'a> {
                 float(self, r)
             }
             "v_cndmask_b32" => {
-                let mask = match v.src.get(2) {
-                    Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                    _ => None,
-                };
-                let m = mask
-                    .and_then(|m| self.x.st.masks.get(&m).copied())
-                    .ok_or("a select on an untracked mask")?;
-                let cond = self.boolean(m, c)?;
+                let cond = self.valu_mask(inst, "a select on an untracked mask")?;
                 if v.abs != 0 || v.neg != 0 {
                     let (a, bb) = (f(self, 0)?, f(self, 1)?);
                     let r = self.s.m.select(c, cond, bb, a);
@@ -4177,14 +4198,7 @@ impl<'a> Lower<'a> {
                     std::mem::swap(&mut a, &mut bb);
                 }
                 let cin = if name.ends_with("_ci_u32") {
-                    let m = match v.src.get(2) {
-                        Some(&Operand::Scalar { code, .. }) => inst.read(Reg::S(code)),
-                        _ => None,
-                    };
-                    let m = m
-                        .and_then(|m| self.x.st.masks.get(&m).copied())
-                        .ok_or("a carry-in from an untracked mask")?;
-                    Some(self.boolean(m, c)?)
+                    Some(self.valu_mask(inst, "a carry-in from an untracked mask")?)
                 } else {
                     None
                 };
@@ -4225,7 +4239,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
-                let me = self.lane_index();
+                let me = self.lane_index(c);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
@@ -5231,7 +5245,7 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
-                let lane = self.lane_index();
+                let lane = self.lane_index(c);
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
                 } else {
@@ -6277,11 +6291,7 @@ impl<'a> Lower<'a> {
             let vals = self.vgprs(inst, d, if op == u32::MAX { 2 } else { 1 })?;
             let (h, coords) = match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (12 | u, structured_stride(used)?))?;
                     (h, [index, off, iu])
                 }
                 None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
@@ -6360,10 +6370,7 @@ impl<'a> Lower<'a> {
             } else {
                 match index {
                     Some(index) => {
-                        let stride = used.map_or(0, |u| u.stride);
-                        if stride < 4 || !stride.is_multiple_of(4) {
-                            return Err("a structured buffer of unknown stride");
-                        }
+                        let stride = structured_stride(used)?;
                         args.push(self.handle(site, src, false, (12 | u, stride))?);
                         args.extend([index, off]);
                     }
@@ -6421,11 +6428,7 @@ impl<'a> Lower<'a> {
             let align = self.s.m.i32(4);
             match index {
                 Some(index) => {
-                    let stride = used.map_or(0, |u| u.stride);
-                    if stride < 4 || !stride.is_multiple_of(4) {
-                        return Err("a structured buffer of unknown stride");
-                    }
-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+                    let h = self.handle(site, src, false, (12 | u, structured_stride(used)?))?;
                     self.s.op(
                         c,
                         "rawBufferLoad.f32",
