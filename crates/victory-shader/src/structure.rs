@@ -346,6 +346,8 @@ pub struct Structured {
     pub masks: HashMap<Value, Bool>,
     /// Exact Wave64 pairs for checking masks at their uses.
     paired_masks: Map<Key, Bool>,
+    /// Non-derived masks (constants, opaque scalars) used across mask joins.
+    pub(crate) other_masks: HashMap<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: HashMap<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
@@ -361,6 +363,26 @@ impl Structured {
             None => self.masks.get(&low),
         }
         .copied()
+    }
+
+    /// Mask for an incoming edge of a lane-mask phi, including non-derived
+    /// constants and opaque masks tracked during structurisation.
+    pub(crate) fn join_mask(&self, low: Value, high: Option<Value>) -> Option<Bool> {
+        if let Some(m) = self.mask_bits(low, high) {
+            return Some(m);
+        }
+        match high {
+            Some(high) => self.other_masks.get(&(low, high)).copied(),
+            None => self
+                .other_masks
+                .get(&(low, low))
+                .copied()
+                .or_else(|| {
+                    self.other_masks
+                        .iter()
+                        .find_map(|(&(lo, _), &m)| (lo == low).then_some(m))
+                }),
+        }
     }
 
     /// The symbolic mask consumed by a select or carry-in, if tracked.
@@ -659,6 +681,21 @@ impl<'a> Lanes<'a> {
                 },
             })
             .collect();
+        // Ensure all incoming args (including back-edges) of tracked mask phis
+        // are resolved into `masks` or `other` for lowering.
+        let mask_keys: Vec<Key> = self.masks.keys().copied().collect();
+        for k in mask_keys {
+            let lo_phi = self.phis.get(&k.0).copied();
+            let hi_phi = self.phis.get(&k.1).copied();
+            if let Some((block, _)) = lo_phi.or(hi_phi) {
+                let preds = self.p.blocks[block].preds.len();
+                for n in 0..preds {
+                    let lo_arg = lo_phi.map_or(k.0, |(_, i)| self.p.blocks[block].phis[i].args[n]);
+                    let hi_arg = hi_phi.map_or(k.1, |(_, i)| self.p.blocks[block].phis[i].args[n]);
+                    self.mask((lo_arg, hi_arg));
+                }
+            }
+        }
         if self.b.overflow {
             return Err(TOO_LARGE);
         }
@@ -671,6 +708,7 @@ impl<'a> Lanes<'a> {
                 .map(|&(lo, hi)| (hi, lo))
                 .collect(),
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
+            other_masks: self.other.into_iter().collect(),
             active: self.active,
             bools: self.b,
             exits,
@@ -703,6 +741,40 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    fn dword_constant(&self, v: Value) -> Option<u32> {
+        let &(b, i) = self.defs.get(&v)?;
+        let inst = &self.p.blocks[b].insts[i];
+        let Fields::Sop { src, imm, .. } = &inst.fields else {
+            return None;
+        };
+        match inst.name() {
+            "s_movk_i32" => Some(i32::from((*imm)? as i16) as u32),
+            "s_mov_b32" => match *src.first()? {
+                Operand::Scalar { code: NULL, .. } => Some(0),
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(x) => Some(x),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn split_dword_constant(&mut self, k: Key) -> Option<Bool> {
+        let lo = self.dword_constant(k.0)?;
+        let v = if self.p.wave64 {
+            let hi = self.dword_constant(k.1)?;
+            u64::from(lo) | (u64::from(hi) << 32)
+        } else {
+            u64::from(lo)
+        };
+        let all = u64::MAX >> (32 * u8::from(!self.p.wave64));
+        Some(match v {
+            0 => Bool::FALSE,
+            _ if v == all => Bool::TRUE,
+            _ => self.b.atom(Atom::Constant(v), 0),
+        })
+    }
+
     /// The mask a value pair holds, and whether it derives from EXEC or a
     /// VALU result.
     fn mask(&mut self, k: Key) -> (Bool, bool) {
@@ -723,7 +795,7 @@ impl<'a> Lanes<'a> {
                         .and_then(|i| self.sop(i))
                         .and_then(|r| r.dst)
                         .map(|d| d.1),
-                    _ => None,
+                    _ => self.split_dword_constant(k),
                 };
                 // What an EXEC write the pass does not follow leaves there.
                 let exec_write = |d: Option<(usize, usize)>, v: Value| {

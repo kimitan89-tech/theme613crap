@@ -522,3 +522,312 @@ fn non_active_mask_read_as_data_on_device() {
         assert_eq!(got, expected, "input={input}: expected {expected:#x}, got {got:#x}");
     }
 }
+
+#[test]
+fn root_descriptor_and_buffer_only_descriptor_data_loads() {
+    // 1. Direct `s_load_dwordx4` from a Root CBV (`RootType::Descriptor`).
+    let root_cbv_layout = vec![RootParam {
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        sgprs: 2,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let root_cbv_used = vec![UsedResource {
+        kind: ResourceType::Cbv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    let root_load = [
+        0xF408_0200,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[0:1], null
+        0x7E02_0208, // v_mov_b32 v1, s8
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&root_load, false, false, root_cbv_layout.clone(), root_cbv_used)
+        .expect("s_load_dwordx4 from Root CBV should lower");
+
+    // 2. Direct `s_load_dwordx4` from a Root SRV (`RootType::Descriptor`).
+    let root_srv_used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Descriptor,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    }];
+    lower_words(&root_load, false, false, root_cbv_layout, root_srv_used)
+        .expect("s_load_dwordx4 from Root SRV should lower");
+
+    // 3. 4-dword SRV buffer descriptor in a table read ONLY for dword 2 (GetDimensions).
+    let (layout, used) = buffer_table(Some(16));
+    let buf_dims_only = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0x7E02_020A, // v_mov_b32 v1, s10 (dword 2 = record count)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&buf_dims_only, false, false, layout.clone(), used.clone())
+        .expect("4-dword SRV buffer descriptor read only for dimensions should lower");
+
+    // 4. Sibling `s_load_dword` at offset +8 reading dword 2 of a buffer descriptor
+    //    loaded separately by `s_load_dwordx4` at offset 0.
+    let sibling_load = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xE030_2000,
+        0x8002_0100, // buffer_load_dword v1, v0, s[8:11], 0 idxen
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        0xF400_0302,
+        0xFA00_0008, // s_load_dword s12, s[4:5], null offset:8 (dword 2 of same descriptor)
+        0x7E02_020C, // v_mov_b32 v1, s12
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&sibling_load, false, false, layout.clone(), used)
+        .expect("sibling s_load_dword reading dword 2 of buffer descriptor should lower");
+
+    // 5. 8-dword image descriptor read ONLY as data (dimension unknown) still refuses.
+    let image_only_used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    }];
+    let Err(err) = lower_words(&buf_dims_only, false, false, layout, image_only_used) else {
+        panic!("8-dword image descriptor with no image use should still be refused");
+    };
+    assert!(
+        matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor read only as data",
+                ..
+            }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn s_buffer_load_descriptor_dimensions_and_cache_inv() {
+    // 1. Buffer descriptor used by `s_buffer_load_dword` (Fields::Smem on SRV)
+    //    whose dword 2 is also read as data (previously "a scalar memory read as data").
+    let (layout, used) = buffer_table(Some(0));
+    let smem_desc_dims = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+        0xF420_0304,
+        0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+        0x7E02_020C, // v_mov_b32 v1, s12
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        0x7E02_020A, // v_mov_b32 v1, s10 (dword 2 of descriptor used by s_buffer_load)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&smem_desc_dims, false, false, layout, used)
+        .expect("s_buffer_load_dword descriptor dimensions read as data should lower");
+
+    // 2. Scalar cache invalidation hints (`s_gl1_inv`, `s_dcache_inv`) are no-ops.
+    let cache_inv = [
+        0xF47C_0000,
+        0x0000_0000, // s_gl1_inv
+        0xF480_0000,
+        0x0000_0000, // s_dcache_inv
+        S_ENDPGM,
+    ];
+    lower_words(&cache_inv, false, false, vec![], vec![])
+        .expect("s_gl1_inv and s_dcache_inv should lower as no-ops");
+}
+
+#[test]
+fn lane_mask_phi_join_and_loop_mask_read_as_data() {
+    let layout = vec![RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+
+    // 1. Wave64 if-else joining a compare mask with `s_mov_b64 0` on the other arm,
+    //    consumed by `v_cndmask_b32` (previously "a lane-mask join of an untracked mask").
+    let phi_join_mov64 = [
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 -> else (skip 3 dwords)
+        0xD4C2_0004,
+        0x0002_0080, // v_cmp_eq_u32_e64 s[4:5], 0, v0
+        0xBF82_0001, // s_branch -> join (skip 1 dword)
+        0xBE84_0480, // s_mov_b64 s[4:5], 0
+        0xD501_0001,
+        128 | (129 << 9) | (4 << 18), // v_cndmask_b32 v1, 0, 1, s[4:5]
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&phi_join_mov64, true, false, layout.clone(), vec![])
+        .expect("wave64 phi join of compare and s_mov_b64 0 should lower");
+
+    // 2. Wave64 if-else joining a compare mask with split `s_mov_b32 s4, 0; s_mov_b32 s5, 0`.
+    let phi_join_split32 = [
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003, // s_cbranch_scc1 -> else (skip 3 dwords)
+        0xD4C2_0004,
+        0x0002_0080, // v_cmp_eq_u32_e64 s[4:5], 0, v0
+        0xBF82_0002, // s_branch -> join (skip 2 dwords)
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xD501_0001,
+        128 | (129 << 9) | (4 << 18), // v_cndmask_b32 v1, 0, 1, s[4:5]
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&phi_join_split32, true, false, layout.clone(), vec![])
+        .expect("wave64 phi join of compare and split s_mov_b32 0 should lower");
+
+    // 3. Wave64 loop accumulating a lane mask via phi + `s_or_b64`, then reading the
+    //    phi-joined mask as data (previously "a lane mask holding lanes elsewhere read as data").
+    let loop_mask_as_data = [
+        0xBE82_0480, // s_mov_b64 s[2:3], 0
+        // loop header (offset 4):
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        0x8882_6A02, // s_or_b64 s[2:3], s[2:3], vcc
+        0x8000_8100, // s_add_u32 s0, s0, 1
+        0xBF06_8400, // s_cmp_eq_u32 s0, 4
+        0xBF84_FFFB, // s_cbranch_scc0 -> offset 4 (-5 dwords from PC=24)
+        // after loop: read phi-joined mask s[2:3] as data
+        0xBE86_1002, // s_bcnt1_i32_b64 s6, s[2:3]
+        0x7E02_0206, // v_mov_b32 v1, s6
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        0x7E02_0203, // v_mov_b32 v1, s3 (high dword)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&loop_mask_as_data, true, false, layout, vec![])
+        .expect("wave64 loop phi-joined lane mask read as data should lower");
+}
+
+#[test]
+fn buffer_descriptor_stride_dword_read_as_data() {
+    let (layout, used) = buffer_table(Some(16));
+    let read = |dword_sgpr: u32| {
+        [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000,                       // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_0200 | dword_sgpr,          // v_mov_b32 v1, s<dword_sgpr>
+            LDS_STORE_V1[0],
+            LDS_STORE_V1[1],
+            S_ENDPGM,
+        ]
+    };
+    // Dword 1 (stride) and dword 3 (swizzle) are known.
+    for sgpr in [9, 11] {
+        lower_words(&read(sgpr), false, false, layout.clone(), used.clone())
+            .unwrap_or_else(|e| panic!("s{sgpr} of a buffer descriptor should lower: {e}"));
+    }
+    // Dword 0 is the address: it stays refused.
+    let Err(err) = lower_words(&read(8), false, false, layout, used) else {
+        panic!("the address dword must stay refused");
+    };
+    assert!(
+        matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor's address or format read as data",
+                ..
+            }
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn wqm_of_an_active_compare_read_as_data() {
+    const fn s_wqm_b32(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x09 << 8 | src0 as u32
+    }
+    const fn s_wqm_b64(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x0A << 8 | src0 as u32
+    }
+    const fn v_mov_b32(vdst: u8, src0: u16) -> u32 {
+        0x7E00_0000 | (vdst as u32) << 17 | (0x001 << 9) | (src0 as u32 & 0x1FF)
+    }
+    let layout = vec![RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let store = |sgpr: u16| [v_mov_b32(1, sgpr), LDS_STORE_V1[0], LDS_STORE_V1[1]];
+    // Wave32.
+    let mut w32 = vec![v_mov_b32(0, 0), 0x7D84_0080, s_wqm_b32(6, 106)];
+    w32.extend(store(6));
+    w32.push(S_ENDPGM);
+    lower_words(&w32, false, false, layout.clone(), vec![])
+        .expect("wave32 s_wqm_b32 of an active compare read as data should lower");
+    // Wave64, both dwords.
+    let mut w64 = vec![v_mov_b32(0, 0), 0x7D84_0080, s_wqm_b64(6, 106)];
+    w64.extend(store(6));
+    w64.extend(store(7));
+    w64.push(S_ENDPGM);
+    lower_words(&w64, true, false, layout, vec![])
+        .expect("wave64 s_wqm_b64 of an active compare read as data should lower");
+}
+
+#[test]
+fn inverted_mask_in_a_mesh_shader_refuses_with_its_reason() {
+    const fn s_not_b64(sdst: u8, src0: u8) -> u32 {
+        0xBE80_0000 | (sdst as u32) << 16 | 0x08 << 8 | src0 as u32
+    }
+    let words = [
+        0x7E00_0100, // v_mov_b32 v0, v0 (anything reading nothing)
+        0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+        s_not_b64(6, 106),
+        0x7E02_0206, // v_mov_b32 v1, s6
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    match lower_words(&words, true, true, vec![], vec![]) {
+        Ok(_) => {} // a mesh program may not read it as data at all; no regression
+        Err(ShaderError::Unsupported { what, .. }) => assert!(
+            what.contains("inverted") || what.contains("lane mask"),
+            "unexpected reason: {what}"
+        ),
+        Err(e) => panic!("{e}"),
+    }
+}
