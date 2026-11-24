@@ -3504,7 +3504,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -3604,6 +3603,8 @@ impl<'a> Lower<'a> {
                 Fields::Buffer { idxen, format, .. } => {
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
+                        || un.starts_with("tbuffer_load_format")
+                        || un.starts_with("tbuffer_store_format")
                     {
                         (10 | u, 0x409)
                     } else if *idxen && format.is_none() {
@@ -3611,13 +3612,18 @@ impl<'a> Lower<'a> {
                     } else {
                         (11 | u, 0)
                     };
+                    // A CBV descriptor copied/tested as data: synthesize a
+                    // non-null token and a large byte size (no GetDimensions).
                     if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
-                        return Err("a constant buffer's descriptor read as data (a CBV has no size query)");
+                        return self.cbv_descriptor_data(inst, code, count, rel_base);
                     }
                     (props, None)
                 }
                 Fields::Smem { .. } if un.starts_with("s_buffer_load_dword") => {
-                    if used.is_none() || used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                    if used.is_some_and(|u| u.kind == ResourceType::Cbv) {
+                        return self.cbv_descriptor_data(inst, code, count, rel_base);
+                    }
+                    if used.is_none() {
                         return Err("a constant buffer's descriptor read as data (a CBV has no size query)");
                     }
                     ((11 | u, 0), None)
@@ -3626,12 +3632,9 @@ impl<'a> Lower<'a> {
             };
             (src, rel_base, props, image, uav)
         } else if let Some(here) = a_here
-            && self
-                .x
-                .native
-                .layout
-                .get(here.param)
-                .is_some_and(|rp| rp.root == RootType::Table)
+            && self.x.native.layout.get(here.param).is_some_and(|rp| {
+                matches!(rp.root, RootType::Table | RootType::ResourceHeap)
+            })
             && let Some(u_res) = self.used_kind(&Source::Loaded {
                 load: site,
                 first: 0,
@@ -3642,20 +3645,45 @@ impl<'a> Lower<'a> {
                 first: 0,
             };
             if u_res.kind == ResourceType::Cbv {
-                return Err("a constant buffer's descriptor read as data (a CBV has no size query)");
-            }
-            if u_res.dwords != 4 || !matches!(u_res.kind, ResourceType::Srv | ResourceType::Uav) {
-                return Err("a descriptor read only as data");
+                let rel_base = ((here.offset % 32) / 4) as i32;
+                return self.cbv_descriptor_data(inst, code, count, rel_base);
             }
             let uav = u_res.kind == ResourceType::Uav;
             let u = if uav { 0x1000 } else { 0 };
-            let props = match u_res.stride {
-                0 => (11 | u, 0),
-                s if s.is_multiple_of(4) => (12 | u, s),
-                _ => return Err("a structured buffer with an unaligned stride"),
+            // 8-dword SRV/UAV entries are images; default to 2D (the common
+            // case for dimension / base-level queries without a sibling use).
+            let (props, image) = if u_res.dwords >= 8
+                && matches!(u_res.kind, ResourceType::Srv | ResourceType::Uav)
+            {
+                ((2 | u, 0x409), Some(2u32))
+            } else if u_res.dwords == 4
+                && matches!(u_res.kind, ResourceType::Srv | ResourceType::Uav)
+            {
+                let props = match u_res.stride {
+                    0 => (11 | u, 0),
+                    s if s.is_multiple_of(4) => (12 | u, s),
+                    _ => return Err("a structured buffer with an unaligned stride"),
+                };
+                (props, None)
+            } else {
+                return Err("a descriptor read only as data");
             };
             let rel_base = ((here.offset % 32) / 4) as i32;
-            (src, rel_base, props, None, uav)
+            (src, rel_base, props, image, uav)
+        } else if let Some(here) = a_here
+            && self.x.native.layout.get(here.param).is_some_and(|rp| {
+                matches!(rp.root, RootType::Table | RootType::ResourceHeap)
+            })
+            && count >= 8
+        {
+            // Bindless / table image descriptor read only for its fields
+            // (base level, width, null check) with no used-resource row.
+            let src = Source::Loaded {
+                load: site,
+                first: 0,
+            };
+            let rel_base = ((here.offset % 32) / 4) as i32;
+            (src, rel_base, (2u32, 0x409), Some(2u32), false)
         } else {
             return Err("a descriptor read only as data");
         };
@@ -3677,6 +3705,7 @@ impl<'a> Lower<'a> {
         let words: Vec<(u32, V)> = match image {
             Some(kind) => {
                 let one = self.s.m.i32(1);
+                let zero = self.s.m.i32(0);
                 let w = field(self, 0);
                 let (height, depth) = match kind {
                     1 => (one, one),
@@ -3685,6 +3714,13 @@ impl<'a> Lower<'a> {
                     _ => (field(self, 1), field(self, 2)),
                 };
                 let levels = if uav { one } else { field(self, 3) };
+                // Dword 0 is the GPU VA: synthesize a non-null token from the
+                // view's dimensions so `(d0|d1)==0` / `d0==0` null checks work.
+                let any = self.s.m.bin(c, Bin::Or, w, height);
+                let any = self.s.m.bin(c, Bin::Or, any, depth);
+                let any = self.s.m.bin(c, Bin::Or, any, levels);
+                let nonempty = self.s.m.cmp(c, pred::NE, any, zero);
+                let d0 = self.s.m.select(c, nonempty, one, zero);
                 let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
                 let (w, height, depth, levels) = (
                     less(self, w),
@@ -3709,17 +3745,19 @@ impl<'a> Lower<'a> {
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+                vec![(0, d0), (1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            // A buffer: dword 1 holds the stride in bits 16-29 (claimed only
-            // for a structured view, whose stride the host view has; its low
-            // half, the address's high bits, stays zero: dword 0, the
-            // address, is never claimed, so no use of the address passes),
-            // dword 2 the record count, dword 3 the identity swizzle only
-            // (the format bits have no host value).
+            // A buffer: dword 0 is a non-null token from the record count;
+            // dword 1 holds the stride in bits 16-29 (structured views);
+            // dword 2 the record count; dword 3 the identity swizzle.
             None => {
                 let d3 = self.s.m.i32(BUFFER_SWIZZLE_DWORD3);
-                let mut w = vec![(2, field(self, 0)), (3, d3)];
+                let records = field(self, 0);
+                let zero = self.s.m.i32(0);
+                let one = self.s.m.i32(1);
+                let nonempty = self.s.m.cmp(c, pred::NE, records, zero);
+                let d0 = self.s.m.select(c, nonempty, one, zero);
+                let mut w = vec![(0, d0), (2, records), (3, d3)];
                 if buf_stride != 0 {
                     w.push((1, self.s.m.i32((buf_stride & 0x3FFF) << 16)));
                 }
@@ -3728,11 +3766,43 @@ impl<'a> Lower<'a> {
         };
         for k in 0..count {
             let rel = (k as i32).wrapping_add(rel_base) as u32;
+            let x = match words.iter().find(|w| w.0 == rel) {
+                Some(&(_, x)) => x,
+                // Format / tiling / high address bits the host view does not
+                // expose: zero so masks and compares still lower.
+                None => self.s.m.i32(0),
+            };
+            self.write(inst, Reg::S(code + k as u8), x, None);
+        }
+        Ok(())
+    }
+
+    /// A CBV descriptor's dwords read as numbers (null checks, writelane
+    /// spills): no host size query, so dword 0 is a non-null token and
+    /// dword 2 a large byte size; the rest match a raw buffer swizzle.
+    fn cbv_descriptor_data(
+        &mut self,
+        inst: &Inst,
+        code: u8,
+        count: u32,
+        rel_base: i32,
+    ) -> Result<(), Why> {
+        let words = [
+            (0u32, self.s.m.i32(1)),
+            (1, self.s.m.i32(0)),
+            (2, self.s.m.i32(0x1_0000)),
+            (3, self.s.m.i32(BUFFER_SWIZZLE_DWORD3)),
+        ];
+        for k in 0..count {
+            let rel = (k as i32).wrapping_add(rel_base) as u32;
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        self.vals.insert(
+                            v,
+                            Val::Missing("a constant buffer's descriptor read as data (a CBV has no size query)"),
+                        );
                     }
                 }
             }
@@ -3959,20 +4029,35 @@ impl<'a> Lower<'a> {
         };
         let a = self.scalar.get(load)?;
         let rp = self.x.native.layout.get(a.param)?;
-        if rp.root != RootType::Table {
-            return None;
+        match rp.root {
+            RootType::Table => {
+                let dword = (a.offset / 4) + u32::from(*first);
+                self.x
+                    .native
+                    .used
+                    .iter()
+                    .filter(|u| {
+                        u.root == RootType::Table
+                            && u.user_data == rp.user_data
+                            && u.table_offset_dwords <= dword
+                    })
+                    .max_by_key(|u| u.table_offset_dwords)
+            }
+            // Bindless heap: match an 8-dword image or 4-dword buffer row by
+            // slot when the used list names ResourceHeap entries; otherwise
+            // any Srv/Uav with matching dwords.
+            RootType::ResourceHeap => self
+                .x
+                .native
+                .used
+                .iter()
+                .filter(|u| {
+                    matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                        && (u.root == RootType::ResourceHeap || u.dwords >= 4)
+                })
+                .max_by_key(|u| u.dwords),
+            _ => None,
         }
-        let dword = (a.offset / 4) + u32::from(*first);
-        self.x
-            .native
-            .used
-            .iter()
-            .filter(|u| {
-                u.root == RootType::Table
-                    && u.user_data == rp.user_data
-                    && u.table_offset_dwords <= dword
-            })
-            .max_by_key(|u| u.table_offset_dwords)
     }
 
     /// A handle for the descriptor `src` read at `site`.
@@ -6327,10 +6412,17 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked image")?;
         let store = name.starts_with("image_store");
+        // Sample/gather always bind as SRV even when the used-resource row
+        // says UAV (console reflection often tags RW textures that the
+        // program also samples through the same descriptor).
+        let sample_like = name.contains("sample")
+            || name.contains("gather")
+            || name == "image_get_lod";
         let uav = store
-            || self
-                .used_kind(src)
-                .is_some_and(|u| u.kind == ResourceType::Uav);
+            || (!sample_like
+                && self
+                    .used_kind(src)
+                    .is_some_and(|u| u.kind == ResourceType::Uav));
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // DXIL's atomic operations on a 32-bit integer texture UAV; the
@@ -6512,9 +6604,6 @@ impl<'a> Lower<'a> {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
-        }
-        if uav && op != 66 {
-            return Err("sampling a UAV");
         }
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
@@ -6918,12 +7007,17 @@ impl<'a> Lower<'a> {
         // d16: two 16-bit channels per VGPR, low half first.
         let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
-        // Sub-dword raw loads: (bits, signed).
+        // Sub-dword raw loads: (bits, signed). Stores: (bits,) via atomic and/or.
         let subdword: Option<(u32, bool)> = match plain.strip_prefix("buffer_load_") {
             Some("ubyte") => Some((8, false)),
             Some("sbyte") => Some((8, true)),
             Some("ushort") => Some((16, false)),
             Some("sshort") => Some((16, true)),
+            _ => None,
+        };
+        let subdword_store: Option<u32> = match plain.strip_prefix("buffer_store_") {
+            Some("byte") => Some(8),
+            Some("short") => Some(16),
             _ => None,
         };
         let (typed, count) = match plain
@@ -6932,7 +7026,7 @@ impl<'a> Lower<'a> {
             .or(plain.strip_prefix("tbuffer_load_"))
         {
             _ if atomic.is_some() => (false, 1),
-            _ if subdword.is_some() => (false, 1),
+            _ if subdword.is_some() || subdword_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
@@ -7048,6 +7142,45 @@ impl<'a> Lower<'a> {
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
             }
+            return Ok(());
+        }
+        if let Some(bits) = subdword_store {
+            // Race-free sub-dword UAV store: atomic AND to clear the lane's
+            // bytes, then atomic OR to insert (same as `ds_write_b8/b16`).
+            let width_mask = if bits == 8 { 0xffu32 } else { 0xffff };
+            let mut val = self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, 1)?[0];
+            let not3 = self.s.m.i32(!3);
+            let three = self.s.m.i32(3);
+            let aligned = self.s.m.bin(c, Bin::And, off, not3);
+            let byte = self.s.m.bin(c, Bin::And, off, three);
+            let sh = self.s.m.bin(c, Bin::Shl, byte, three);
+            let mask = self.s.m.i32(width_mask);
+            let all = self.s.m.i32(u32::MAX);
+            let shifted = self.s.m.bin(c, Bin::Shl, mask, sh);
+            let clear = self.s.m.bin(c, Bin::Xor, shifted, all);
+            val = self.s.m.bin(c, Bin::And, val, mask);
+            let insert = self.s.m.bin(c, Bin::Shl, val, sh);
+            let (h, coords): (V, [V; 3]) = match index {
+                Some(index) => {
+                    let h = self.handle(site, src, false, (12 | u, structured_stride(used)?))?;
+                    (h, [index, aligned, iu])
+                }
+                None => {
+                    let h = self.handle(site, src, false, (11 | u, 0))?;
+                    (h, [aligned, iu, iu])
+                }
+            };
+            let at = self.begin_guarded(guard);
+            let i32t = self.s.t.i32;
+            for (op, x) in [(1u32, clear), (2u32, insert)] {
+                // atomicBinOp: 1 = AND, 2 = OR.
+                let mut args = vec![h, self.s.m.i32(op)];
+                args.extend(coords);
+                args.push(x);
+                self.s
+                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+            }
+            self.end_guarded(at, &[]);
             return Ok(());
         }
         if store {

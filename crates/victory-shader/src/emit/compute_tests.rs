@@ -962,7 +962,8 @@ fn root_descriptor_and_buffer_only_descriptor_data_loads() {
     lower_words(&sibling_load, false, false, layout.clone(), used)
         .expect("sibling s_load_dword reading dword 2 of buffer descriptor should lower");
 
-    // 5. 8-dword image descriptor read ONLY as data (dimension unknown) still refuses.
+    // 5. 8-dword image descriptor read ONLY as data (no image_* use): dimensions
+    //    from GetDimensions with a default 2D view.
     let image_only_used = vec![UsedResource {
         kind: ResourceType::Srv,
         root: RootType::Table,
@@ -973,19 +974,8 @@ fn root_descriptor_and_buffer_only_descriptor_data_loads() {
         user_data: 0,
         slot: 0,
     }];
-    let Err(err) = lower_words(&buf_dims_only, false, false, layout, image_only_used) else {
-        panic!("8-dword image descriptor with no image use should still be refused");
-    };
-    assert!(
-        matches!(
-            err,
-            ShaderError::Unsupported {
-                what: "a descriptor read only as data",
-                ..
-            }
-        ),
-        "unexpected error: {err}"
-    );
+    lower_words(&buf_dims_only, false, false, layout, image_only_used)
+        .expect("8-dword image descriptor dimensions-only should lower as 2D");
 }
 
 #[test]
@@ -1109,25 +1099,11 @@ fn buffer_descriptor_stride_dword_read_as_data() {
             S_ENDPGM,
         ]
     };
-    // Dword 1 (stride) and dword 3 (swizzle) are known.
-    for sgpr in [9, 11] {
+    // Dword 0 (non-null token), 1 (stride), 2 (count), and 3 (swizzle) are known.
+    for sgpr in [8, 9, 10, 11] {
         lower_words(&read(sgpr), false, false, layout.clone(), used.clone())
             .unwrap_or_else(|e| panic!("s{sgpr} of a buffer descriptor should lower: {e}"));
     }
-    // Dword 0 is the address: it stays refused.
-    let Err(err) = lower_words(&read(8), false, false, layout, used) else {
-        panic!("the address dword must stay refused");
-    };
-    assert!(
-        matches!(
-            err,
-            ShaderError::Unsupported {
-                what: "a descriptor's address or format read as data",
-                ..
-            }
-        ),
-        "unexpected error: {err}"
-    );
 }
 
 #[test]
@@ -1574,5 +1550,124 @@ mod lds_wave_device {
             }
         }
     }
+}
+
+#[test]
+fn buffer_store_short_and_byte_lower() {
+    let (layout, used) = buffer_table(Some(0));
+    // Same skeleton as buffer_store_dword (0xE070_0000 = op 0x1c raw); short=0x1a, byte=0x18.
+    let store = |op: u32| {
+        let word0 = 0xE070_0000u32 ^ ((0x1Cu32 ^ op) << 18);
+        [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_0281, // v_mov_b32 v1, 1
+            word0,
+            0x8002_0100, // buffer_store_* v1, off=0, s[8:11], 0 (raw)
+            S_ENDPGM,
+        ]
+    };
+    for (name, op) in [("short", 0x1Au32), ("byte", 0x18)] {
+        lower_words(&store(op), false, false, layout.clone(), used.clone())
+            .unwrap_or_else(|e| panic!("buffer_store_{name} should lower: {e}"));
+    }
+}
+
+#[test]
+fn image_descriptor_dword0_null_token_and_bfe_lower() {
+    // s_load_dwordx8 of a table image, then s_bfe base-level + read dword 0.
+    let layout = vec![RootParam {
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    let used = vec![UsedResource {
+        kind: ResourceType::Srv,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 4,
+        dwords: 8,
+        user_data: 0,
+        slot: 0,
+    }];
+    let words = [
+        0xBE84_0300u32, // s_mov_b32 s4, s0
+        0xBE85_0380,    // s_mov_b32 s5, 0
+        0xF410_0202,
+        0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+        0x7E02_0208, // v_mov_b32 v1, s8 (dword 0 null token)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        0x7E02_020B, // v_mov_b32 v1, s11 (dword 3: base/last level + type)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        0x7E02_020A, // v_mov_b32 v1, s10 (dword 2: width/height)
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&words, false, false, layout, used)
+        .expect("image descriptor dword0/2/3 as data should lower");
+}
+
+#[test]
+fn address_phi_null_vs_root_constants() {
+    use crate::resource::{self, Address};
+    // Wave32: if (s0 == 0) s[2:3]=0 else s[2:3]=s[0:1]; then global_load via saddr.
+    // After structurisation the join is a phi of null vs the Constants address.
+    let layout = vec![RootParam {
+        root: RootType::Constants,
+        table_offset_dwords: 0,
+        sgprs: 4,
+        base_register: 0,
+        user_data: 0,
+        slot: 0,
+    }];
+    // Use SGPR address form: global_load_dword v0, v0, s[2:3]
+    // Encoding borrowed from resource tests (FLAT with saddr).
+    let words = [
+        0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+        0xBF85_0003,    // s_cbranch_scc1 -> null arm (PC+4 + 3 dwords)
+        0xBE82_0300,    // s_mov_b32 s2, s0
+        0xBE83_0301,    // s_mov_b32 s3, s1
+        0xBF82_0002,    // s_branch join
+        0xBE82_0380,    // null: s_mov_b32 s2, 0
+        0xBE83_0380,    // s_mov_b32 s3, 0
+        0x7E00_0280, // join: v_mov_b32 v0, 0 (offset)
+        0xDC30_8000,
+        0x0002_0000, // global_load_dword v0, v0, s[2:3]
+        S_ENDPGM,
+    ];
+    let p = ir::build(
+        &words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+        false,
+        256,
+    )
+    .unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &layout, HwStage::Cs, Some(&st)).unwrap();
+    let a = res
+        .scalar
+        .iter()
+        .find_map(|(_, a)| (a.param == 0).then_some(*a))
+        .expect("phi of null vs Constants should track as Constants address");
+    assert_eq!(
+        a,
+        Address {
+            param: 0,
+            offset: 0,
+            dynamic: None,
+            dword: 0,
+            shift: 0,
+        }
+    );
+    lower_words(&words, false, false, layout, vec![])
+        .expect("null-vs-root Constants address should lower");
 }
 

@@ -734,35 +734,124 @@ impl<'a> Tracer<'a> {
         if let Some(a) = self.constants_shifted_address(lo, hi, &extra) {
             return Ok(a);
         }
+        if let Some(a) = self.address_through_choice(lo, hi, &extra) {
+            return Ok(a);
+        }
         let s = self.sum(lo);
         if s.dynamic.is_some() && extra.dynamic.is_some() {
             return Err("an address with two computed terms");
         }
         let base = s.base.ok_or_else(|| self.why_no_base(s.dynamic))?;
+        self.address_from_base(
+            base,
+            hi,
+            Sum {
+                base: s.base,
+                offset: s.offset.wrapping_add(extra.offset),
+                dynamic: s.dynamic.or(extra.dynamic),
+            },
+        )
+        .ok_or_else(|| {
+            if self.value_param(base).is_some()
+                || self.inputs[base.0 as usize]
+                    .and_then(|r| self.param_of(r))
+                    .is_some()
+            {
+                "an address with an untracked high half"
+            } else {
+                "an address not from a root parameter"
+            }
+        })
+    }
+
+    /// `lo`/`hi` are a phi or `v_cndmask_b32` of addresses: keep non-null
+    /// arms that resolve to the same root (param/dword/shift). Null checks
+    /// before the access (e.g. `v_cmpx_ne_u64`) make the dead arm irrelevant.
+    fn address_through_choice(
+        &self,
+        lo: Term,
+        hi: Term,
+        extra: &Sum,
+    ) -> Option<Address> {
+        let Term::Value(lo_v) = lo else {
+            return None;
+        };
+        let arms = self.choice_arms(lo_v)?;
+        if arms.len() < 2 {
+            return None;
+        }
+        let hi_arms = match hi {
+            Term::Value(h) => self.choice_arms(h).unwrap_or_else(|| vec![hi; arms.len()]),
+            other => vec![other; arms.len()],
+        };
+        if hi_arms.len() != arms.len() {
+            return None;
+        }
+        let mut found: Option<Address> = None;
+        for (&arm_lo, &arm_hi) in arms.iter().zip(&hi_arms) {
+            if self.term_is_null(arm_lo) && self.term_is_null(arm_hi) {
+                continue;
+            }
+            // Avoid re-entering choice resolution on nested phis of the same value.
+            let a = {
+                if let Some(shifted) = self.constants_shifted_address(arm_lo, arm_hi, extra) {
+                    shifted
+                } else {
+                    let s = self.sum(arm_lo);
+                    if s.dynamic.is_some() && extra.dynamic.is_some() {
+                        return None;
+                    }
+                    let base = s.base?;
+                    self.address_from_base(
+                        base,
+                        arm_hi,
+                        Sum {
+                            base: s.base,
+                            offset: s.offset.wrapping_add(extra.offset),
+                            dynamic: s.dynamic.or(extra.dynamic),
+                        },
+                    )?
+                }
+            };
+            match &found {
+                None => found = Some(a),
+                // Identical root address (null vs root, or duplicated arms).
+                Some(prev) if *prev == a => {}
+                Some(_) => return None,
+            }
+        }
+        found
+    }
+
+    /// Finish [`Self::address`] once `sum` has named the root `base`.
+    fn address_from_base(
+        &self,
+        base: Value,
+        hi: Term,
+        s: Sum,
+    ) -> Option<Address> {
+        let dynamic = s.dynamic;
         if self.spill
             && self.inputs[base.0 as usize] == Some(Reg::S(self.stage.user_sgpr(0)))
             && self.spill_high(hi)
         {
-            return Ok(Address {
+            return Some(Address {
                 param: SPILL,
-                offset: s.offset.wrapping_add(extra.offset),
-                dynamic: s.dynamic.or(extra.dynamic),
+                offset: s.offset,
+                dynamic,
                 dword: 0,
                 shift: 0,
             });
         }
         if let Some(pc) = self.getpc(base) {
-            // A table in the code: the base is the next instruction's offset.
             let high = pc.writes.get(1).map(|w| w.1);
             if !self.high_half(hi, high) && !high.is_some_and(|h| self.carried(hi, h)) {
-                return Err("an address with an untracked high half");
+                return None;
             }
-            return Ok(Address {
+            return Some(Address {
                 param: CODE,
-                offset: (pc.machine.offset as u32 + 4)
-                    .wrapping_add(s.offset)
-                    .wrapping_add(extra.offset),
-                dynamic: s.dynamic.or(extra.dynamic),
+                offset: (pc.machine.offset as u32 + 4).wrapping_add(s.offset),
+                dynamic,
                 dword: 0,
                 shift: 0,
             });
@@ -772,21 +861,17 @@ impl<'a> Tracer<'a> {
             .or_else(|| {
                 let reg = self.inputs[base.0 as usize]?;
                 self.param_of(reg)
-            })
-            .ok_or("an address not from a root parameter")?;
-        let dynamic = s.dynamic.or(extra.dynamic);
+            })?;
         if self.layout[param].root == RootType::Constants {
-            let high = self
-                .param_dword(param, dword + 1)
-                .ok_or("a Constants address without its high half")?;
+            let high = self.param_dword(param, dword + 1)?;
             if !self.high_half(hi, Some(high))
                 && !(dynamic.is_some() && self.carried(hi, high))
             {
-                return Err("an address with an untracked high half");
+                return None;
             }
-            return Ok(Address {
+            return Some(Address {
                 param,
-                offset: s.offset.wrapping_add(extra.offset),
+                offset: s.offset,
                 dynamic,
                 dword: dword as u16,
                 shift: 0,
@@ -794,26 +879,54 @@ impl<'a> Tracer<'a> {
         }
         let high = match self.layout[param].root {
             RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => None,
-            RootType::Descriptor => Some(
-                self.descriptor_high(param)
-                    .ok_or("a root descriptor without its high half")?,
-            ),
-            _ => return Err("an address from a root parameter that is no address"),
+            RootType::Descriptor => Some(self.descriptor_high(param)?),
+            _ => return None,
         };
-        // shortcut: with a computed term, a high half that adds anything to the
-        // base's is taken as the carry of that term (offsets below 4 GB).
         if !self.high_half(hi, high)
             && !(dynamic.is_some() && high.is_some_and(|h| self.carried(hi, h)))
         {
-            return Err("an address with an untracked high half");
+            return None;
         }
-        Ok(Address {
+        Some(Address {
             param,
-            offset: s.offset.wrapping_add(extra.offset),
+            offset: s.offset,
             dynamic,
             dword: 0,
             shift: 0,
         })
+    }
+
+    /// Phi or plain `v_cndmask_b32` arms of `v` (one level).
+    fn choice_arms(&self, v: Value) -> Option<Vec<Term>> {
+        if let Some((b, i)) = self.phis[v.0 as usize] {
+            let phi = &self.p.blocks[b].phis[i];
+            return Some(phi.args.iter().map(|&a| self.origin(a)).collect());
+        }
+        let inst = self.def(v)?;
+        if inst.name() != "v_cndmask_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.abs != 0 || f.neg != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        let a = self.vterm(inst, f.src.first()?)?;
+        let b = self.vterm(inst, f.src.get(1)?)?;
+        Some(vec![a, b])
+    }
+
+    fn term_is_null(&self, t: Term) -> bool {
+        match t {
+            Term::Const(0) => true,
+            Term::Const(_) => false,
+            Term::Value(v) => matches!(self.sum(Term::Value(v)), Sum {
+                base: None,
+                offset: 0,
+                dynamic: None,
+            }),
+        }
     }
 
     /// Value holding layout parameter `param` dword `dword`.
