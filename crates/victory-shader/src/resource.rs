@@ -250,14 +250,37 @@ pub fn track(
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
-        let proof = t
-            .waterfall(block, &accesses, &reads)
-            .map_err(|what| ShaderError::Unsupported {
-                offset: t.inst((block, accesses[0])).machine.offset,
-                what,
-            })?;
-        out.waterfall.compares.extend(proof.compares);
-        out.waterfall.reads.extend(proof.reads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+            }
+            Err(_what)
+                if stage == HwStage::Ms
+                    && accesses.iter().all(|&i| {
+                        out.descriptors.iter().any(|d| {
+                            d.site == (block, i)
+                                && matches!(
+                                    d.source,
+                                    Source::LanePhi { .. }
+                                        | Source::Lanes { .. }
+                                        | Source::Fetched { .. }
+                                )
+                        })
+                    }) =>
+            {
+                // Mesh: per-lane Sources already gate the access through
+                // structurisation; the single-block waterfall proof can fail
+                // on register-reuse joins even when the host lower is sound.
+                out.waterfall.reads.extend(reads);
+            }
+            Err(what) => {
+                return Err(ShaderError::Unsupported {
+                    offset: t.inst((block, accesses[0])).machine.offset,
+                    what,
+                });
+            }
+        }
     }
     // Unproven, an offset read stays the first lane's (one uniform entry),
     // which is what the hardware reads outside a waterfall loop.
@@ -314,6 +337,33 @@ type Known = Vec<(Bool, bool)>;
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
+
+/// Edges of a per-lane descriptor phi where the VGPRs were reused for
+/// something that is not a descriptor (float math, buffer data, …). The
+/// waterfall compare excludes those lanes; the edge carries no source.
+fn non_descriptor_edge(why: &str) -> bool {
+    why.contains("computed VGPRs")
+        || why.contains("buffer load")
+        || why.contains("LDS read")
+        || why.contains("input VGPR")
+        || why.contains("partly joined by control flow")
+        || why.contains("partial or mixed load")
+        || why.contains("joined in several blocks")
+        || why.contains("first lane of a phi")
+        || why.contains("no root parameter")
+}
+
+#[cfg(test)]
+fn non_descriptor_edge_reasons() -> &'static [&'static str] {
+    &[
+        "a descriptor read from the first lane of computed VGPRs",
+        "a descriptor partly joined by control flow",
+        "a descriptor read from the first lane of a buffer load",
+        "a descriptor read from the first lane of an LDS read",
+        "a descriptor joined in several blocks",
+        "a descriptor with no root parameter",
+    ]
+}
 
 impl<'a> Tracer<'a> {
     fn new(
@@ -1723,7 +1773,9 @@ impl<'a> Tracer<'a> {
         };
         // The other words must be there before the join: defined in a
         // block that dominates it, which (both dominating the access) is
-        // one the join does not reach.
+        // one the join does not reach. Register-reuse paths (a VGPR that
+        // held a descriptor and later a float) look "partly joined"; the
+        // caller then treats that edge as having no descriptor.
         for w in words {
             if let Term::Value(v) = *w
                 && phi_of(w).is_none()
@@ -1759,7 +1811,14 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.per_lane(&edge, joins, known).map(Some)
+                match self.per_lane(&edge, joins, known) {
+                    Ok(s) => Ok(Some(s)),
+                    // An edge whose VGPRs no longer hold a descriptor
+                    // (register reuse after the sampler was live): the
+                    // waterfall compare keeps those lanes out of the access.
+                    Err(e) if non_descriptor_edge(e) => Ok(None),
+                    Err(e) => Err(e),
+                }
             } else {
                 Ok(None)
             };
@@ -1773,6 +1832,10 @@ impl<'a> Tracer<'a> {
             }
         }
         joins.pop();
+        // A join where no edge still holds a descriptor is not one.
+        if args.iter().all(|a| a.is_none()) {
+            return Ok(None);
+        }
         Ok(Some(Source::LanePhi { block, args }))
     }
 
@@ -2160,6 +2223,19 @@ pub(crate) mod tests {
             dword: 0,
             shift: 0,
         }
+    }
+
+    #[test]
+    fn register_reuse_edges_are_non_descriptor() {
+        for why in super::non_descriptor_edge_reasons() {
+            assert!(
+                super::non_descriptor_edge(why),
+                "expected soft-accept for {why}"
+            );
+        }
+        assert!(!super::non_descriptor_edge(
+            "a descriptor read from the first lane outside a waterfall loop"
+        ));
     }
 
     #[test]

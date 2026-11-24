@@ -1,7 +1,7 @@
 ﻿use std::collections::HashSet;
 
 use crate::gfx10::Fields;
-use crate::ir::{Program, Reg, Value, reverse_postorder};
+use crate::ir::{EXEC, Program, Reg, VCC, Value, reverse_postorder};
 use crate::resource::Site;
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -77,12 +77,30 @@ pub(super) fn analyze(p: &Program, st: &Structured) -> Analysis {
                     }
                 }
                 if !uniform(when, &varying) {
+                    let back = rank[taken] <= n || rank[not_taken] <= n;
                     let mut visited = HashSet::new();
                     let mut todo = vec![taken, not_taken];
+                    // A non-uniform back edge makes the whole loop divergent:
+                    // include the header (back-edge target) and every block
+                    // that can reach the branch through the loop.
+                    if back {
+                        todo.push(b);
+                        if rank[taken] <= n {
+                            todo.push(taken);
+                        }
+                        if rank[not_taken] <= n {
+                            todo.push(not_taken);
+                        }
+                    }
                     while let Some(q) = todo.pop() {
                         if rank[q] != a && visited.insert(q) {
                             divergent[q] = true;
                             todo.extend(blocks[q].exit.successors());
+                            // Walk predecessors too so a divergent loop exit
+                            // marks the header and body, not only the exit arm.
+                            if back {
+                                todo.extend(blocks[q].preds.iter().copied());
+                            }
                         }
                     }
                 }
@@ -92,6 +110,22 @@ pub(super) fn analyze(p: &Program, st: &Structured) -> Analysis {
         };
     }
     Analysis { divergent, varying }
+}
+
+/// An `s_barrier` that only some threads of the group execute: on Wave32 with
+/// more than one host wave it deadlocks.
+pub(super) fn has_divergent_s_barrier(p: &Program, st: &Structured, a: &Analysis) -> bool {
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            if inst.name() != "s_barrier" {
+                continue;
+            }
+            if a.divergent[b] || st.guards[b][i].is_some_and(|g| !a.uniform(st, g)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn barriers_for(p: &Program, st: &Structured, a: &Analysis) -> Option<HashSet<Site>> {
@@ -118,8 +152,9 @@ fn barriers_for(p: &Program, st: &Structured, a: &Analysis) -> Option<HashSet<Si
 }
 
 /// Fences for LDS accesses that sit in group-uniform blocks only. Divergent
-/// `ds_*` are skipped (never insert a barrier there) so Wave64-on-Wave32
-/// emulation can still sync the uniform part of the group's own LDS.
+/// `ds_*` are skipped (never insert a barrier there). Kept for analysis /
+/// tests; Wave64-on-Wave32 now requires a full [`split_barriers`] proof.
+#[allow(dead_code)]
 pub(super) fn uniform_split_barriers(
     p: &Program,
     _st: &Structured,
@@ -162,8 +197,15 @@ fn fence_sites(p: &Program, a: &Analysis, skip_divergent: bool) -> HashSet<Site>
     }
 }
 
+fn is_exec_or_vcc(r: Reg) -> bool {
+    matches!(r, Reg::S(c) if c == VCC || c == VCC + 1 || c == EXEC || c == EXEC + 1)
+}
+
 /// Values whose contents may differ between host waves. A scalar register
 /// alone proves nothing: read-first-lane, for example, writes an SGPR.
+/// EXEC and VCC stay varying: even `s_mov exec, -1` is followed by per-lane
+/// compares that re-narrow them, and treating them as uniform across host
+/// waves would miss divergent barriers.
 fn varying_values(p: &Program, order: &[usize], uniform_control: bool) -> HashSet<Value> {
     let mut varying: HashSet<_> = p
         .inputs
@@ -174,12 +216,17 @@ fn varying_values(p: &Program, order: &[usize], uniform_control: bool) -> HashSe
         let count = varying.len();
         for &b in order {
             for phi in &p.blocks[b].phis {
-                if !uniform_control || phi.args.iter().any(|v| varying.contains(v)) {
+                if !uniform_control
+                    || is_exec_or_vcc(phi.reg)
+                    || phi.args.iter().any(|v| varying.contains(v))
+                {
                     varying.insert(phi.value);
                 }
             }
             for i in &p.blocks[b].insts {
-                if !matches!(i.fields, Fields::Sop { .. } | Fields::Smem { .. })
+                let to_exec_vcc = i.writes.iter().any(|&(r, _)| is_exec_or_vcc(r));
+                if to_exec_vcc
+                    || !matches!(i.fields, Fields::Sop { .. } | Fields::Smem { .. })
                     || i.reads.iter().any(|r| varying.contains(&r.1))
                 {
                     varying.extend(i.writes.iter().map(|w| w.1));

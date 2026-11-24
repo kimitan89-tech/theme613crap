@@ -1675,9 +1675,127 @@ mod lds_wave_device {
             assert_ne!(wave(&cs), (64, 64));
             host().compute_pipeline(&cs).expect("predicated LDS PSO");
         }
+
+        // 6) Exclusive prefix-of-ones over 64 lanes ≡ console lane index.
+        // `v_mbcnt` lowers through the Wave64-on-Wave32 ballot path; a true
+        // DPP `wavePrefixOp` section is covered offline by `wave::tests`.
+        // Dispatch checks the 64-lane exclusive-prefix identity on device.
+        {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0003,
+                193 | 128 << 9,
+                0xd766_0003,
+                193 | 259 << 9, // v3 = console lane
+                0x3404_0082,
+            ]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(wave(&cs), (32, 32));
+            assert_eq!(
+                dispatch(&cs, 64),
+                (0..64).collect::<Vec<_>>(),
+                "exclusive prefix of ones over 64 lanes"
+            );
+        }
     }
 
 }
+
+#[test]
+fn divergent_s_barrier_keeps_wave64() {
+    // A divergent s_barrier is a no-op inside one console wave, but hangs when
+    // the group is two host Wave32s: keep WaveSize(64).
+    let words = [
+        0x7da4_0080, // v_cmpx_gt_u32 exec, v0, 0 (half the lanes leave)
+        0xbf88_0001, // s_cbranch_execz +1
+        SYNC,
+        END,
+    ];
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+}
+
+#[test]
+fn divergent_cross32_readlane_keeps_wave64() {
+    // v_readlane in a divergent block needs an LDS barrier there: refuse
+    // Wave32 emulation rather than deadlock.
+    let readlane = [0xd760_0002u32, 0x100 | ((128 + 32) << 9)]; // s2 = readlane(v0, 32)
+    let mut words = vec![
+        0xd765_0000,
+        193 | 128 << 9,
+        0xd766_0000,
+        193 | 256 << 9, // v0 = console lane
+        0x7da4_0080,    // v_cmpx
+        0xbf88_0002,    // s_cbranch_execz skip readlane
+    ];
+    words.extend(readlane);
+    words.push(END);
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+}
+
+#[test]
+fn divergent_ballot_keeps_wave64() {
+    // A compare defined inside a divergent block, then read as data: the
+    // Wave64-on-Wave32 ballot barrier would land in that block and hang.
+    let words = [
+        0x7da4_0080u32, // v_cmpx_gt_u32 exec, v0, 0
+        0xbf88_0002,    // s_cbranch_execz skip compare+bcnt
+        0x7d84_0080,    // v_cmp_eq_u32 vcc, 0, v0 (mask def, divergent)
+        0xbe86_106a,    // s_bcnt1_i32_b64 s6, vcc
+        END,
+    ];
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+}
+
+#[test]
+fn mesh_lane_mask_as_data_lowers() {
+    // Mesh uses console lane masks; reading a compare mask as numbers must
+    // lower (same pattern as the remaining failed mesh shaders).
+    let words = [
+        0x7D84_0080u32, // v_cmp_eq_u32 vcc, 0, v0
+        0xBE86_106A,    // s_bcnt1_i32_b64 s6, vcc
+        0x7E02_0206,    // v_mov_b32 v1, s6
+        LDS_STORE_V1[0],
+        LDS_STORE_V1[1],
+        S_ENDPGM,
+    ];
+    lower_words(&words, true, true, vec![], vec![])
+        .expect("mesh lane mask as data should lower");
+}
+
+#[test]
+fn sampler_heap_descriptor_as_data_lowers() {
+    // CS: heap base in s0. Mesh: user data starts at s8 (merged-stage layout).
+    let words_at = |base: u8| {
+        let s4 = 0xBE84_0300u32 | u32::from(base); // s_mov_b32 s4, s{base}
+        [
+            s4,
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0x7E02_0208, // v_mov_b32 v1, s8 (null-check dword)
+            LDS_STORE_V1[0],
+            LDS_STORE_V1[1],
+            S_ENDPGM,
+        ]
+    };
+    let layout = |user_data: u8| {
+        vec![RootParam {
+            root: RootType::SamplerHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: 0,
+        }]
+    };
+    lower_words(&words_at(0), false, false, layout(0), vec![])
+        .expect("CS sampler-heap descriptor as data should lower");
+    lower_words(&words_at(8), false, true, layout(0), vec![])
+        .expect("mesh sampler-heap descriptor as data should lower");
+}
+
 
 #[test]
 fn buffer_store_short_and_byte_lower() {

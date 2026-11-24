@@ -83,14 +83,27 @@ pub(crate) struct Parts<'a> {
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
+    /// A Wave64-on-Wave32 barrier landed in divergent/guarded control flow:
+    /// re-lower with WaveSize(64) and no LDS scratch emulation.
+    RefuseEmu,
     Fail(ShaderError),
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
+    let mut refuse_emu = false;
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, refuse_emu).run() {
             Ok(l) => return Ok(l),
+            Err(Stop::RefuseEmu) => {
+                if refuse_emu {
+                    return Err(ShaderError::Unsupported {
+                        offset: 0,
+                        what: "a divergent group barrier",
+                    });
+                }
+                refuse_emu = true;
+            }
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
                     return Err(ShaderError::Unsupported {
@@ -223,6 +236,17 @@ struct Lower<'a> {
     wave64_emu: Option<Wave64Emu>,
     /// Lazy ids for [`Self::wave64_emu`] (built in the entry block).
     wave64_ids: Option<Wave64Ids>,
+    /// IR blocks that only some threads of the group reach.
+    divergent: Vec<bool>,
+    /// Nesting depth of [`Self::begin_guarded`].
+    in_guard: u32,
+    /// LLVM blocks created inside a lane guard (the `then` arm).
+    llvm_guarded: HashSet<usize>,
+    /// LLVM blocks belonging to a divergent IR block (including its tail).
+    llvm_divergent: HashSet<usize>,
+    /// Set when a group barrier was emitted in divergent or guarded code while
+    /// splitting a Wave64 shader across host Wave32s.
+    divergent_barrier: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -309,15 +333,77 @@ fn cross32_wave_op(st: &Structured, res: &Resources, i: &Inst) -> bool {
         || reads_mask_as_data(st, i)
 }
 
-/// Cross-32 ops whose lowering inserts group barriers (must be uniform CFG).
-fn cross32_needs_barrier(st: &Structured, res: &Resources, i: &Inst) -> bool {
+/// Ops whose Wave64-on-Wave32 lowering emits a group barrier at their site.
+fn emits_barrier_at_site(st: &Structured, res: &Resources, i: &Inst) -> bool {
     let n = i.name();
-    // writelane is a select on the console lane; mbcnt / mask-as-data use the
-    // console lane index and ballots taken at the mask's def site.
-    if n == "v_writelane_b32" || n.starts_with("v_mbcnt") || reads_mask_as_data(st, i) {
+    if n == "v_writelane_b32" {
+        return false;
+    }
+    // mbcnt / mask-as-data ballots land at the mask's def, checked separately.
+    if n.starts_with("v_mbcnt") || reads_mask_as_data(st, i) {
         return false;
     }
     cross32_wave_op(st, res, i)
+}
+
+/// IR blocks where a Wave64-on-Wave32 group barrier would be inserted.
+fn wave64_barrier_blocks(
+    p: &Program,
+    st: &Structured,
+    res: &Resources,
+) -> HashSet<usize> {
+    let mut sites = HashSet::new();
+    let def_of = |v: Value| -> Option<usize> {
+        p.blocks.iter().enumerate().find_map(|(b, block)| {
+            block
+                .insts
+                .iter()
+                .any(|i| i.writes.iter().any(|&(_, w)| w == v))
+                .then_some(b)
+                .or_else(|| {
+                    block
+                        .phis
+                        .iter()
+                        .any(|phi| phi.value == v)
+                        .then_some(b)
+                })
+        })
+    };
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            if emits_barrier_at_site(st, res, inst) {
+                sites.insert(b);
+            }
+            // Ballots for mbcnt / mask-as-data are taken at the mask def.
+            if inst.name().starts_with("v_mbcnt") || reads_mask_as_data(st, inst) {
+                for op in match &inst.fields {
+                    Fields::Sop { src, .. } => src.iter().collect::<Vec<_>>(),
+                    Fields::Valu(v) => v.src.iter().collect(),
+                    _ => Vec::new(),
+                } {
+                    if let Operand::Scalar { code, .. } = *op
+                        && let Some(v) = inst.read(Reg::S(code))
+                        && (st.masks.contains_key(&v) || st.highs.contains_key(&v))
+                        && let Some(d) = def_of(v)
+                    {
+                        sites.insert(d);
+                    }
+                }
+            }
+        }
+        // Whole-wave sections lower to waveActive*/Prefix and need LDS combine.
+        for section in super::wave::sections(p, b).values() {
+            if section.shapes.values().any(|sh| {
+                matches!(
+                    sh,
+                    super::wave::Shape::Active(..) | super::wave::Shape::Prefix(..)
+                )
+            }) {
+                sites.insert(b);
+            }
+        }
+    }
+    sites
 }
 
 /// Whether a wave64 compute group can run as WaveSize(32) with LDS scratch.
@@ -334,23 +420,20 @@ fn try_wave64_on_wave32(
         return None;
     }
     let analysis = super::lds::analyze(p, st);
-    // Scratch store/barrier/load must run in lockstep: refuse only when a
-    // cross-32-lane wave op itself sits in a divergent block.
-    for (b, insts) in p.blocks.iter().enumerate() {
-        for inst in &insts.insts {
-            if cross32_needs_barrier(st, res, inst) && analysis.divergent[b] {
-                return None;
-            }
+    // A divergent s_barrier is a no-op inside one console wave, but deadlocks
+    // when the group is two host Wave32s.
+    if super::lds::has_divergent_s_barrier(p, st, &analysis) {
+        return None;
+    }
+    for b in wave64_barrier_blocks(p, st, res) {
+        if analysis.divergent[b] {
+            return None;
         }
     }
     let barriers = if orig_lds > 0 {
-        match super::lds::split_barriers(p, st) {
-            Some(b) => b,
-            // User LDS has divergent accesses: still emulate wave ops (their
-            // barriers stay in uniform blocks) and fence only the uniform
-            // LDS sites so we never insert a barrier that would deadlock.
-            None => super::lds::uniform_split_barriers(p, st, &analysis),
-        }
+        // Need a full proof: divergent user LDS or s_barrier means we cannot
+        // keep the two host waves in lockstep on the group's own LDS.
+        super::lds::split_barriers(p, st)?
     } else {
         HashSet::new()
     };
@@ -457,7 +540,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, refuse_emu: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -476,6 +559,11 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let mut lds_barriers = None;
         let mut wave64_emu = None;
+        let analysis = if matches!(x.native.io, StageIo::Cs(_)) {
+            Some(super::lds::analyze(p, x.st))
+        } else {
+            None
+        };
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -573,8 +661,15 @@ impl<'a> Lower<'a> {
                             .any(|a| matches!(a, Atom::Opaque(..) | Atom::Constant(_)))
                     })
                 });
+            let divergent_s_barrier = analysis
+                .as_ref()
+                .is_some_and(|a| super::lds::has_divergent_s_barrier(p, x.st, a));
             if console_lanes && wave == 64 {
-                if !cross32 {
+                if refuse_emu || divergent_s_barrier {
+                    // Never split a shader with a divergent s_barrier (or one
+                    // whose prior lower already saw a divergent emu barrier).
+                    s.wave_size = Some(64);
+                } else if !cross32 {
                     // DPP / ds_swizzle stay inside a 32-lane half: WaveSize(32)
                     // with thread remapping matches the console bit for bit.
                     s.wave_size = Some(32);
@@ -592,12 +687,16 @@ impl<'a> Lower<'a> {
                 if !console_lanes && wave == 64 {
                     lds_barriers = super::lds::split_barriers(p, x.st);
                 }
-                // When uniform LDS fences work, leave WaveSize unset so a
-                // Wave32 host can run. When they do not (divergent LDS) and
-                // the program needs no console lane layout, also leave it
-                // unset: forcing WaveSize(64) only refuses on Wave32 GPUs.
-                // Console-lane programs take the branch above instead.
-                if lds_barriers.is_none() && (console_lanes || wave == 32) {
+                // A divergent s_barrier on Wave32 is an instant GPU hang when
+                // the group spans more than one host wave: keep WaveSize(64).
+                if divergent_s_barrier && wave == 64 {
+                    s.wave_size = Some(64);
+                } else if lds_barriers.is_none() && (console_lanes || wave == 32) {
+                    // When uniform LDS fences work, leave WaveSize unset so a
+                    // Wave32 host can run. When they do not (divergent LDS) and
+                    // the program needs no console lane layout, also leave it
+                    // unset: forcing WaveSize(64) only refuses on Wave32 GPUs.
+                    // Console-lane programs take the branch above instead.
                     s.wave_size = Some(wave);
                 }
             }
@@ -690,9 +789,20 @@ impl<'a> Lower<'a> {
             lds_barriers,
             wave64_emu,
             wave64_ids: None,
+            divergent: analysis
+                .map(|a| a.divergent)
+                .unwrap_or_else(|| vec![false; p.blocks.len()]),
+            in_guard: 0,
+            llvm_guarded: HashSet::new(),
+            llvm_divergent: HashSet::new(),
+            divergent_barrier: false,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
-                HwStage::Cs => MaskData::Console,
+                // Mesh has no WaveSize attribute, but lane masks still appear as
+                // numbers (bit tests, cselect of EXEC, counts). Host wave ballots
+                // match the device wave; console lane order is not required for
+                // these scalar uses the way compute cross-lane ops need it.
+                HwStage::Cs | HwStage::Ms => MaskData::Console,
                 HwStage::Ps | HwStage::Vs => MaskData::Host,
                 _ => MaskData::None,
             },
@@ -1068,7 +1178,10 @@ impl<'a> Lower<'a> {
         let r = if float { self.as_int(r) } else { r };
         if self.wave64_emu.is_some() {
             let id = self.s.m.i32(ident);
-            return Ok(self.combine_wave64_op(r, on, op, prefix, id, float, c));
+            // `x` is the per-lane source (ident in inactive lanes); needed so a
+            // Prefix combine can publish the true 32-lane total, not lane 0's
+            // prefix (which is only the identity / lane0 value).
+            return Ok(self.combine_wave64_op(r, x, on, op, prefix, id, float, c));
         }
         Ok(r)
     }
@@ -1080,11 +1193,15 @@ impl<'a> Lower<'a> {
             self.rpo[b] = n;
         }
         for (n, &b) in order.iter().enumerate() {
-            self.block[b] = Some(if n == 0 {
+            let llvm = if n == 0 {
                 self.s.entry
             } else {
                 self.s.m.new_block()
-            });
+            };
+            self.block[b] = Some(llvm);
+            if self.divergent.get(b).copied().unwrap_or(false) {
+                self.llvm_divergent.insert(llvm);
+            }
         }
         // Loop headers count iterations (`LOOP_LIMIT`).
         for &b in &order {
@@ -1151,6 +1268,9 @@ impl<'a> Lower<'a> {
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
+            if self.divergent.get(b).copied().unwrap_or(false) {
+                self.llvm_divergent.insert(self.cur);
+            }
             self.exit(b)?;
         }
         self.fill_phis()?;
@@ -1162,6 +1282,14 @@ impl<'a> Lower<'a> {
             && self.wave64_emu.is_none()
             && self.s.flags & flags::WAVE_OPS != 0
         {
+            self.s.wave_size = Some(64);
+        }
+        // Structural deadlock guard: any barrier that landed in divergent or
+        // guarded control flow while splitting Wave64 aborts the split.
+        if self.divergent_barrier {
+            if self.wave64_emu.is_some() {
+                return Err(Stop::RefuseEmu);
+            }
             self.s.wave_size = Some(64);
         }
         let user_data = self.user_reads.values().copied().collect();
@@ -2322,9 +2450,11 @@ impl<'a> Lower<'a> {
     fn begin_guarded(&mut self, guard: Option<V>) -> Option<(usize, usize)> {
         let g = guard?;
         let (then, join) = (self.s.m.new_block(), self.s.m.new_block());
+        self.llvm_guarded.insert(then);
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
         self.cur = then;
+        self.in_guard += 1;
         Some((head, join))
     }
 
@@ -2333,6 +2463,8 @@ impl<'a> Lower<'a> {
         let Some((head, join)) = at else {
             return values.iter().map(|v| v.0).collect();
         };
+        debug_assert!(self.in_guard > 0);
+        self.in_guard -= 1;
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
@@ -2869,6 +3001,23 @@ impl<'a> Lower<'a> {
     }
 
     fn group_barrier_at(&mut self, at: usize, fence_uavs: bool) {
+        // Splitting a console Wave64 across two host Wave32s: a barrier that
+        // only some threads reach deadlocks the group. Track every such site
+        // so `run` can abort the split before finish.
+        let splitting = self.x.native.wave64 && self.s.wave_size != Some(64);
+        if splitting
+            && (self.llvm_guarded.contains(&at)
+                || self.llvm_divergent.contains(&at)
+                || (at == self.cur && self.in_guard > 0)
+                || (at == self.cur
+                    && self
+                        .divergent
+                        .get(self.cur_ir)
+                        .copied()
+                        .unwrap_or(false)))
+        {
+            self.divergent_barrier = true;
+        }
         let mode = self.s.m.i32(if fence_uavs { 1 | 2 | 8 } else { 1 | 8 });
         self.s.op(
             at,
@@ -3002,10 +3151,12 @@ impl<'a> Lower<'a> {
     }
 
     /// Combine a per-half waveActive*/Prefix result into a 64-lane value.
+    /// `half_src` is the per-lane source with `ident` in inactive lanes.
     #[allow(clippy::too_many_arguments)]
     fn combine_wave64_op(
         &mut self,
         half_val: V,
+        half_src: V,
         active: V,
         op: super::wave::Op,
         prefix: Option<bool>,
@@ -3021,7 +3172,36 @@ impl<'a> Lower<'a> {
         let k33 = self.s.m.i32(33);
         let k5 = self.s.m.i32(5);
         let i32t = self.s.t.i32;
-        // Publish half_val at lane 0 of the half and half_any at lane 1.
+        // For a whole-wave Active, half_val is already the 32-lane total.
+        // For Prefix, half_val is per-lane (lane 0 holds only the identity /
+        // lane0 value): take waveActiveOp over half_src so the published
+        // lane-0 dword is the true 32-lane sum the high half must add.
+        let publish = if prefix.is_some() {
+            let sfx = if float { "f32" } else { "i32" };
+            let arg = if float {
+                self.as_float(half_src)
+            } else {
+                half_src
+            };
+            let (code, unsigned) = match op {
+                Op::AddF => (0u8, 0u8),
+                _ => (0u8, 1u8), // AddU (prefix only supports sums)
+            };
+            let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
+            let ty = if float { self.s.t.f32 } else { i32t };
+            let t = self.s.op(
+                at,
+                &format!("waveActiveOp.{sfx}"),
+                Attr::NoUnwind,
+                ty,
+                119,
+                &[arg, k, u],
+            );
+            if float { self.as_int(t) } else { t }
+        } else {
+            half_val
+        };
+        // Publish the half total at lane 0 and half_any at lane 1.
         let half_any = self.s.op(
             at,
             "waveAnyTrue",
@@ -3033,7 +3213,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         let any_i = self.s.m.cast(at, Cast::ZExt, half_any, i32t);
         let is0 = self.s.m.cmp(at, pred::EQ, ids.host_lane, z);
-        let payload = self.s.m.select(at, is0, half_val, any_i);
+        let payload = self.s.m.select(at, is0, publish, any_i);
         let p = self.scratch_ptr(at, ids.flat);
         self.s.m.store(at, p, payload);
         self.group_barrier_at(at, false);
@@ -3971,12 +4151,18 @@ impl<'a> Lower<'a> {
             let u = if uav { 0x1000 } else { 0 };
             let (props, image) = match &ui.fields {
                 Fields::Image { dim, .. } => {
+                    // Same DXIL kind codes as `image()`: 1D=1, 2D=2, 3D=4,
+                    // Cube=5, 1DArray=6, 2DArray=7. MSAA dims synthesize as
+                    // 2D / 2DArray field layouts (no MSAA createHandle kind).
                     let kind = match dim {
                         0 => 1,
                         1 => 2,
                         2 => 4,
+                        3 => 5,
                         4 => 6,
                         5 => 7,
+                        6 => 2,
+                        7 => 7,
                         _ => return Err("an image dimension (cube or MSAA)"),
                     };
                     ((kind | u, 0x409), Some(kind))
@@ -4046,6 +4232,11 @@ impl<'a> Lower<'a> {
                     _ => return Err("a structured buffer with an unaligned stride"),
                 };
                 (props, None)
+            } else if count >= 8 {
+                // Used-resource metadata does not match an 8-dword image or
+                // 4-dword buffer; still emit image-field reads (waterfall
+                // table loads often lack a precise used-resource row).
+                ((2 | u, 0x409), Some(2u32))
             } else {
                 return Err("a descriptor read only as data");
             };
@@ -4065,6 +4256,17 @@ impl<'a> Lower<'a> {
             };
             let rel_base = ((here.offset % 32) / 4) as i32;
             (src, rel_base, (2u32, 0x409), Some(2u32), false)
+        } else if let Some(here) = a_here
+            && self.x.native.layout.get(here.param).is_some_and(|rp| {
+                matches!(rp.root, RootType::SamplerHeap)
+            })
+            && count >= 4
+        {
+            // Sampler-heap dword reads used as null checks / copies: no host
+            // sampler-size query, so emit opaque non-null tokens (same shape
+            // as a CBV descriptor-as-data read).
+            let rel_base = ((here.offset % 16) / 4) as i32;
+            return self.cbv_descriptor_data(inst, code, count, rel_base);
         } else {
             return Err("a descriptor read only as data");
         };
@@ -4122,7 +4324,16 @@ impl<'a> Lower<'a> {
                 let hi = self.s.m.bin(c, Bin::And, hi, mask);
                 let ht = self.s.m.bin(c, Bin::Shl, height, k14);
                 let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+                // SQ_RSRC_IMG_* type field in dword 3 bits 28..31.
+                let ty = match kind {
+                    1 => 8,  // 1D
+                    2 => 9,  // 2D
+                    4 => 10, // 3D
+                    5 => 11, // Cube
+                    6 => 12, // 1D_ARRAY
+                    7 => 13, // 2D_ARRAY
+                    _ => 9,
+                };
                 let base = k(self, 0xFAC | ty << 28);
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
