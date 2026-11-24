@@ -94,8 +94,14 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
-/// Waiting allowed per title frame, over all threads.
+/// Waiting allowed per title frame, over all threads, for small batches
+/// (menus, one-off passes).
 const BUDGET: Duration = Duration::from_millis(500);
+
+/// Waiting allowed per frame when a large backlog is queued: blocking
+/// recording threads for 500 ms on a pipeline buried deep in the FIFO
+/// freezes every world frame without making that pipeline ready.
+const BACKLOG_BUDGET: Duration = Duration::from_millis(8);
 
 /// Pipelines queued and not made yet.
 static WAITING: AtomicU64 = AtomicU64::new(0);
@@ -140,10 +146,31 @@ pub(crate) fn early(p: &Arc<Pending>) {
 fn wait(p: &Pending, frame: u64) {
     static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
     static WAITED_US: AtomicU64 = AtomicU64::new(0);
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
     if FRAME.swap(frame, Ordering::Relaxed) != frame {
         WAITED_US.store(0, Ordering::Relaxed);
     }
-    let left = BUDGET.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    let budget = if WAITING.load(Ordering::Relaxed) > 16 {
+        BACKLOG_BUDGET
+    } else {
+        BUDGET
+    };
+    let left = budget.saturating_sub(Duration::from_micros(WAITED_US.load(Ordering::Relaxed)));
+    if left.is_zero() {
+        return;
+    }
+    // Only one title thread waits at a time so parallel recording threads do
+    // not all stall simultaneously for the full budget on the same frame.
+    if ACTIVE.swap(true, Ordering::Acquire) {
+        return;
+    }
+    struct ActiveGuard;
+    impl Drop for ActiveGuard {
+        fn drop(&mut self) {
+            ACTIVE.store(false, Ordering::Release);
+        }
+    }
+    let _active = ActiveGuard;
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -170,12 +197,6 @@ fn queue(p: Arc<Pending>) {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
-                    // Below the title's own threads (loading, recording).
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
-                    }
                     loop {
                         let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
                         let Ok(p) = next else { return };

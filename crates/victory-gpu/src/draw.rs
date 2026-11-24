@@ -71,9 +71,9 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Tables made afresh in this list: normalized descriptor records → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u64), u32>,
+    fresh_tables: std::collections::HashMap<Vec<[u32; 3]>, u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -702,24 +702,63 @@ impl State {
                 .map(|u| u.table_offset_dwords / 8 + 1)
                 .max()
                 .unwrap_or(1);
-            // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, h.finish())
-            };
-            if let Some(&first) = self.fresh_tables.get(&key) {
+            // Inspect the table's descriptor records and live views once.
+            // Persistent tables (no unaligned CBVs needing per-list scratch)
+            // are shared across open lists on the host heap.
+            let mut records = Vec::with_capacity(n as usize);
+            let mut views = Vec::with_capacity(n as usize);
+            let mut aligned_cbvs = Vec::with_capacity(n as usize);
+            let mut shareable = true;
+            for k in 0..n {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                let raw = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                let view = crate::descriptor::view(at);
+                // Normalize absent/stale views so released resources never
+                // alias a cached live table.
+                records.push(if view.is_some() { raw } else { [0; 3] });
+                let aligned = match &view {
+                    Some(View::Constant(address, size)) => {
+                        let (address, size) = (*address, *size);
+                        let cbv_bytes = u64::from(size.max(1).next_multiple_of(256));
+                        let found = crate::shadow::find(address, u64::from(size)).and_then(|s| {
+                            let gpu = s.gpu(address);
+                            (gpu.is_multiple_of(256) && cbv_bytes <= s.left(address))
+                                .then_some((s, address, size))
+                        });
+                        if found.is_none() {
+                            shareable = false;
+                        }
+                        found
+                    }
+                    _ => None,
+                };
+                aligned_cbvs.push(aligned);
+                views.push(view);
+            }
+            let refresh_entries = |list: &HostList| {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
-                    let handle = table + u64::from(u.table_offset_dwords) * 4;
-                    if let Some(view) = crate::descriptor::view(handle) {
-                        readable(list, u, &view);
+                    let k = (u.table_offset_dwords / 8) as usize;
+                    if let Some(Some(view)) = views.get(k) {
+                        readable(list, u, view);
                     }
                 }
+                for (shadow, address, size) in aligned_cbvs.iter().flatten() {
+                    if *size > 0 {
+                        shadow.refresh(list, *address, u64::from(*size));
+                    }
+                }
+            };
+            if let Some(&first) = self.fresh_tables.get(&records) {
+                refresh_entries(list);
+                made.push((slot, first * 32));
+                continue;
+            }
+            if shareable && let Some(first) = host.acquire_shared(&records) {
+                self.fresh_tables.insert(records, first);
+                self.dynamic
+                    .push((std::ptr::from_ref(heap) as usize, first, n));
+                refresh_entries(list);
                 made.push((slot, first * 32));
                 continue;
             }
@@ -732,37 +771,50 @@ impl State {
                 self.table_failed = true;
                 continue;
             };
-            self.fresh_tables.insert(key, first);
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
-                            host.make_null(index);
-                            continue;
-                        };
-                        list.defer_fill(to, address as *const u8, size as usize);
-                        host.constant_at(index, gpu, size);
-                    }
-                    Some(view) => {
-                        host.make_at(index, &view);
-                        if let Some(u) = used {
-                            readable(list, u, &view);
+                let k_usize = k as usize;
+                if let Some((shadow, address, size)) = &aligned_cbvs[k_usize] {
+                    host.constant_at(
+                        index,
+                        shadow.gpu(*address),
+                        *size,
+                        Some(shadow.buffer.clone()),
+                    );
+                } else {
+                    match &views[k_usize] {
+                        Some(View::Constant(address, size)) => {
+                            let (address, size) = (*address, *size);
+                            let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                                host.make_null(index);
+                                continue;
+                            };
+                            list.defer_fill(to, address as *const u8, size as usize);
+                            host.constant_at(index, gpu, size, None);
                         }
-                    }
-                    None => {
-                        host.make_null(index);
-                        if used.is_some() {
-                            once!(slot, "a table entry without a view");
+                        Some(view) => {
+                            host.make_at(index, view);
+                        }
+                        None => {
+                            host.make_null(index);
+                            if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                                once!(slot, "a table entry without a view");
+                            }
                         }
                     }
                 }
             }
+            let first = if shareable {
+                host.publish_shared(records.clone(), first, n)
+            } else {
+                first
+            };
+            self.fresh_tables.insert(records, first);
+            self.dynamic
+                .push((std::ptr::from_ref(heap) as usize, first, n));
+            refresh_entries(list);
             made.push((slot, first * 32));
         }
         made

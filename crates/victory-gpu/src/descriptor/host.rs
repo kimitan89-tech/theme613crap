@@ -5,6 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -12,6 +13,147 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+
+/// Bitset allocator for dynamic descriptor slots: O(1) fast-fail when full
+/// and word-level scanning instead of a linear byte scan.
+struct DynamicPool {
+    total: u32,
+    free: u32,
+    next: u32,
+    /// Any request `>= min_failed` is known not to fit until slots are freed.
+    min_failed: u32,
+    /// Bit `i` == 1 means slot `i` is taken; padding bits past `total` are 1.
+    bits: Vec<u64>,
+}
+
+impl DynamicPool {
+    fn new(total: u32) -> Self {
+        let words = (total as usize).div_ceil(64);
+        let mut bits = vec![0u64; words];
+        let rem = total as usize % 64;
+        if rem != 0 && let Some(last) = bits.last_mut() {
+            *last = !0u64 << rem;
+        }
+        DynamicPool {
+            total,
+            free: total,
+            next: 0,
+            min_failed: u32::MAX,
+            bits,
+        }
+    }
+
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        if n == 0 || n > self.free || n >= self.min_failed {
+            return None;
+        }
+        let n_usize = n as usize;
+        let total = self.total as usize;
+        let next = self.next as usize;
+        let found = find_free_run(&self.bits, next, total, n_usize).or_else(|| {
+            if next == 0 {
+                None
+            } else {
+                find_free_run(&self.bits, 0, (next + n_usize - 1).min(total), n_usize)
+            }
+        });
+        let Some(first) = found else {
+            self.min_failed = self.min_failed.min(n);
+            return None;
+        };
+        set_bits(&mut self.bits, first, first + n_usize, true);
+        self.free -= n;
+        self.next = ((first + n_usize) % total) as u32;
+        Some(first as u32)
+    }
+
+    fn release(&mut self, at: u32, n: u32) {
+        let start = at.min(self.total) as usize;
+        let end = at.saturating_add(n).min(self.total) as usize;
+        if start >= end {
+            return;
+        }
+        let cleared = set_bits(&mut self.bits, start, end, false);
+        self.free += cleared;
+        if cleared > 0 {
+            self.min_failed = u32::MAX;
+        }
+    }
+}
+
+/// Finds the first run of `n` zero bits inside `[start, end)` without wrapping.
+fn find_free_run(bits: &[u64], start: usize, end: usize, n: usize) -> Option<usize> {
+    let mut i = start;
+    let mut run = 0usize;
+    while i < end {
+        let w = i / 64;
+        let b = i % 64;
+        let word = bits[w];
+        if b == 0 && word == u64::MAX {
+            run = 0;
+            i += 64;
+            continue;
+        }
+        if b == 0 && word == 0 {
+            let avail = (end - i).min(64);
+            if run + avail >= n {
+                return Some(i - run);
+            }
+            run += avail;
+            i += avail;
+            continue;
+        }
+        let shifted = word >> b;
+        let rem = (end - i).min(64 - b);
+        if shifted & 1 != 0 {
+            let ones = (shifted.trailing_ones() as usize).min(rem);
+            run = 0;
+            i += ones;
+        } else {
+            let zeros = (shifted.trailing_zeros() as usize).min(rem);
+            if run + zeros >= n {
+                return Some(i - run);
+            }
+            run += zeros;
+            i += zeros;
+        }
+    }
+    None
+}
+
+/// Sets or clears `[start, end)` in `bits`; returns the number of bits flipped.
+fn set_bits(bits: &mut [u64], start: usize, end: usize, value: bool) -> u32 {
+    let mut i = start;
+    let mut changed = 0u32;
+    while i < end {
+        let w = i / 64;
+        let b = i % 64;
+        let count = (end - i).min(64 - b);
+        let mask = if count == 64 {
+            u64::MAX
+        } else {
+            ((1u64 << count) - 1) << b
+        };
+        let prev = bits[w];
+        if value {
+            changed += (mask & !prev).count_ones();
+            bits[w] = prev | mask;
+        } else {
+            changed += (mask & prev).count_ones();
+            bits[w] = prev & !mask;
+        }
+        i += count;
+    }
+    changed
+}
+
+/// Persistent fresh tables shared across open command lists by exact
+/// descriptor records, reference-counted until every list holding them resets.
+#[derive(Default)]
+struct SharedTables {
+    by_key: HashMap<Vec<[u32; 3]>, (u32, u32, u32)>,
+    by_slot: HashMap<u32, Vec<[u32; 3]>>,
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -30,9 +172,10 @@ pub(crate) struct HostHeap {
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
-    /// Where the search for free dynamic slots starts, and which are taken
-    /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    /// Dynamic slot allocator (taken by lists not yet reset).
+    pool: Mutex<DynamicPool>,
+    /// Ref-counted dynamic tables shared across lists (non-scratch tables).
+    shared: Mutex<SharedTables>,
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -145,7 +288,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            pool: Mutex::new(DynamicPool::new(extra)),
+            shared: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -227,34 +371,47 @@ impl HostHeap {
         if self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
-        let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = self.pool.lock().unwrap_or_else(|e| e.into_inner()).alloc(n);
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             return None;
         };
-        taken[first..first + n].fill(true);
-        *next = ((first + n) % self.dynamic as usize) as u32;
-        Some(self.count + first as u32)
+        Some(self.count + first)
+    }
+
+    /// Reuses an already-populated shared dynamic table matching `key`,
+    /// bumping its reference count so it stays alive until this caller also
+    /// releases it.
+    pub(crate) fn acquire_shared(&self, key: &[[u32; 3]]) -> Option<u32> {
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        let (first, _, refs) = shared.by_key.get_mut(key)?;
+        *refs += 1;
+        Some(*first)
+    }
+
+    /// Registers a freshly populated dynamic table `[first, first + n)` under
+    /// `key` for cross-list sharing. If another thread published the same key
+    /// first, returns the existing table (ref-counted) and releases `[first,
+    /// first + n)`.
+    pub(crate) fn publish_shared(&self, key: Vec<[u32; 3]>, first: u32, n: u32) -> u32 {
+        let existing = {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((slot, _, refs)) = shared.by_key.get_mut(&key) {
+                *refs += 1;
+                Some(*slot)
+            } else {
+                shared.by_slot.insert(first, key.clone());
+                shared.by_key.insert(key, (first, n, 1));
+                None
+            }
+        };
+        if let Some(existing) = existing {
+            self.release_raw(first, n);
+            existing
+        } else {
+            first
+        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -263,19 +420,54 @@ impl HostHeap {
         self.count
     }
 
-    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
-    /// returned).
+    /// Gives back `n` dynamic slots from `first` (an index [`dynamic`] or
+    /// [`acquire_shared`] returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
+        let should_free = {
+            let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(key) = shared.by_slot.get(&first).cloned() {
+                let mut drop_entry = false;
+                if let Some((_, _, refs)) = shared.by_key.get_mut(&key) {
+                    *refs = refs.saturating_sub(1);
+                    drop_entry = *refs == 0;
+                }
+                if drop_entry {
+                    shared.by_key.remove(&key);
+                    shared.by_slot.remove(&first);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                true
+            }
+        };
+        if should_free {
+            self.release_raw(first, n);
+        }
+    }
+
+    fn release_raw(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
         };
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
+        // Drop kept resource references before handing slots back so another
+        // allocator cannot race with clearing them.
+        {
+            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let end = first.saturating_add(n).min(self.count + self.dynamic) as usize;
+            if let Some(slots) = kept.get_mut(first as usize..end) {
+                for slot in slots {
+                    *slot = None;
+                }
+            }
         }
+        self.pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release(at, n);
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
@@ -307,15 +499,22 @@ impl HostHeap {
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
-    /// memory (the list's own, which it holds).
-    pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
-        self.keep(index, None);
+    /// memory (either the list's own scratch upload memory, or a persistent
+    /// buffer copy kept alive in `kept`).
+    pub(crate) fn constant_at(
+        &self,
+        index: u32,
+        gpu: u64,
+        size: u32,
+        kept: Option<ID3D12Resource>,
+    ) {
+        self.keep(index, kept);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
             SizeInBytes: size.next_multiple_of(256),
         };
-        // SAFETY: a slot of our heap; the memory is the caller's.
+        // SAFETY: a slot of our heap; the memory is kept alive by the caller or `kept`.
         unsafe {
             host.device
                 .CreateConstantBufferView(Some(&desc), self.cpu(index))
@@ -972,5 +1171,51 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
+    }
+
+    #[test]
+    fn dynamic_pool_word_boundaries_fast_fail_and_double_release() {
+        let mut pool = DynamicPool::new(130);
+        assert_eq!(pool.alloc(60), Some(0));
+        assert_eq!(pool.alloc(10), Some(60)); // crosses 64-bit word boundary
+        assert_eq!(pool.alloc(60), Some(70)); // reaches exact end 130
+        assert_eq!(pool.free, 0);
+        assert_eq!(pool.alloc(1), None);
+        // Release two disjoint holes (5 + 5 = 10 free, largest contiguous run = 5)
+        // plus test double-release safety.
+        pool.release(60, 5);
+        pool.release(60, 5);
+        pool.release(70, 5);
+        assert_eq!(pool.free, 10);
+        // 6 <= free, so scan discovers no contiguous run of 6 and caches min_failed = 6.
+        assert_eq!(pool.alloc(6), None);
+        assert_eq!(pool.min_failed, 6);
+        assert_eq!(pool.alloc(5), Some(60));
+        assert_eq!(pool.alloc(5), Some(70));
+        assert_eq!(pool.free, 0);
+    }
+
+    #[test]
+    fn shared_tables_are_refcounted_until_last_release() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let key = vec![[VIEW_TAG, 1, 1], [VIEW_TAG, 2, 1]];
+        assert_eq!(heap.acquire_shared(&key), None);
+        let first = heap.dynamic(2).unwrap();
+        assert_eq!(heap.publish_shared(key.clone(), first, 2), first);
+        // Second list shares the exact same slot block without consuming new slots.
+        assert_eq!(heap.acquire_shared(&key), Some(first));
+        // Competing publish returns existing slot and frees the duplicate allocation.
+        let dup = heap.dynamic(2).unwrap();
+        assert_ne!(dup, first);
+        assert_eq!(heap.publish_shared(key.clone(), dup, 2), first);
+        // Three refs held; two releases keep it alive, third releases it.
+        heap.release(first, 2);
+        heap.release(first, 2);
+        assert_eq!(heap.acquire_shared(&key), Some(first));
+        heap.release(first, 2);
+        heap.release(first, 2);
+        assert_eq!(heap.acquire_shared(&key), None);
     }
 }

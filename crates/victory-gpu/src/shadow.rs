@@ -40,9 +40,11 @@ pub(crate) struct Shadow {
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
-    /// The copy's bytes before the submission ran, from an offset on,
-    /// covering the ranges its shaders write: what the GPU wrote differs.
-    before: Mutex<Option<(usize, Vec<u8>)>>,
+    /// The copy's bytes before the submission ran, as sorted non-overlapping
+    /// intervals covering only the ranges shaders write: what the GPU wrote
+    /// differs. Keeping disjoint intervals avoids snapshotting huge untouched
+    /// gaps across the title's 174 MB GPU heap.
+    before: Mutex<Vec<(usize, Vec<u8>)>>,
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -142,42 +144,41 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
-    /// At submission, after the range's refresh: a submitted list's shaders
-    /// write this range. Its bytes are kept to tell later what the GPU wrote:
-    /// one snapshot per copy and submission, grown to cover every range the
-    /// submission declares (the world declares overlapping views of its
-    /// 174 MB heap dozens of times), in reused memory (fresh snapshots cost
-    /// ~2.3 million page faults per world frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    /// Whether `[address, address + len)` is already covered by a pending
+    /// shader-write range in this submission.
+    pub(crate) fn covers_pending(&self, address: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = address.saturating_add(len);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
-        let (from, to) = self.inside(address, len);
-        // SAFETY: inside the mapping.
-        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
+            .iter()
+            .any(|&(a, e)| a <= address && end <= e)
+    }
+
+    /// At submission, after the range's refresh: a submitted list's shaders
+    /// write this range. Its bytes are kept in sorted non-overlapping
+    /// intervals to tell later what the GPU wrote, without bridging disjoint
+    /// ranges across the title's 174 MB heap, in reused memory (fresh
+    /// snapshots cost ~2.3 million page faults per world frame).
+    pub(crate) fn writing(&self, address: usize, len: usize) {
+        let range = (address, address.saturating_add(len));
         {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            if !pending.contains(&range) {
+                pending.push(range);
+            }
+        }
+        let (from, to) = self.inside(address, len);
+        if from >= to {
             return;
         }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
-            }
-            None => grown.extend_from_slice(host(start, end)),
-        }
-        *before = Some((start, grown));
+        // SAFETY: inside the mapping.
+        let host = |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
+        let mut intervals = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        merge_snapshot(&mut intervals, from, to, host);
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -188,11 +189,12 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut intervals = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
+        let pos = intervals.partition_point(|(at, bytes)| at + bytes.len() <= from);
+        if let Some((taken, before)) = intervals.get(pos)
             && *taken <= from
             && to <= taken + before.len()
             && from < to
@@ -248,13 +250,13 @@ impl Shadow {
             }
         }
         // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
+        // submission runs at a time), and the snapshots with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
+        pending.retain(|&r| r != (address, address.saturating_add(len)));
+        if pending.is_empty() {
+            for (_, bytes) in intervals.drain(..) {
+                give_back(bytes);
+            }
         }
         written
     }
@@ -287,6 +289,9 @@ impl Shadow {
                     bytes += self.update_free(at, a);
                 }
                 at = at.max(e);
+                if at >= to {
+                    return bytes;
+                }
             }
             if at < to {
                 bytes += self.update_free(at, to);
@@ -363,6 +368,61 @@ impl Shadow {
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
         to - from
     }
+}
+
+/// Merges `[from, to)` into sorted non-overlapping snapshot `intervals`,
+/// reading only newly covered regions via `host` and preserving bytes already
+/// captured in existing intervals.
+fn merge_snapshot<'a>(
+    intervals: &mut Vec<(usize, Vec<u8>)>,
+    from: usize,
+    to: usize,
+    host: impl Fn(usize, usize) -> &'a [u8],
+) {
+    if from >= to {
+        return;
+    }
+    let start = intervals.partition_point(|(at, bytes)| at + bytes.len() < from);
+    if let Some((at, bytes)) = intervals.get(start)
+        && *at <= from
+        && to <= at + bytes.len()
+    {
+        return;
+    }
+    let mut end = start;
+    while end < intervals.len() && intervals[end].0 <= to {
+        end += 1;
+    }
+    if start == end {
+        let mut snap = pooled(to - from);
+        snap.extend_from_slice(host(from, to));
+        intervals.insert(start, (from, snap));
+        return;
+    }
+    if end == start + 1 && intervals[start].0 <= from {
+        let (at, bytes) = &mut intervals[start];
+        let cur_end = *at + bytes.len();
+        if to > cur_end {
+            bytes.extend_from_slice(host(cur_end, to));
+        }
+        return;
+    }
+    let merged_start = from.min(intervals[start].0);
+    let merged_end = to.max(intervals[end - 1].0 + intervals[end - 1].1.len());
+    let mut grown = pooled(merged_end - merged_start);
+    let mut cursor = merged_start;
+    for (at, bytes) in intervals.drain(start..end) {
+        if at > cursor {
+            grown.extend_from_slice(host(cursor, at));
+        }
+        grown.extend_from_slice(&bytes);
+        cursor = at + bytes.len();
+        give_back(bytes);
+    }
+    if merged_end > cursor {
+        grown.extend_from_slice(host(cursor, merged_end));
+    }
+    intervals.insert(start, (merged_start, grown));
 }
 
 struct Entry {
@@ -496,4 +556,44 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshots_keep_disjoint_ranges_separate_and_preserve_prior_bytes() {
+        let mut backing: Vec<u8> = (0..128u8).collect();
+        let mut intervals: Vec<(usize, Vec<u8>)> = Vec::new();
+        merge_snapshot(&mut intervals, 10, 20, |a, b| &backing[a..b]);
+        merge_snapshot(&mut intervals, 100, 110, |a, b| &backing[a..b]);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].0, 10);
+        assert_eq!(intervals[1].0, 100);
+
+        // Mutate backing memory inside already-snapshotted [10, 20); extending
+        // right and then bridging must keep the original snapshot bytes.
+        backing[15] = 250;
+        merge_snapshot(&mut intervals, 15, 25, |a, b| &backing[a..b]);
+        assert_eq!(intervals.len(), 2);
+        assert_eq!(intervals[0].0, 10);
+        assert_eq!(intervals[0].1.len(), 15);
+        assert_eq!(intervals[0].1[5], 15);
+        assert_eq!(intervals[0].1[10], 20);
+
+        // Sub-range is a no-op.
+        merge_snapshot(&mut intervals, 12, 18, |a, b| &backing[a..b]);
+        assert_eq!(intervals.len(), 2);
+
+        // Bridge [10, 25) and [100, 110) with [5, 115).
+        backing[105] = 251;
+        merge_snapshot(&mut intervals, 5, 115, |a, b| &backing[a..b]);
+        assert_eq!(intervals.len(), 1);
+        assert_eq!(intervals[0].0, 5);
+        assert_eq!(intervals[0].1.len(), 110);
+        assert_eq!(intervals[0].1[10], 15); // original offset 15
+        assert_eq!(intervals[0].1[100], 105); // original offset 105
+        assert_eq!(intervals[0].1[50], 55); // newly covered middle
+    }
 }

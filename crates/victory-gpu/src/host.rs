@@ -1211,9 +1211,14 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len) => {
-                    // The shaders start from the title's data.
-                    batch.flush();
-                    shadow.writing(*address, *len);
+                    // The shaders start from the title's data. Skip flushing
+                    // if this range is already locked and snapshotted for this
+                    // submission; otherwise flush only the overlapping part of
+                    // this shadow so other buffers and ranges stay batched.
+                    if !shadow.covers_pending(*address, *len) {
+                        batch.flush_overlap(shadow, *address, *len);
+                        shadow.writing(*address, *len);
+                    }
                     continue;
                 }
                 Step::Texture(staging) => {
@@ -1229,31 +1234,92 @@ impl HostList {
     }
 }
 
-/// A submission's refreshes not done yet, merged per buffer copy into the
-/// range that covers them: done before a step that writes title memory or
-/// gives a range to shaders, and before the lists run.
+/// A submission's refreshes not done yet, coalesced per buffer copy into
+/// sorted non-overlapping intervals (merging ranges overlapping or within one
+/// watched 64 KiB page, without bridging huge untouched gaps across the
+/// title's 174 MB heap): done before a step that writes title memory or gives
+/// an overlapping range to shaders, and before the lists run.
 ///
 /// Also the textures brought up to date in the submission so far: most
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+type ShadowRefreshes = (std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>);
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<ShadowRefreshes>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
 }
 
+/// Inserts `[address, end)` into sorted non-overlapping `ranges`, coalescing
+/// ranges that overlap or sit within one watched page (64 KiB).
+fn merge_range(ranges: &mut Vec<(usize, usize)>, address: usize, end: usize) {
+    if address >= end {
+        return;
+    }
+    const GAP: usize = crate::watch::PAGE;
+    let mut pos = ranges.partition_point(|&(_, e)| e.saturating_add(GAP) < address);
+    let mut from = address;
+    let mut to = end;
+    let start = pos;
+    while pos < ranges.len() && ranges[pos].0 <= to.saturating_add(GAP) {
+        from = from.min(ranges[pos].0);
+        to = to.max(ranges[pos].1);
+        pos += 1;
+    }
+    if pos == start {
+        ranges.insert(start, (from, to));
+    } else {
+        ranges[start] = (from, to);
+        ranges.drain(start + 1..pos);
+    }
+}
+
+/// Removes the portions of `ranges` overlapping `[g_start, g_end)` and
+/// returns those clipped overlapping intervals, leaving non-overlapping parts
+/// in `ranges`.
+fn take_overlap(
+    ranges: &mut Vec<(usize, usize)>,
+    g_start: usize,
+    g_end: usize,
+) -> Vec<(usize, usize)> {
+    if g_start >= g_end {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut next = Vec::with_capacity(ranges.len());
+    for &(from, to) in ranges.iter() {
+        if to <= g_start || from >= g_end {
+            next.push((from, to));
+        } else {
+            if from < g_start {
+                next.push((from, g_start));
+            }
+            out.push((from.max(g_start), to.min(g_end)));
+            if to > g_end {
+                next.push((g_end, to));
+            }
+        }
+    }
+    *ranges = next;
+    out
+}
+
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        let end = address.saturating_add(len);
+        if address >= end {
+            return;
+        }
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, ranges)) => merge_range(ranges, address, end),
+            None => self.refreshes.push((shadow.clone(), vec![(address, end)])),
         }
     }
 
@@ -1270,15 +1336,42 @@ impl Batch {
         self.textures.clear();
     }
 
+    /// Flushes only pending refreshes of `shadow` that overlap
+    /// `[address, address + len)`.
+    fn flush_overlap(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let end = address.saturating_add(len);
+        let Some((_, ranges)) = self
+            .refreshes
+            .iter_mut()
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
+        else {
+            return;
+        };
+        for (from, to) in take_overlap(ranges, address, end) {
+            Self::flush_range(shadow, from, to);
+        }
+    }
+
+    fn flush_range(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
+        let started = std::time::Instant::now();
+        let copied = shadow.update(from, to - from);
+        let us = started.elapsed().as_micros() as u64;
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, us, 0);
+        PREPARING[0].fetch_add(us, Ordering::Relaxed);
+        PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+    }
+
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            let started = std::time::Instant::now();
-            let copied = shadow.update(from, to - from);
-            let us = started.elapsed().as_micros() as u64;
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::range(from, to - from, us, 0);
-            PREPARING[0].fetch_add(us, Ordering::Relaxed);
-            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+        for (shadow, ranges) in self.refreshes.drain(..) {
+            for (from, to) in ranges {
+                Self::flush_range(&shadow, from, to);
+            }
         }
     }
 }
@@ -1982,8 +2075,28 @@ fn pump() {
 
 #[cfg(test)]
 mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at the top of this file
-    use super::Batch;
+    use super::{Batch, merge_range, take_overlap};
     use std::sync::Arc;
+
+    #[test]
+    fn refresh_ranges_coalesce_nearby_without_bridging_huge_gaps() {
+        let mut ranges = Vec::new();
+        merge_range(&mut ranges, 0, 4096);
+        merge_range(&mut ranges, 100 << 20, (100 << 20) + 4096);
+        assert_eq!(ranges, [(0, 4096), (100 << 20, (100 << 20) + 4096)]);
+
+        // Within one 64 KiB page coalesces.
+        merge_range(&mut ranges, 8192, 16384);
+        assert_eq!(ranges, [(0, 16384), (100 << 20, (100 << 20) + 4096)]);
+
+        // Taking an overlapping middle slice splits cleanly.
+        let taken = take_overlap(&mut ranges, 4096, 8192);
+        assert_eq!(taken, [(4096, 8192)]);
+        assert_eq!(
+            ranges,
+            [(0, 4096), (8192, 16384), (100 << 20, (100 << 20) + 4096)]
+        );
+    }
 
     #[test]
     fn a_texture_is_checked_once_per_submission() {

@@ -87,8 +87,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let mut last_page = usize::MAX;
+    for &at in &j.found[..count] {
+        let page = at / PAGE;
+        if page != last_page {
+            j.written.insert(page, now);
+            last_page = page;
+        }
+    }
+    for page in guarded {
         j.written.insert(page, now);
     }
     Some((
