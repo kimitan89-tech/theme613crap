@@ -1,8 +1,10 @@
 //! The host GPU: one D3D12 device and direct queue (decision 0007), and a
 //! window to present on.
 //!
-//! shortcut: every submission is waited for, so CPU and GPU never overlap;
-//! overlap them with per-submission fences once more than clears run.
+//! shortcut: every submission is waited for, so CPU and GPU never overlap.
+//! Under PresentX scene overlay, TDR chunks are deep-queued (one fence wait
+//! before copy-back) so the GPU stays fed; mid-chunk waits return if a
+//! deep-queue submit approaches the TDR limit.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -690,21 +692,43 @@ impl Host {
         } else {
             vec![&lists[..]]
         };
+        // Overlay already dropped hanging compute-only lists: queue every
+        // chunk then wait once so the GPU stays busy. Mid-chunk waits return
+        // if a prior deep-queue submit approached the TDR limit.
+        let deep_queue = overlay && !OVERLAY_FORCE_MID_WAIT.load(Ordering::Relaxed);
+        if deep_queue {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    chunks = groups.len(),
+                    lists = runs.len(),
+                    "deep-queueing PresentX overlay submits (one fence wait)"
+                );
+            }
+        }
+        let last = groups.len().saturating_sub(1);
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
+            let fence_val = *submitted;
             let started = std::time::Instant::now();
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
-                let waited = self
-                    .queue
-                    .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
-                match waited {
+                match self.queue.Signal(&self.fence, fence_val) {
                     Ok(()) => {
-                        WaitForSingleObject(self.event, INFINITE);
+                        let wait_now = !deep_queue || i == last;
+                        if wait_now {
+                            match self.fence.SetEventOnCompletion(fence_val, self.event) {
+                                Ok(()) => {
+                                    WaitForSingleObject(self.event, INFINITE);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "host submission not waited for")
+                                }
+                            }
+                        }
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => tracing::warn!(error = %e, "host submission not signalled"),
                 }
             }
             #[cfg(feature = "diagnostics")]
@@ -731,8 +755,21 @@ impl Host {
                 .collect();
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
+        // Approaching Windows's ~2 s TDR: fall back to mid-chunk waits.
+        if deep_queue
+            && gpu > std::time::Duration::from_millis(1500)
+            && !OVERLAY_FORCE_MID_WAIT.swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                ms = gpu.as_millis(),
+                "overlay deep-queue slow; forcing mid-wait submits"
+            );
+        }
         // SAFETY: a plain query.
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            if deep_queue {
+                OVERLAY_FORCE_MID_WAIT.store(true, Ordering::Relaxed);
+            }
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
@@ -1405,11 +1442,8 @@ impl HostList {
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        add(C::Refreshes, 1);
-                        add(C::RefreshBytes, *len as u64);
-                    }
+                    // Coalesce into Batch before any watch/update; fully
+                    // covered ranges are counted as skipped there.
                     batch.add(shadow, *address, *len);
                     continue;
                 }
@@ -1556,8 +1590,32 @@ impl Batch {
             .iter_mut()
             .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, ranges)) => merge_range(ranges, address, end),
-            None => self.refreshes.push((shadow.clone(), vec![(address, end)])),
+            Some((_, ranges)) => {
+                // Already covered by a coalesced interval: do not re-check /
+                // re-copy at flush (that was the "0 skipped" thrash).
+                if ranges.iter().any(|&(from, to)| from <= address && to >= end) {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        crate::copystat::add(crate::copystat::C::Skipped, 1);
+                        crate::copystat::add(crate::copystat::C::SkippedBytes, (end - address) as u64);
+                    }
+                    return;
+                }
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::Refreshes, 1);
+                    crate::copystat::add(crate::copystat::C::RefreshBytes, (end - address) as u64);
+                }
+                merge_range(ranges, address, end);
+            }
+            None => {
+                #[cfg(feature = "diagnostics")]
+                {
+                    crate::copystat::add(crate::copystat::C::Refreshes, 1);
+                    crate::copystat::add(crate::copystat::C::RefreshBytes, (end - address) as u64);
+                }
+                self.refreshes.push((shadow.clone(), vec![(address, end)]));
+            }
         }
     }
 
@@ -1844,13 +1902,35 @@ struct SceneColor {
 }
 
 static SCENES: Mutex<Vec<SceneColor>> = Mutex::new(Vec::new());
-static PREV_PRESENT_BLACK: AtomicBool = AtomicBool::new(false);
 
-/// True while PresentX is black and we stretch-blit a scene RT — cutscene
-/// survival path. Heavy compute that was TDRing the GPU is skipped then.
-pub(crate) fn scene_overlay_active() -> bool {
-    PREV_PRESENT_BLACK.load(Ordering::Relaxed)
+/// Opt-in PresentX scene stretch-blit (`VICTORY_SCENE_OVERLAY=1`). Off by
+/// default so release and diag both keep compute and normal PresentX.
+fn scene_overlay_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_SCENE_OVERLAY") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    })
 }
+
+/// True while the opt-in scene overlay is live: env enabled and at least one
+/// tracked MRT0 color RT has real geometry draws. Compute skips and deep-queue
+/// follow this in both release and diagnostics builds.
+pub(crate) fn scene_overlay_active() -> bool {
+    if !scene_overlay_enabled() {
+        return false;
+    }
+    const MIN_DRAWS: u64 = 32;
+    SCENES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|s| s.draws >= MIN_DRAWS)
+}
+
+/// After an overlay deep-queue submit approaches TDR / device-removed, force
+/// per-chunk waits for the rest of the process.
+static OVERLAY_FORCE_MID_WAIT: AtomicBool = AtomicBool::new(false);
 
 /// Remembers a color RTV the title just bound, for present fallback.
 pub(crate) fn note_scene_color(resource: crate::object::This, format: u32, width: u32, height: u32) {
@@ -1915,15 +1995,14 @@ pub(crate) fn mark_scene_drawn(targets: &[usize]) {
 }
 
 fn scene_overlay(plane0: usize) -> Option<SceneColor> {
-    // Only after a real black PresentX probe (cutscene/world). Menus keep
-    // plane 0 lit so this stays off. Stretch-blits via compositor — never
+    // Opt-in only (`VICTORY_SCENE_OVERLAY=1`). Menus/boot stay on PresentX
+    // until MRT0 has real draws. Stretch-blit via compositor — never
     // CopyResource a differently sized texture.
-    if !PREV_PRESENT_BLACK.load(Ordering::Relaxed) {
+    if !scene_overlay_enabled() {
         return None;
     }
     let scenes = SCENES.lock().unwrap_or_else(|e| e.into_inner());
-    // Ignore near-empty RTs (boot/fade 1080p with a couple of draws) — those
-    // were what showed as sparse dots instead of the mesh color.
+    // Ignore near-empty RTs (boot/fade with a couple of draws).
     const MIN_DRAWS: u64 = 32;
     let cands: Vec<_> = scenes
         .iter()
@@ -1932,8 +2011,7 @@ fn scene_overlay(plane0: usize) -> Option<SceneColor> {
     if cands.is_empty() {
         return None;
     }
-    // Series S cutscene color is 1280×720 — once any exists, never fall back
-    // to a 1080 present sibling.
+    // Prefer 1280×720 scene color once any exists over a 1080 sibling.
     let cutscene: Vec<_> = cands
         .iter()
         .copied()
@@ -2312,10 +2390,12 @@ impl Host {
         // near-opaque UI and leaving only sparse dots.
         let mut overlays: Vec<(&ID3D12Resource, u32, DXGI_FORMAT)> = Vec::new();
         if let Some(s) = &scene {
+            // Never pass TYPELESS (e.g. format 27) to CreateShaderResourceView.
+            let srv_fmt = swap_format(s.format).unwrap_or(DXGI_FORMAT_R8G8B8A8_UNORM);
             overlays.push((
                 &s.host.texture,
                 s.host.state.load(Ordering::Relaxed),
-                s.format,
+                srv_fmt,
             ));
         } else {
             overlays.extend(planes.iter().skip(1).filter_map(|&(ov, ov_state)| {
@@ -2468,12 +2548,7 @@ impl Host {
                     let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
                     p.meter.frame(p.hwnd);
                     let black = probe.is_some_and(|b| crate::capture::black(&b));
-                    // Learn blackness only from a plain PresentX copy. While
-                    // we overlay a scene, keep the flag set so every frame
-                    // keeps showing the model over the black plane.
-                    if scene.is_none() {
-                        PREV_PRESENT_BLACK.store(black, Ordering::Relaxed);
-                    }
+                    let _ = &scene;
                     return Some(black);
                 }
                 #[cfg(not(feature = "diagnostics"))]
@@ -2518,11 +2593,8 @@ impl Host {
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             {
-                let black = probe.is_some_and(|b| crate::capture::black(&b));
-                if scene.is_none() {
-                    PREV_PRESENT_BLACK.store(black, Ordering::Relaxed);
-                }
-                Some(black)
+                let _ = &scene;
+                Some(probe.is_some_and(|b| crate::capture::black(&b)))
             }
             #[cfg(not(feature = "diagnostics"))]
             {

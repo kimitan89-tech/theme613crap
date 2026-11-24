@@ -16,6 +16,7 @@
 //! (every mip and array slice), depth and stencil planes are not.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -34,8 +35,7 @@ macro_rules! once {
 /// texture's subresources, and what was last detiled.
 pub(crate) struct Staging {
     buffer: ID3D12Resource,
-    /// Its bytes.
-    #[cfg(feature = "diagnostics")]
+    /// Staging upload heap bytes (for the RAM budget).
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
@@ -45,6 +45,8 @@ pub(crate) struct Staging {
     mips: u32,
     memory: *const u8,
     last: Mutex<Last>,
+    /// Title frame that last sampled this staging.
+    touched: AtomicU64,
 }
 
 /// What a texture's staging buffer holds: the hash of the memory detiled
@@ -64,6 +66,11 @@ unsafe impl Send for Staging {}
 unsafe impl Sync for Staging {}
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+/// Cap on live texture staging upload heaps. Idle entries (not held by an
+/// in-flight list, untouched for ≥8 frames) past this are dropped LRU.
+const STAGING_MAX_BYTES: u64 = 384 << 20;
+const STAGING_MIN_AGE: u64 = 8;
 
 /// Textures the host GPU wrote by a copy or resolve: their contents are on
 /// the host, not in title memory, which stays as it was.
@@ -272,9 +279,11 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
+    let frame = crate::frame::current();
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize)) {
+        s.touched.store(frame, Ordering::Relaxed);
         return Some(s.clone());
     }
     let (memory, desc) = crate::resource::texture_memory(resource)?;
@@ -324,7 +333,6 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
     let s = Arc::new(Staging {
         buffer,
-        #[cfg(feature = "diagnostics")]
         size: total,
         data,
         footprints,
@@ -333,7 +341,44 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         mips: u32::from(d.MipLevels),
         memory,
         last: Mutex::default(),
+        touched: AtomicU64::new(frame),
     });
     map.insert(resource as usize, s.clone());
+    trim_staging(map);
     Some(s)
+}
+
+/// Drops least-recently-sampled staging heaps that no list still holds.
+fn trim_staging(map: &mut HashMap<usize, Arc<Staging>>) {
+    let mut total: u64 = map.values().map(|s| s.size).sum();
+    if total <= STAGING_MAX_BYTES {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut victims: Vec<(usize, u64, u64)> = map
+        .iter()
+        .filter(|(_, s)| {
+            Arc::strong_count(s) == 1
+                && frame.saturating_sub(s.touched.load(Ordering::Relaxed)) >= STAGING_MIN_AGE
+        })
+        .map(|(&k, s)| (k, s.touched.load(Ordering::Relaxed), s.size))
+        .collect();
+    victims.sort_by_key(|&(_, touched, _)| touched);
+    let before = map.len();
+    for (key, _, size) in victims {
+        if total <= STAGING_MAX_BYTES {
+            break;
+        }
+        map.remove(&key);
+        total = total.saturating_sub(size);
+    }
+    let dropped = before.saturating_sub(map.len());
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            left = map.len(),
+            bytes = total,
+            "trimmed idle texture staging heaps"
+        );
+    }
 }

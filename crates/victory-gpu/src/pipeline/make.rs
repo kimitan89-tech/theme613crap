@@ -116,7 +116,14 @@ pub(crate) fn waiting() -> u64 {
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
         start(p);
-        wait(p, crate::frame::current());
+        // Overlay drops compute draws/dispatches: do not burn the frame wait
+        // budget on PSOs that will not run. Still queue them for workers.
+        let compute_only = p.graphics.is_none()
+            && p.shaders.len() == 1
+            && p.shaders[0].stage == "compute";
+        if !(compute_only && crate::host::scene_overlay_active()) {
+            wait(p, crate::frame::current());
+        }
     }
     let made = p.made.get()?.as_ref();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {

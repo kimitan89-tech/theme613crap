@@ -567,22 +567,33 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
-/// Titles also use memory outside any buffer object as GPU memory (Grand
-/// Theft Auto VI's interface vertices, from its own allocator). Such memory
-/// gets copies of the aligned windows it touches.
-/// shortcut: copies of windows are never freed; key them to the title's
-/// allocations if memory use grows.
+/// Titles also use memory outside any buffer object as GPU memory (UI
+/// vertices from their own allocator). Such memory gets copies of the
+/// aligned windows it touches.
 const WINDOW: u64 = 4 << 20;
 
+/// Cap on live loose windows (each typically [`WINDOW`] bytes). Excess idle
+/// copies (not held by an in-flight list, untouched for ≥8 frames) are
+/// dropped least-recently-used.
+const LOOSE_MAX_BYTES: u64 = 256 << 20;
+const LOOSE_MIN_AGE: u64 = 8;
+
+struct LooseEntry {
+    shadow: Arc<Shadow>,
+    touched: u64,
+}
+
 /// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+static LOOSE: Mutex<BTreeMap<(u64, u64), LooseEntry>> = Mutex::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
+    let frame = crate::frame::current();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
-        return Some(shadow.clone());
+    if let Some(entry) = map.get_mut(&(start, len)) {
+        entry.touched = frame;
+        return Some(entry.shadow.clone());
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
@@ -594,8 +605,52 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len));
-    map.insert((start, len), shadow.clone());
+    map.insert(
+        (start, len),
+        LooseEntry {
+            shadow: shadow.clone(),
+            touched: frame,
+        },
+    );
+    trim_loose(&mut map);
     Some(shadow)
+}
+
+/// Drops least-recently-touched loose copies that no list still holds and
+/// that have been idle for at least [`LOOSE_MIN_AGE`] frames, until total
+/// mapped size is under [`LOOSE_MAX_BYTES`].
+fn trim_loose(map: &mut BTreeMap<(u64, u64), LooseEntry>) {
+    let mut total: u64 = map.keys().map(|&(_, len)| len).sum();
+    if total <= LOOSE_MAX_BYTES {
+        return;
+    }
+    let frame = crate::frame::current();
+    let mut victims: Vec<((u64, u64), u64, u64)> = map
+        .iter()
+        .filter(|(_, e)| {
+            Arc::strong_count(&e.shadow) == 1
+                && frame.saturating_sub(e.touched) >= LOOSE_MIN_AGE
+        })
+        .map(|(&k, e)| (k, e.touched, k.1))
+        .collect();
+    victims.sort_by_key(|&(_, touched, _)| touched);
+    let before = map.len();
+    for (key, _, len) in victims {
+        if total <= LOOSE_MAX_BYTES {
+            break;
+        }
+        map.remove(&key);
+        total = total.saturating_sub(len);
+    }
+    let dropped = before.saturating_sub(map.len());
+    if dropped > 0 {
+        tracing::debug!(
+            dropped,
+            left = map.len(),
+            bytes = total,
+            "trimmed idle loose title-memory copies"
+        );
+    }
 }
 
 /// For device-removed reports: the copy of title memory whose host range
@@ -610,7 +665,7 @@ pub(crate) fn near(va: u64) -> String {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|e| (e.shadow.gpu, e.shadow.start, e.shadow.len)),
     );
     let below = all.iter().filter(|c| c.0 <= va).max();
     let above = all.iter().filter(|c| c.0 > va).min();

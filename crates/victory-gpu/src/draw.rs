@@ -269,7 +269,7 @@ impl State {
         };
         self.targets.clear();
         let mut rtvs = Vec::new();
-        for &h in handles {
+        for (slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -285,12 +285,16 @@ impl State {
             crate::capture::note_target(record.resource);
             // SAFETY: live host texture.
             let d = unsafe { texture.GetDesc() };
-            crate::host::note_scene_color(
-                record.resource,
-                d.Format.0 as u32,
-                d.Width as u32,
-                d.Height,
-            );
+            // Only MRT0: later slots are G-buffer (normals/material). Tracking
+            // them made PresentX pick the wrong RT by draw count.
+            if slot == 0 {
+                crate::host::note_scene_color(
+                    record.resource,
+                    d.Format.0 as u32,
+                    d.Width as u32,
+                    d.Height,
+                );
+            }
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
@@ -1203,6 +1207,13 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
+        // Before args.refresh / clamp: those queue shadow work for compute we
+        // then drop under PresentX overlay (CPU peg with no silhouette gain).
+        if kind == DISPATCH && crate::host::scene_overlay_active() {
+            once!("indirect compute skipped while PresentX scene overlay is active");
+            list.note_compute_op();
+            return false;
+        }
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
@@ -1270,18 +1281,10 @@ impl State {
             DRAW if rects => self.prepare(list, false) && self.rectangles_all(list),
             DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
-            DISPATCH => {
-                if crate::host::scene_overlay_active() {
-                    once!("indirect compute skipped while PresentX scene overlay is active");
-                    list.note_compute_op();
-                    false
-                } else {
-                    match crate::pipeline::host_pipeline(self.pipeline as This) {
-                        Some(p) if p.compute => self.bind(list, p, true),
-                        _ => false,
-                    }
-                }
-            }
+            DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
+                Some(p) if p.compute => self.bind(list, p, true),
+                _ => false,
+            },
             _ => false,
         };
         if !ran {
