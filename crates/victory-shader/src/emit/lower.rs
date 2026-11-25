@@ -1376,6 +1376,19 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
+            // Local-waves lowering ([`with_local_waves`]): each host wave is its
+            // own console wave. Never require WaveSize(64) on a Wave32 host —
+            // otherwise every retry still emits a blob D3D12 refuses (0x80070057)
+            // and every draw that needs the program is dropped. Seed a solo
+            // `exchange` so `local` is true on the lowerer.
+            if wave == 64 && host_max_wave() == 32 && LOCAL_WAVES.get() {
+                wave = 32;
+                if exchange.is_none() {
+                    let all =
+                        all_lane_blocks(x.st).unwrap_or_else(|| vec![true; p.blocks.len()]);
+                    exchange = Some((s.lds_dwords, true, all));
+                }
+            }
             if wave == 32 && x.native.wave64 {
                 // console threads go to host waves in the order the waves take them (`wave_base`)
                 halves = Some(s.lds_dwords);
