@@ -2549,7 +2549,8 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &bounded);
+            // Leave the scratch in INDIRECT_ARGUMENT: `HostList::close`
+            // returns it to COMMON once for the whole list.
             why("prepare failed");
             return false;
         }
@@ -2562,6 +2563,8 @@ impl State {
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
+        // No per-draw INDIRECT_ARGUMENT→COMMON: windowed hits reuse the same
+        // scratch, and close finishes it once.
         unsafe {
             if let Some(((param, dword), signature)) = &parts {
                 for part in 0..crate::indirect::SPLIT {
@@ -2584,7 +2587,6 @@ impl State {
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
-        crate::indirect::done(list, &bounded);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

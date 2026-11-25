@@ -767,8 +767,9 @@ pub(crate) struct HostList {
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
+    /// grown to the largest indirect execution recorded on the list. The bool
+    /// is whether it is currently in `INDIRECT_ARGUMENT` (else `COMMON`).
+    indirect_args: Mutex<Option<(ID3D12Resource, u64, bool)>>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3505,9 +3506,9 @@ impl Host {
         }
         let mut written = 0usize;
         if wide_merge() && pieces.len() >= 4 {
-            // One job per copy: `card_merge_relay` takes that copy's lock,
-            // and pieces of one copy are disjoint. `relay_fetched` stays
-            // after every job returns.
+            // Group by copy so `card_merge_relay` never contends across
+            // threads, then pack groups into at most 8 buckets (not one
+            // tiny job per small buffer). `relay_fetched` stays after.
             use std::collections::HashMap;
             use std::sync::atomic::AtomicUsize;
             let fetched = data;
@@ -3519,8 +3520,19 @@ impl Host {
                     .or_default()
                     .push((shadow, lo, hi, at));
             }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = by_copy
-                .into_values()
+            let mut groups: Vec<Vec<_>> = by_copy.into_values().collect();
+            groups.sort_by_key(|g| std::cmp::Reverse(g.len()));
+            let n_buckets = groups.len().min(8).max(1);
+            let mut buckets: Vec<Vec<_>> = (0..n_buckets).map(|_| Vec::new()).collect();
+            let mut sizes = vec![0usize; n_buckets];
+            for group in groups {
+                let i = (0..n_buckets).min_by_key(|&i| sizes[i]).unwrap_or(0);
+                sizes[i] += group.len();
+                buckets[i].extend(group);
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .filter(|b| !b.is_empty())
                 .map(|chunk| {
                     let total_written = total_written.clone();
                     Box::new(move || {
@@ -4639,6 +4651,7 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         self.twins_to_depth();
+        self.finish_indirect();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -4676,6 +4689,9 @@ impl HostList {
             if scratch_pool() {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
+        }
+        if let Some((_, _, in_arg)) = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *in_arg = false;
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {
@@ -5262,29 +5278,73 @@ impl HostList {
 
     /// A device-local unordered-access buffer of at least `size` bytes for
     /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
-    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
+    /// list, with the state it is in now (`COMMON` or `INDIRECT_ARGUMENT`).
+    /// Smaller buffers replaced mid-list stay alive until [`HostList::reset`].
+    pub(crate) fn indirect_scratch(&self, size: u64) -> Option<(ID3D12Resource, D3D12_RESOURCE_STATES)> {
         let needed = size.max(64 << 10);
         let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
+        if let Some((buffer, cap, in_arg)) = &*slot
             && *cap >= needed
         {
-            return Some(buffer.clone());
+            let state = if *in_arg {
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+            } else {
+                D3D12_RESOURCE_STATE_COMMON
+            };
+            return Some((buffer.clone(), state));
         }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = slot.as_ref().map_or(0, |(_, cap, _)| *cap);
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
         let buffer = host()?.uav_buffer(alloc)?;
         name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
+        let old = slot.replace((buffer.clone(), alloc, false));
         drop(slot);
-        if let Some((old_buf, _)) = old {
+        if let Some((old_buf, _, _)) = old {
+            // Old buffer was read-only INDIRECT_ARGUMENT or COMMON; it
+            // decays to COMMON at the execute boundary without a barrier.
             self.keep(&old_buf);
         }
-        Some(buffer)
+        Some((buffer, D3D12_RESOURCE_STATE_COMMON))
+    }
+
+    /// Notes that `scratch` is in `INDIRECT_ARGUMENT` (`in_arg`) or `COMMON`.
+    pub(crate) fn set_indirect_in_arg(&self, scratch: &ID3D12Resource, in_arg: bool) {
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((buf, _, flag)) = slot.as_mut()
+            && buf.as_raw() == scratch.as_raw()
+        {
+            *flag = in_arg;
+        }
+    }
+
+    /// If `scratch` is the list's buffer and currently in `INDIRECT_ARGUMENT`,
+    /// marks it `COMMON` and returns `true` (caller emits the barrier).
+    pub(crate) fn take_indirect_in_arg(&self, scratch: &ID3D12Resource) -> bool {
+        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.as_mut() {
+            Some((buf, _, in_arg)) if buf.as_raw() == scratch.as_raw() && *in_arg => {
+                *in_arg = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// One `INDIRECT_ARGUMENT -> COMMON` for the scratch buffer at list close,
+    /// so windowed draws need none between them.
+    fn finish_indirect(&self) {
+        let buf = self
+            .indirect_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(buf, _, _)| buf.clone());
+        if let Some(buf) = buf {
+            crate::indirect::done(self, &buf);
+        }
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -5671,8 +5731,14 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
-    // SAFETY: the destination is mapped writable memory of `len` bytes; the
-    // kernel checks the source.
+    if direct_writes() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source (same as `NtWriteVirtualMemory`).
+        return unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) >= 0
+        };
+    }
+    // SAFETY: as above; `ReadProcessMemory` when direct writes are off.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
 }
 
@@ -5687,6 +5753,16 @@ unsafe extern "system" {
         buffer: *const std::ffi::c_void,
         size: usize,
         written: *mut usize,
+    ) -> i32;
+
+    /// The kernel's read from a process's memory: an NTSTATUS, negative when
+    /// a page of the range is not there or not readable.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
     ) -> i32;
 }
 

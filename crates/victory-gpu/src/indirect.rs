@@ -268,8 +268,13 @@ pub(crate) fn bound(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
-    let (c, budget, dst) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
-    record_clamp(c, &list.list, &dst, budget, src, count, spec).then_some(dst)
+    let (c, budget, (dst, before)) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    if record_clamp(c, &list.list, &dst, before, budget, src, count, spec) {
+        list.set_indirect_in_arg(&dst, true);
+        Some(dst)
+    } else {
+        None
+    }
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -288,8 +293,13 @@ pub(crate) fn bound_ahead(
     spec: (u32, u32, u32),
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
-    let (c, budget, dst) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+    let (c, budget, (dst, before)) = (clamp()?, list.budget_resource()?, list.indirect_scratch(bytes)?);
+    if record_clamp_as(c, &list.list, &dst, before, budget, src, None, spec, AHEAD) {
+        list.set_indirect_in_arg(&dst, true);
+        Some(dst)
+    } else {
+        None
+    }
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
@@ -310,34 +320,43 @@ pub(crate) fn bound_split(list: &HostList, src: (&ID3D12Resource, u64)) -> Optio
     let spec = (2, 12, 1);
     validate_layout(spec, src.1, None)?;
     let (c, budget) = (clamp()?, list.budget_resource()?);
-    let dst = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
-    record_clamp_as(c, &list.list, &dst, budget, src, None, spec, IN_PARTS).then_some(dst)
+    let (dst, before) = list.indirect_scratch(u64::from(SPLIT) * PART_BYTES)?;
+    if record_clamp_as(c, &list.list, &dst, before, budget, src, None, spec, IN_PARTS) {
+        list.set_indirect_in_arg(&dst, true);
+        Some(dst)
+    } else {
+        None
+    }
 }
 
 /// Bits of the clamp's `has_count`.
 const AHEAD: u32 = 2;
 const IN_PARTS: u32 = 4;
 
+#[allow(clippy::too_many_arguments)]
 fn record_clamp(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
     budget: (&ID3D12Resource, u64),
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
 ) -> bool {
-    record_clamp_as(c, l, dst, budget, src, count, spec, 0)
+    record_clamp_as(c, l, dst, before, budget, src, count, spec, 0)
 }
 
 /// [`record_clamp`]; `how`: [`AHEAD`], the records are a window clamped
 /// ahead of their draws ([`bound_ahead`]); [`IN_PARTS`], one dispatch in
-/// parts ([`bound_split`]).
+/// parts ([`bound_split`]). `before`: the scratch buffer's state now
+/// (`COMMON` or `INDIRECT_ARGUMENT`).
 #[allow(clippy::too_many_arguments)]
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
     dst: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
     (budget_res, budget): (&ID3D12Resource, u64),
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
@@ -391,7 +410,7 @@ fn record_clamp_as(
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
-    // transitions `COMMON -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
+    // transitions `before -> UNORDERED_ACCESS -> INDIRECT_ARGUMENT`.
     // Diagnostics: counted; `VICTORY_BARRIER_TEST=indirect` leaves the UAV
     // waits for every earlier shader write out (the state changes stay).
     #[cfg(feature = "diagnostics")]
@@ -417,7 +436,7 @@ fn record_clamp_as(
     }
     first.push(transition(
         dst,
-        D3D12_RESOURCE_STATE_COMMON,
+        before,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
     ));
     let second = [transition(
@@ -445,8 +464,11 @@ fn record_clamp_as(
 
 /// After indirect execution (or if preparation failed after [`bound`]):
 /// returns the scratch buffer to the common state for the next call.
+/// Idempotent: a second call, or a close that already finished it, is a no-op.
 pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
-    done_on(&list.list, scratch);
+    if list.take_indirect_in_arg(scratch) {
+        done_on(&list.list, scratch);
+    }
 }
 
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
@@ -934,6 +956,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
+            D3D12_RESOURCE_STATE_COMMON,
             (&budget_buf, budget_gpu),
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_1 as u64)),
@@ -979,6 +1002,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
+            D3D12_RESOURCE_STATE_COMMON,
             (&budget_buf, budget_gpu),
             (&src_buf, ARGS_OFFSET as u64),
             Some((&count_buf, COUNT_OFFSET_2 as u64)),
@@ -1091,7 +1115,8 @@ void main() {
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
-                (&budget_buf, budget_gpu),
+                D3D12_RESOURCE_STATE_COMMON,
+            (&budget_buf, budget_gpu),
                 (&src_buf, 0),
                 None,
                 (2, 12, 1),
@@ -1144,7 +1169,8 @@ void main() {
                 &warp.clamp,
                 &warp.list,
                 &dst_buf,
-                (&budget_buf, budget_gpu),
+                D3D12_RESOURCE_STATE_COMMON,
+            (&budget_buf, budget_gpu),
                 (&src_buf, 0),
                 None,
                 (KIND_MESH, STRIDE, RECORDS),
@@ -1237,6 +1263,7 @@ void main() {
             &warp.clamp,
             &warp.list,
             &dst_buf,
+            D3D12_RESOURCE_STATE_COMMON,
             (&budget_buf, budget_gpu),
             (&src_buf, 0),
             None,
@@ -1389,6 +1416,41 @@ void main() {
             Some((budget_res.as_raw(), budget_gpu)),
             "the list keeps one budget buffer"
         );
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
+
+    /// Several `bound` / `bound_ahead` calls without `done` between them:
+    /// scratch stays in `INDIRECT_ARGUMENT`, close finishes it once, and a
+    /// second submission reuses the buffer.
+    #[test]
+    fn host_list_keeps_scratch_in_arg_across_bounds_until_close() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(4 << 10) else {
+            return;
+        };
+        // SAFETY: mapped host buffer; three 16-byte draw records.
+        unsafe {
+            let words = [1u32, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0];
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast(), src_ptr, 48);
+        }
+        let b1 = bound(&list, (&src_buf, 0), None, (0, 16, 1)).expect("first bound");
+        let b2 = bound_ahead(&list, (&src_buf, 16), (0, 16, 2)).expect("bound ahead");
+        let b3 = bound(&list, (&src_buf, 32), None, (0, 16, 1)).expect("third bound");
+        assert_eq!(b1.as_raw(), b2.as_raw());
+        assert_eq!(b2.as_raw(), b3.as_raw());
+        // No `done` between them: close emits the single COMMON transition.
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        let b4 = bound(&list, (&src_buf, 0), None, (0, 16, 1)).expect("after reset");
+        assert_eq!(b4.as_raw(), b1.as_raw(), "scratch reused after reset");
         list.close();
         host.execute(&[&list]);
         list.reset();
