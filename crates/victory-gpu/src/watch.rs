@@ -324,28 +324,17 @@ pub(crate) fn synced(at: usize, len: usize) -> u64 {
 }
 
 /// Clears write-watch dirty bits for the pages of `[at, end)`. No-op when
-/// the range is not write-watched (views, ordinary reservations).
+/// the range is not write-watched (views, ordinary reservations). Prefer
+/// [`ResetWriteWatch`] over a resetting [`GetWriteWatch`]: settle merges
+/// call this per piece, and enumerating dirty pages there cost copy-back.
 fn reset_write_watch(at: usize, end: usize) {
-    use windows_sys::Win32::System::Memory::GetWriteWatch;
-    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
     let (first, last) = (at / PAGE, end.div_ceil(PAGE));
     if first >= last {
         return;
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    let mut found = vec![0usize; count.max(1)];
-    let mut granularity = 0;
-    // SAFETY: answer buffer holds `count` entries; failure means not watched.
-    let _ = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    };
+    // SAFETY: title range; failure (not write-watched) is ignored.
+    let _ = unsafe { ResetWriteWatch((first * PAGE) as *const _, (last - first) * PAGE) };
 }
 
 /// View blocks opened for our write: make them read-only and clean again so
