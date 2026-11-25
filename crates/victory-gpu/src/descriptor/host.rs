@@ -342,6 +342,9 @@ struct Waiting {
     /// Bytes of its memory that were mapped when it was last uploaded
     /// without all of it there; 0: not uploaded yet.
     mapped: u64,
+    /// True when the slot already shows an older view of the same placed
+    /// texture and is upgrading to sharper streamed mips (`keep_views`).
+    upgrade: bool,
 }
 
 /// A title slot whose texture was uploaded whole, and is looked at again:
@@ -389,7 +392,18 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(
+            index,
+            Waiting { due, written: frame, write, looks: 0, mapped: 0, upgrade: false },
+        );
+    }
+
+    /// Marks an already-queued slot as a mip-sharpness upgrade for a texture
+    /// already visible on screen so [`TextureQueue::due`] serves it first.
+    fn mark_upgrade(&mut self, index: u32) {
+        if let Some(w) = self.slots.get_mut(&index) {
+            w.upgrade = true;
+        }
     }
 
     fn remove(&mut self, index: u32) {
@@ -455,20 +469,36 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        let mut upgrades: Vec<(u64, u32, u64)> = Vec::new();
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
-            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+            let class = if w.upgrade {
+                &mut upgrades
+            } else if w.looks > 0 || w.mapped > 0 {
+                &mut again
+            } else {
+                &mut fresh
+            };
             class.push((w.written, index, w.write));
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
-        if again.len() > max {
-            again.select_nth_unstable_by(max, newest_first);
-            again.truncate(max);
+        if upgrades.len() > max {
+            upgrades.select_nth_unstable_by(max, newest_first);
+            upgrades.truncate(max);
         }
-        again.sort_unstable_by(newest_first);
-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+        upgrades.sort_unstable_by(newest_first);
+        let mut order: Vec<(u32, u64)> = upgrades.iter().map(|&(_, index, write)| (index, write)).collect();
+        let need_again = max.saturating_sub(order.len());
+        if need_again > 0 && !again.is_empty() {
+            if again.len() > need_again {
+                again.select_nth_unstable_by(need_again, newest_first);
+                again.truncate(need_again);
+            }
+            again.sort_unstable_by(newest_first);
+            order.extend(again.iter().map(|&(_, index, write)| (index, write)));
+        }
         let need = max.saturating_sub(order.len());
         if need > 0 && !fresh.is_empty() {
             if fresh.len() <= need.saturating_mul(2) {
@@ -552,9 +582,15 @@ impl TextureQueue {
     fn changed(&mut self, index: u32, frame: u64, due: u64) {
         self.writes += 1;
         let write = self.writes;
-        let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+        let (due, upgrade) = self
+            .slots
+            .get(&index)
+            .map_or((due, false), |w| (w.due.min(due), w.upgrade));
         self.rechecks.remove(&index);
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(
+            index,
+            Waiting { due, written: frame, write, looks: 0, mapped: 0, upgrade },
+        );
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1763,6 +1799,7 @@ impl HostHeap {
                 .is_some_and(|old| same_placed_texture(&old, &view))
         {
             KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.textures.lock().unwrap_or_else(|e| e.into_inner()).mark_upgrade(index);
             drop(made);
             return Some((view, false, None));
         }

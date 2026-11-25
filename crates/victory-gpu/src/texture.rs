@@ -849,6 +849,9 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
+    /// Large multi-subresource textures (>= 256 KiB, >= 2 subresources) detile
+    /// across worker threads (`VICTORY_WIDE_DETILE=0` disables) so mipmapped
+    /// world textures drain the upload queue several times faster.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
@@ -858,6 +861,69 @@ impl Staging {
                 desc = ?self.layout.desc,
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
+        }
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let wide = *WIDE.get_or_init(|| {
+            std::env::var_os("VICTORY_WIDE_DETILE").is_none_or(|v| v != "0")
+        });
+        if wide && self.footprints.len() >= 2 && self.size >= (256 << 10) {
+            const MAX_WORKERS: usize = 4;
+            let mut items: Vec<(u32, u32, usize, usize, usize, usize)> = self
+                .footprints
+                .iter()
+                .zip(&self.rows)
+                .enumerate()
+                .map(|(i, (footprint, &rows))| {
+                    let (mip, slice) = self.part(i);
+                    let f = footprint.Footprint;
+                    let pitch = f.RowPitch as usize;
+                    let slice_pitch = pitch * rows as usize;
+                    let len = slice_pitch * f.Depth as usize;
+                    (mip, slice, footprint.Offset as usize, pitch, slice_pitch, len)
+                })
+                .collect();
+            // Longest-processing-time-first packing into <= 4 balanced buckets.
+            items.sort_by_key(|item| std::cmp::Reverse(item.5));
+            let n = items.len().min(MAX_WORKERS);
+            let mut buckets: Vec<Vec<(u32, u32, usize, usize, usize, usize)>> =
+                (0..n).map(|_| Vec::new()).collect();
+            let mut loads = vec![0usize; n];
+            for item in items {
+                let i = (0..n).min_by_key(|&k| loads[k]).unwrap_or(0);
+                loads[i] = loads[i].saturating_add(item.5);
+                buckets[i].push(item);
+            }
+            buckets.retain(|b| !b.is_empty());
+            let tiled_ptr = tiled.as_ptr() as usize;
+            let tiled_len = tiled.len();
+            let data_ptr = self.data as usize;
+            let layout_ptr = std::ptr::from_ref(&self.layout) as usize;
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .map(|chunk| {
+                    Box::new(move || {
+                        // SAFETY: `wide_run` joins all jobs before `detile` returns, so
+                        // `tiled`, `self.layout`, and the disjoint subresource slices of
+                        // `self.data` remain valid for the duration of every job.
+                        let tiled_slice =
+                            unsafe { std::slice::from_raw_parts(tiled_ptr as *const u8, tiled_len) };
+                        let layout = unsafe { &*(layout_ptr as *const victory_formats::texture::Layout) };
+                        for (mip, slice, offset, pitch, slice_pitch, len) in chunk {
+                            let linear = unsafe {
+                                std::slice::from_raw_parts_mut((data_ptr + offset) as *mut u8, len)
+                            };
+                            if let Err(e) =
+                                layout.detile(tiled_slice, mip, slice, linear, pitch, slice_pitch)
+                            {
+                                tracing::warn!(?e, mip, slice, "texture not detiled");
+                                return;
+                            }
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            return;
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = self.part(i);
