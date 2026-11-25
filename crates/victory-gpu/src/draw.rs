@@ -1745,7 +1745,7 @@ impl State {
             (PER_FRAME, span_normal)
         };
         let began = std::time::Instant::now();
-        for (index, write) in due {
+        for (n, (index, write)) in due.into_iter().enumerate() {
             if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
@@ -1831,9 +1831,11 @@ impl State {
             if let Some(view) = &view {
                 readable(list, sampled.kind, view);
             }
-            // A texture view the host refuses removes the device: name it.
+            // A texture view the host refuses removes the device: check every
+            // 16 textures so healthy streaming does not pay a COM call per slot.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !GONE.load(Ordering::Relaxed)
+            if n % 16 == 15
+                && !GONE.load(Ordering::Relaxed)
                 && let Some(why) = crate::descriptor::host::device_removed()
             {
                 GONE.store(true, Ordering::Relaxed);
@@ -2919,6 +2921,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
+            crate::texture::host_written(*resource as This);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
