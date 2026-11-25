@@ -1853,6 +1853,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether this buffer stands directly over title memory (`crate::inplace`).
+    pub(crate) fn is_in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id

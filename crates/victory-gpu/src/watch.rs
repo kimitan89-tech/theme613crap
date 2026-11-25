@@ -33,6 +33,15 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
+/// Mirrors `Journal::kept` so `Batch::flush` skips rebuilding `ask_ahead`
+/// ranges without locking `JOURNAL`.
+static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a submission-wide `ask_once` is currently active.
+pub(crate) fn is_kept() -> bool {
+    KEPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct Journal {
     /// Numbers the askings; 0 is "never".
     asked: u64,
@@ -44,9 +53,12 @@ struct Journal {
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
     ahead: Vec<(usize, usize)>,
+    /// Page ranges of view memory already checked by `guard` during the
+    /// current `ask_once` submission (`guarded == true` only).
+    ahead_views: Vec<(usize, usize)>,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
-    /// other ahead asking is made, and `ahead` stays, until
+    /// other ahead asking is made, and `ahead` / `ahead_views` stay, until
     /// [`ask_once_end`].
     kept: bool,
 }
@@ -56,6 +68,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     written: BTreeMap::new(),
     found: Vec::new(),
     ahead: Vec::new(),
+    ahead_views: Vec::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -198,7 +211,9 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             j.ahead.push((first, last));
         }
     }
-    j.kept = !j.ahead.is_empty();
+    j.ahead_views.clear();
+    j.kept = true;
+    KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -207,7 +222,9 @@ pub(crate) fn ask_once_end() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if j.kept {
         j.kept = false;
+        KEPT.store(false, std::sync::atomic::Ordering::Relaxed);
         j.ahead.clear();
+        j.ahead_views.clear();
     }
 }
 
@@ -316,7 +333,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked ahead with the submission's other ranges: the journal has it.
     // Return `j.asked` (not `j.ahead_asked`) so writes recorded via `wrote()`
     // during this submission are marked current once copied.
-    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        || (guarded && j.ahead_views.iter().any(|&(a, b)| a <= first && last <= b))
+    {
         return Some((
             j.asked,
             j.written
@@ -334,13 +353,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let (count, guarded_pages) = if known_view {
+    let (count, guarded_pages, was_view) = if known_view {
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        (0usize, written?)
+        (0usize, written?, true)
     } else {
         let mut count = (last - first) * PAGE / KERNEL_PAGE;
         j.found.resize(count.max(j.found.len()), 0);
@@ -365,9 +384,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             let written = guard(first * PAGE, last * PAGE);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-            (0usize, written?)
+            (0usize, written?, true)
         } else {
-            (count, Vec::new())
+            (count, Vec::new(), false)
         }
     };
     #[cfg(feature = "diagnostics")]
@@ -379,12 +398,21 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded_pages);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    if count > 0 || !guarded_pages.is_empty() {
+        let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded_pages);
+        for page in pages.collect::<Vec<_>>() {
+            j.written.insert(page, now);
+        }
+    }
+    if j.kept {
+        if was_view {
+            j.ahead_views.push((first, last));
+        } else {
+            j.ahead.push((first, last));
+        }
     }
     Some((
-        now,
+        j.asked,
         j.written
             .range(first..last)
             .map(|(&p, &w)| (p, w))

@@ -5584,6 +5584,9 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        if shadow.is_in_place() {
+            return;
+        }
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         match self.index.get(&key) {
@@ -5639,8 +5642,8 @@ impl Batch {
     fn flush(&mut self) {
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy. Skip rebuilding ranges while `ask_once` holds.
+        let ahead = self.refreshes.len() > 1 && !crate::watch::is_kept();
         if ahead {
             let started = std::time::Instant::now();
             let ranges: Vec<(usize, usize)> = self
