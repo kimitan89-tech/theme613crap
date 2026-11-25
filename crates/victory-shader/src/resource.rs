@@ -623,8 +623,15 @@ impl<'a> Tracer<'a> {
         };
         // Uniformized addresses: `v_readfirstlane_b32` of a VGPR that holds
         // root+offset (often after `v_add_co_u32`) is still that address.
-        // Pure dynamic offsets keep the readfirstlane value so waterfall
-        // offset tracking still sees `first_lane_source`.
+        // Keep the readfirstlane value as `dynamic` whenever there was a
+        // lane-local term: lowering must emit WaveReadLaneFirst of that
+        // offset (not the pre-readfirstlane VGPR), or every lane atomics to
+        // a different byte and shared fmin/fmax reductions poison later
+        // passes. Pure-dynamic also keeps it so waterfall tracking still
+        // sees `first_lane_source`. Skip `s_getpc_b64` bases — CODE-table
+        // offsets soft-fail getpc into Missing, and rewriting the dynamic
+        // term to the readfirstlane would pull that Missing into effect
+        // paths (buffer/global) as a hard fail.
         if let Some(src) = self.first_lane_source(v) {
             let s = self.sum(self.vorigin(src));
             return match s {
@@ -634,6 +641,15 @@ impl<'a> Tracer<'a> {
                     dynamic: Some(_),
                 } => Sum {
                     base: None,
+                    offset,
+                    dynamic: Some(v),
+                },
+                Sum {
+                    base: Some(b),
+                    offset,
+                    dynamic: Some(_),
+                } if self.getpc(b).is_none() => Sum {
+                    base: Some(b),
                     offset,
                     dynamic: Some(v),
                 },
@@ -2411,6 +2427,50 @@ pub(crate) mod tests {
             r.scalar.iter().any(|(_, a)| a.param == 0),
             "readfirstlane of a root address should track: {:?}",
             r.scalar
+        );
+    }
+
+    #[test]
+    fn readfirstlane_of_root_plus_vgpr_keeps_uniform_dynamic() {
+        // v0 = s0 + v2; v1 = s1; s2/s3 = readfirstlane(v0/v1); global_load
+        // via s[2:3]. The dynamic term must be the readfirstlane result (so
+        // lowering emits WaveReadLaneFirst), not the lane-local v2.
+        let layout = [param(Constants, 0, 2)];
+        // v_add_nc_u32 as VOP3: opcode 0x125 (= 0x100 + VOP2 0x025).
+        let words = [
+            0xD525_0000u32,
+            0x0002_0400, // v_add_nc_u32 v0, s0, v2
+            0x7E02_0201, // v_mov_b32 v1, s1
+            0x7E04_0500, // v_readfirstlane_b32 s2, v0
+            0x7E06_0501, // v_readfirstlane_b32 s3, v1
+            0x7E00_0280, // v_mov_b32 v0, 0 (offset into global)
+            0xDC30_8000,
+            0x0002_0000, // global_load_dword v0, v0, s[2:3]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let r = track(&p, &layout, HwStage::Cs, lanes(&p).as_ref()).unwrap();
+        let a = r
+            .scalar
+            .iter()
+            .map(|(_, a)| a)
+            .find(|a| a.param == 0 && a.dynamic.is_some())
+            .expect("root+offset through readfirstlane should track");
+        let dyn_v = a.dynamic.unwrap();
+        // Walk the program for the def of `dyn_v`: must be readfirstlane.
+        let def_name = p.blocks.iter().find_map(|b| {
+            b.insts.iter().find_map(|inst| {
+                inst.writes
+                    .iter()
+                    .any(|(_, v)| *v == dyn_v)
+                    .then_some(inst.name())
+            })
+        });
+        assert_eq!(
+            def_name,
+            Some("v_readfirstlane_b32"),
+            "dynamic must be the readfirstlane result, got {def_name:?} addr={a:?}"
         );
     }
 

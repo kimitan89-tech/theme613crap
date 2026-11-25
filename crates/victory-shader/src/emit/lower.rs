@@ -1112,8 +1112,11 @@ impl<'a> Lower<'a> {
 
     /// Bounded CAS loop for `global_atomic_fmin` / `fmax`: memory always
     /// holds real IEEE-754 `f32` bits (never a bit-flipped total order).
+    /// Cap is high enough for a 32-lane wave contending on one address
+    /// (silent exhaustion would leave shared reductions stale and poison
+    /// later passes that spin on those values).
     fn float_atomic_cas(&mut self, h: V, byte: V, val: V, max: bool) -> V {
-        const RETRIES: u32 = 64;
+        const RETRIES: u32 = 1024;
         let i32t = self.s.t.i32;
         let (mask, align) = (self.s.m.i8(1), self.s.m.i32(4));
         let u = self.s.m.undef(i32t);

@@ -363,6 +363,44 @@ mod tests {
         };
         assert!(Compositor::new(&host.device, DXGI_FORMAT_R8G8B8A8_UNORM).is_ok());
     }
+
+    /// Recycled compute segments must re-open (Reset) before recording; a
+    /// pooled list left closed by `reset` used to fail `Close` with E_FAIL.
+    #[test]
+    fn recycled_compute_segments_close_after_reset() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let fill_and_split = |list: &HostList| {
+            let mut splits = 0u32;
+            // Two full segment budgets → at least one closed segment + active.
+            for _ in 0..COMPUTE_SEGMENT_DISPATCHES * 2 {
+                list.note_segment_dispatch();
+                if list.maybe_split_compute_segment(false) {
+                    splits += 1;
+                }
+            }
+            assert!(
+                splits >= 1,
+                "expected at least one compute segment split, got {splits}"
+            );
+            let n = list.segments.lock().unwrap_or_else(|e| e.into_inner()).len();
+            assert!(n >= 1, "expected closed segments before close, got {n}");
+        };
+        fill_and_split(&list);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        // Second frame: splits must pop recycled (previously closed) segments
+        // and re-open them; Close/submit must succeed again.
+        fill_and_split(&list);
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+    }
 }
 
 /// Active allocator + command list pair (recording is single-threaded per
@@ -663,27 +701,39 @@ impl Host {
             return;
         }
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(4 * runs.len());
-        // Where each run's lists start in `lists`.
-        let mut firsts = Vec::with_capacity(runs.len());
+        // Where each TDR-chunkable unit starts in `lists`: one entry per
+        // closed compute segment and the active list (not one per HostList),
+        // so a 17-segment compute list becomes 17 firsts and splits under
+        // `lists_per_submit`.
+        let mut firsts = Vec::with_capacity(4 * runs.len());
+        // Parallel to `firsts`: which `runs` entry owns that chunk (timing).
+        let mut chunk_runs: Vec<usize> = Vec::with_capacity(4 * runs.len());
         let mut batch = Batch::default();
         // Keep segment COM refs alive across ExecuteCommandLists.
         let mut segment_keep: Vec<ID3D12GraphicsCommandList> = Vec::new();
-        for list in &runs {
+        for (run_idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
-            firsts.push(lists.len());
-            if let Some(prelude) = list.prelude() {
-                lists.push(Some(prelude));
-            }
-            // Closed compute segments first (in record order), then the
-            // active list — each becomes its own TDR-chunkable entry.
-            {
+            let segs: Vec<ID3D12GraphicsCommandList> = {
                 let segs = list.segments.lock().unwrap_or_else(|e| e.into_inner());
-                for seg in segs.iter() {
-                    segment_keep.push(seg.list.clone());
-                    lists.push(seg.list.cast().ok());
-                }
-            }
+                segs.iter().map(|s| s.list.clone()).collect()
+            };
             let active = list.cmd();
+            // Prelude rides with the first segment (or the active list).
+            let mut prelude = list.prelude();
+            for seg in &segs {
+                firsts.push(lists.len());
+                chunk_runs.push(run_idx);
+                if let Some(p) = prelude.take() {
+                    lists.push(Some(p));
+                }
+                segment_keep.push(seg.clone());
+                lists.push(seg.cast().ok());
+            }
+            firsts.push(lists.len());
+            chunk_runs.push(run_idx);
+            if let Some(p) = prelude.take() {
+                lists.push(Some(p));
+            }
             segment_keep.push(active.clone());
             lists.push(active.cast().ok());
         }
@@ -693,7 +743,8 @@ impl Host {
         // Split large multi-list submissions into smaller GPU batches so a
         // heavy world/cutscene frame stays under Windows's 2 s TDR timeout
         // per ExecuteCommandLists. Larger chunks when overlay already dropped
-        // the hanging compute; smaller otherwise.
+        // the hanging compute; smaller otherwise. With per-segment firsts,
+        // a mega compute list becomes many 1–2 segment submits.
         let lists_per_submit: usize = if overlay { 4 } else { 2 };
         #[cfg(feature = "diagnostics")]
         let timing_mode = timing();
@@ -768,15 +819,20 @@ impl Host {
             if timing_mode && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                let commands = runs[i].notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                for (ms, op) in runs[i].slowest(frequency, 6) {
-                    tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                // Map chunk index → originating HostList (a list may own many
+                // segment chunks after a compute split).
+                let run = chunk_runs.get(i).copied().and_then(|r| runs.get(r));
+                if let Some(run) = run {
+                    let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
+                    for (ms, op) in run.slowest(frequency, 6) {
+                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                    }
                 }
             }
             let _ = (i, started);
         }
-        let _ = &firsts;
+        let _ = (&firsts, &chunk_runs);
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
@@ -1046,14 +1102,16 @@ impl HostList {
     }
 
     /// Close the current segment when it has recorded enough compute
-    /// dispatches and we are outside a graphics render pass, then open a
-    /// fresh segment so `execute` can TDR-chunk the work. Returns whether
-    /// a split happened (caller should invalidate cached host bindings).
+    /// dispatches on a compute-only list outside a graphics render pass,
+    /// then open a fresh segment so `execute` can TDR-chunk the work.
+    /// Returns whether a split happened (caller should invalidate cached
+    /// host bindings). Mixed graphics/compute lists are never split so
+    /// viewports, scissors, topology, stencil ref and blend factor stay.
     pub(crate) fn maybe_split_compute_segment(
         &self,
         in_graphics_pass: bool,
     ) -> bool {
-        if in_graphics_pass {
+        if in_graphics_pass || self.graphics_ops.load(Ordering::Relaxed) != 0 {
             return false;
         }
         let n = self.segment_dispatches.load(Ordering::Relaxed);
@@ -1063,36 +1121,55 @@ impl HostList {
         let Some(host) = host() else {
             return false;
         };
+        let mut from_pool = false;
         let fresh = {
             let mut pool = self.segment_pool.lock().unwrap_or_else(|e| e.into_inner());
-            pool.pop().or_else(|| {
+            if let Some(seg) = pool.pop() {
+                from_pool = true;
+                Some(seg)
+            } else {
                 // SAFETY: plain object creation on our device.
                 unsafe {
-                    let allocator: ID3D12CommandAllocator = host
+                    let allocator = host
                         .device
                         .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                        .ok()?;
-                    let list: ID3D12GraphicsCommandList = host
-                        .device
-                        .CreateCommandList(
-                            0,
-                            D3D12_COMMAND_LIST_TYPE_DIRECT,
-                            &allocator,
-                            None,
-                        )
-                        .ok()?;
-                    Some(ActiveList { allocator, list })
+                        .ok();
+                    allocator.and_then(|allocator: ID3D12CommandAllocator| {
+                        host.device
+                            .CreateCommandList(
+                                0,
+                                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                &allocator,
+                                None,
+                            )
+                            .ok()
+                            .map(|list: ID3D12GraphicsCommandList| ActiveList { allocator, list })
+                    })
                 }
-            })
+            }
         };
         let Some(fresh) = fresh else {
             return false;
         };
+        // Pooled segments were left closed by reset(); re-open before use.
+        // Fresh CreateCommandList results are already open.
+        if from_pool {
+            // SAFETY: allocator was Reset in HostList::reset; list is closed.
+            if unsafe { fresh.list.Reset(&fresh.allocator, None) }.is_err() {
+                self.segment_pool
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(fresh);
+                return false;
+            }
+        }
         // Close the filled segment and swap in the fresh one.
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         // SAFETY: our open list.
         if unsafe { active.list.Close() }.is_err() {
             // Put the unused fresh segment back so it is not leaked.
+            // SAFETY: leave it closed like other pooled segments.
+            let _ = unsafe { fresh.list.Close() };
             self.segment_pool
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1229,6 +1306,8 @@ impl HostList {
             (scratch.current, scratch.used) = (0, 0);
         }
         // Recycle closed compute segments into the pool (no COM leak).
+        // Allocators are Reset here; lists stay closed until
+        // `maybe_split_compute_segment` re-opens a popped segment.
         {
             let mut segs = self.segments.lock().unwrap_or_else(|e| e.into_inner());
             let mut pool = self.segment_pool.lock().unwrap_or_else(|e| e.into_inner());
@@ -1238,12 +1317,8 @@ impl HostList {
                 pool.push(seg);
             }
             for seg in pool.iter() {
-                // SAFETY: pooled lists stay closed until reused by a split.
-                let _ = unsafe {
-                    seg.list
-                        .Reset(&seg.allocator, None)
-                        .and_then(|()| seg.list.Close())
-                };
+                // SAFETY: prior submits finished; keep the list closed.
+                let _ = unsafe { seg.allocator.Reset() };
             }
         }
         let reset = {
