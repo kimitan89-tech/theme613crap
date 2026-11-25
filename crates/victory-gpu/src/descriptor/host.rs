@@ -1653,6 +1653,22 @@ impl HostHeap {
             .map(|(_, remade, copy)| (remade, copy))
     }
 
+    /// Whether host slot `index` was already made from the view at `handle`
+    /// (same generation key): the heap buffer pass can keep its cached range.
+    pub(crate) fn made_matches(&self, index: u32, handle: u64) -> bool {
+        if index >= self.count || handle == 0 {
+            return false;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        if tag != VIEW_TAG {
+            return false;
+        }
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        made.get(index as usize).is_some_and(|&k| k == key)
+    }
+
     fn mirror_inner(
         &self,
         index: u32,

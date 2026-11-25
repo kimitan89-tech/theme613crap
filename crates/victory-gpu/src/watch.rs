@@ -469,9 +469,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     {
         let g = guards_read();
         let known = !ask_always && (g.protected.contains(&first) || g.absent.contains(&first));
-        // Clean under a shared lock: wide merges and refreshes skip the write lock.
-        if known && g.clean.range(first..last).count() == last - first {
-            return Some(Vec::new());
+        // Clean under a shared lock: wide merges and refreshes skip the write
+        // lock. A 4 MiB window with absent holes used to miss the all-clean
+        // path every time; if the only non-clean blocks are still-unmapped
+        // placeholders, stay on the read path (VirtualQuery those holes only).
+        if known
+            && let Some(empty) = range_unchanged_under_read(&g, first, last)
+        {
+            return Some(empty);
         }
         if !known {
             drop(g);
@@ -693,6 +698,38 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             g.absent.insert(block);
         }
     }
+}
+
+/// Under a shared guards lock: `Some(empty)` when every block in
+/// `[first, last)` is clean, or the only non-clean blocks are still-unmapped
+/// placeholders (confirmed with VirtualQuery on those holes only). `None`
+/// means the caller must take the write path (dirty blocks, or an absent
+/// hole that has since been committed without [`title_memory_remapped`]).
+fn range_unchanged_under_read(g: &Guards, first: usize, last: usize) -> Option<Vec<usize>> {
+    if last <= first {
+        return Some(Vec::new());
+    }
+    let n = last - first;
+    let clean_n = g.clean.range(first..last).count();
+    if clean_n == n {
+        return Some(Vec::new());
+    }
+    let absent_n = g.absent.range(first..last).count();
+    if clean_n + absent_n != n {
+        return None;
+    }
+    // Only absent holes remain. Still unmapped → nothing to copy; a hole
+    // that an ordinary VirtualAlloc committed needs the write path.
+    let mut until = first;
+    for &block in g.absent.range(first..last) {
+        if block >= until {
+            until = uncommitted_end(block);
+        }
+        if block >= until {
+            return None;
+        }
+    }
+    Some(Vec::new())
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.

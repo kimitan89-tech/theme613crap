@@ -1477,6 +1477,14 @@ impl State {
                 }
                 continue;
             };
+            // Bucket rescan of a slot whose host key is unchanged: keep the
+            // cached range without mirror/buffer_copy.
+            if let Some(kept) = prev.clone()
+                && host.made_matches(index, handle)
+            {
+                buckets[b].insert(index, kept);
+                continue;
+            }
             let need_copy = prev.is_none();
             let Some((remade, copy)) = host.mirror_buffer(index, handle, need_copy) else {
                 if let Some((shadow, from, to)) = prev
