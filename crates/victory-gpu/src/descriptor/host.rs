@@ -962,11 +962,15 @@ impl HostHeap {
     /// many were unchanged and changed, and how many wait for a look.
     pub(crate) fn texture_slots_rechecked(&self, frame: u64) -> [u64; 3] {
         /// Looks per pass (each reads 48 KiB), and the time they may take.
-        const MOST: usize = 256;
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(15);
+        const MOST: usize = 64;
+        const SPAN: std::time::Duration = std::time::Duration::from_millis(4);
         let (due, waiting) = {
             let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-            (textures.rechecks_due(frame, MOST), textures.rechecks.len() as u64)
+            let waiting = textures.rechecks.len() as u64;
+            if !frame.is_multiple_of(4) {
+                return [0, 0, waiting];
+            }
+            (textures.rechecks_due(frame, MOST), waiting)
         };
         let began = std::time::Instant::now();
         let mut found = [0, 0, waiting];
@@ -1055,8 +1059,9 @@ impl HostHeap {
     pub(crate) fn texture_sweep(&self, heap: &super::Heap, frame: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         /// Slots looked at at a time, and the least time between.
-        const SLOTS: u32 = 1 << 15;
-        const EVERY_MS: u64 = 100;
+        const SLOTS: u32 = 4_096;
+        const EVERY_MS: u64 = 500;
+        const SHORT: usize = 4_000;
         static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_TEXTURE_SWEEP").as_deref() {
             Ok("0") => 0,
@@ -1064,6 +1069,11 @@ impl HostHeap {
             _ => 2,
         });
         if mode == 0 || self.sampler {
+            return;
+        }
+        // Skip the sweep while the texture queue already has thousands of
+        // entries waiting (`sweep_part` puts back 0 slots above `SHORT`).
+        if mode == 2 && self.textures.lock().unwrap_or_else(|e| e.into_inner()).slots.len() >= SHORT {
             return;
         }
         let now = crate::host::now_ms();
