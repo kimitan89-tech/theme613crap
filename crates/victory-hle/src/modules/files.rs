@@ -519,7 +519,10 @@ pub extern "C" fn _wfsopen(path: *const u16, mode: *const u16, share: i32) -> Fi
 // fail there instead of faulting into its handler; the title's
 // synchronous reads (title+0x313fc0) read straight into 4 KiB-aligned
 // destinations and retry a failed `ReadFile` forever. So the destination
-// is opened first.
+// is opened first. If a concurrent GPU / relay landing re-guards the page
+// between the open and the kernel write (`ERROR_INVALID_USER_BUFFER` /
+// `ERROR_NOACCESS`), the bytes are read into a heap scratch and copied in
+// user mode, which faults into the VEH instead of failing the call.
 
 pub extern "system" fn ReadFile(
     file: *mut c_void,
@@ -528,10 +531,36 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
+    let host_read = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    let ok = host_read(file, buffer, len, read, overlapped);
+    if ok != 0
+        || !overlapped.is_null()
+        || buffer.is_null()
+        || len == 0
+    {
+        return ok;
+    }
+    // SAFETY: plain query after a failed kernel `ReadFile`.
+    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if err != 1784 && err != 998 {
+        return ok;
+    }
+    let mut scratch = vec![0u8; len as usize];
+    let mut n = 0u32;
+    let ok = host_read(file, scratch.as_mut_ptr(), len, &mut n, std::ptr::null_mut());
+    if ok == 0 {
+        return 0;
+    }
+    victory_gpu::kernel_will_write(buffer as usize, n as usize);
+    // SAFETY: `buffer` is the title's destination of `len` bytes; `n ≤ len`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(scratch.as_ptr(), buffer, n as usize);
+        if !read.is_null() {
+            *read = n;
+        }
+    }
+    1
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
@@ -749,6 +778,90 @@ mod tests {
         let handle = file.as_raw_handle().cast();
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    /// Opens a faulting page for the test (stand-in for the GPU-side VEH).
+    unsafe extern "system" fn open_faulted_page(
+        info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    ) -> i32 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        const AV: i32 = 0xC000_0005_u32 as i32;
+        const CONTINUE: i32 = -1;
+        const SEARCH: i32 = 0;
+        // SAFETY: Windows passes a live exception record for this handler.
+        let record = unsafe { &*(*info).ExceptionRecord };
+        if record.ExceptionCode != AV || record.NumberParameters < 2 {
+            return SEARCH;
+        }
+        let page = record.ExceptionInformation[1] & !0xfff;
+        let mut old = 0;
+        // SAFETY: a page of the test's own allocation.
+        if unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old) } != 0 {
+            CONTINUE
+        } else {
+            SEARCH
+        }
+    }
+
+    /// A destination left `PAGE_READONLY` (as after a view-guard race) must
+    /// not fail with `ERROR_INVALID_USER_BUFFER`: the scratch path recovers.
+    #[test]
+    fn readfile_recovers_when_destination_is_read_only() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let want = (0u8..64).collect::<Vec<_>>();
+        std::fs::write(&path, &want).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let handle = file.as_raw_handle().cast();
+        // SAFETY: a page of our own for the destination.
+        let dest = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!dest.is_null());
+        let mut old = 0;
+        // SAFETY: the page we just committed.
+        assert_ne!(
+            unsafe { VirtualProtect(dest, 4096, PAGE_READONLY, &mut old) },
+            0
+        );
+        // SAFETY: first-chance handler for this test only.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(open_faulted_page)) };
+        assert!(!handler.is_null());
+        let mut n = 0u32;
+        assert_ne!(
+            ReadFile(
+                handle,
+                dest.cast(),
+                want.len() as u32,
+                &mut n,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_eq!(n as usize, want.len());
+        // SAFETY: `dest` holds the bytes we just read.
+        let out = unsafe { std::slice::from_raw_parts(dest.cast::<u8>(), want.len()) };
+        assert_eq!(out, want.as_slice());
+        // SAFETY: remove our handler; free our page.
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            let mut old = 0;
+            VirtualProtect(dest, 4096, PAGE_READWRITE, &mut old);
+            VirtualFree(dest, 0, MEM_RELEASE);
+        }
     }
 
     fn text(v: &[u16]) -> String {
