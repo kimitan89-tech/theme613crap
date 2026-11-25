@@ -5659,13 +5659,16 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Pack distinct copies into at most 8 balanced buckets by byte
-            // range so one flush never queues thousands of tiny jobs.
-            // The time counted is wall time, not the threads' sum.
+            // Pack distinct copies into at most one bucket per logical
+            // processor (capped) by byte range so one flush never queues
+            // thousands of tiny jobs. Wall time, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             let items = std::mem::take(&mut self.refreshes);
-            let buckets = pack_buckets(items, 8, |(_, from, to)| to.saturating_sub(*from));
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get().clamp(4, 16))
+                .unwrap_or(8);
+            let buckets = pack_buckets(items, workers, |(_, from, to)| to.saturating_sub(*from));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
                 .into_iter()
                 .map(|chunk| {
