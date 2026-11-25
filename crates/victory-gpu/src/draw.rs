@@ -1353,13 +1353,14 @@ impl State {
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
         type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+        type CachedSpans = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, CachedSpans)>>> =
             std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
+        let (passes, ranges, cached_spans) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
+            .or_insert_with(|| (0, Ranges::new(), Vec::new()));
         // Always rescan what changed; each pass also walks 1/128 of all
         // slots (~650 slots/frame instead of ~5,200) and prunes that bucket's
         // stale keys so released views clear without stalling every frame.
@@ -1371,7 +1372,9 @@ impl State {
         for &index in &bucket_slots {
             scan.insert(index);
         }
+        let before_len = ranges.len();
         ranges.retain(|k, _| *k % RESCAN_BUCKETS != bucket || bucket_set.contains(k));
+        let mut dirty_spans = ranges.len() != before_len;
         let slots: Vec<u32> = scan.into_iter().collect();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
@@ -1379,11 +1382,13 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
+            let prev = ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
+                dirty_spans |= prev.is_some();
                 continue;
             };
             let Some(view) = host.mirror(index, handle, true) else {
+                dirty_spans |= prev.is_some();
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1404,26 +1409,36 @@ impl State {
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                dirty_spans |= prev.is_some();
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let end = address + len;
+            let same = prev.as_ref().is_some_and(|(s, a, b)| {
+                std::sync::Arc::ptr_eq(s, &shadow) && *a == address && *b == end
+            });
+            dirty_spans |= !same;
+            ranges.insert(index, (shadow, address, end));
         }
         let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        if dirty_spans || cached_spans.is_empty() {
+            // Per host copy, the span its picked views cover.
+            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+                std::collections::HashMap::new();
+            for (shadow, from, to) in ranges.values() {
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
+                span.1 = span.1.min(*from);
+                span.2 = span.2.max(*to);
+            }
+            *cached_spans = spans.into_values().collect();
         }
+        let spans = cached_spans.clone();
         drop(kept);
-        let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
         // one by one cost 14 GB a frame in run 11, before they were
@@ -1434,7 +1449,7 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
-        for (shadow, from, to) in spans.values() {
+        for (shadow, from, to) in &spans {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
