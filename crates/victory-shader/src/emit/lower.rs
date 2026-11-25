@@ -1263,6 +1263,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -4208,6 +4209,56 @@ impl<'a> Lower<'a> {
             117,
             &[x, lane],
         )
+    }
+
+    /// `v_permlane16_b32` / `v_permlanex16_b32`: lane `l` takes `x` of
+    /// another lane of its 32-lane group, the one named by nibble `l & 15`
+    /// of the 64-bit selector `{sel_hi, sel_lo}`. `v_permlane16` keeps the
+    /// pick in the lane's own half (`base = l & !15`); `v_permlanex16`
+    /// crosses to the other half (`base = (l & !31) | ((l & 16) ^ 16)`),
+    /// which still stays inside the 32-lane group a host wave of 32 holds,
+    /// so one `WaveReadLaneAt` reaches it. The selectors are constants (the
+    /// console compiler's wave reductions emit them so); a register selector
+    /// is not modelled.
+    fn permlane16(&mut self, x: V, sel_lo: u64, sel_hi: u64, cross: bool) -> V {
+        self.s.flags |= flags::WAVE_OPS;
+        let c = self.cur;
+        let sel = sel_lo | sel_hi << 32;
+        let lane = self.lane_index();
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        // nibble `l & 15` of the selector: shift the matching half by the
+        // position in it, times four, and keep the low four bits.
+        let (fifteen, four, low4) = (k(self, 15), k(self, 4), k(self, 15));
+        let p = self.s.m.bin(c, Bin::And, lane, fifteen);
+        let sh = self.s.m.bin(c, Bin::Mul, p, four);
+        let in_hi = {
+            let eight = k(self, 8);
+            self.s.m.cmp(c, pred::IUGE, p, eight)
+        };
+        let lo32 = k(self, sel as u32);
+        let hi32 = k(self, (sel >> 32) as u32);
+        // the low eight nibbles sit in `sel_lo`, the high eight in `sel_hi`
+        let half = self.s.m.select(c, in_hi, hi32, lo32);
+        let sh16 = {
+            let thirty_two = k(self, 32);
+            let in32 = self.s.m.bin(c, Bin::And, sh, thirty_two);
+            self.s.m.bin(c, Bin::Sub, sh, in32)
+        };
+        let pick = self.s.m.bin(c, Bin::LShr, half, sh16);
+        let pick = self.s.m.bin(c, Bin::And, pick, low4);
+        let base = if cross {
+            // `(l & !31) | ((l & 16) ^ 16)`: the other 16-lane half.
+            let (not31, sixteen) = (k(self, !31), k(self, 16));
+            let group = self.s.m.bin(c, Bin::And, lane, not31);
+            let half16 = self.s.m.bin(c, Bin::And, lane, sixteen);
+            let other = self.s.m.bin(c, Bin::Xor, half16, sixteen);
+            self.s.m.bin(c, Bin::Or, group, other)
+        } else {
+            let not15 = k(self, !15);
+            self.s.m.bin(c, Bin::And, lane, not15)
+        };
+        let src = self.s.m.bin(c, Bin::Or, base, pick);
+        self.read_lane(x, src)
     }
 
     /// The float value of a register value.
@@ -7356,6 +7407,40 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                int(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // A cross-16 permute stays inside a 32-lane group, so it
+                // never reaches a wave64 program's other host wave; only a
+                // half-wave of 32 has no console lane numbers to permute by.
+                self.cross_lane(false)?;
+                if self.local {
+                    return Err("a lane permute in a half-wave");
+                }
+                // op_sel bit 0 is fetch_inactive: with it the console reads
+                // an inactive source lane's value, which is what the host's
+                // lane read gives; without it the console reads 0 for an
+                // inactive lane, so under a guard (not every lane active) the
+                // result would differ. The console compiler's wave
+                // reductions run every lane, so this is rare.
+                if guard.is_some() && v.opsel & 1 == 0 {
+                    return Err("a lane permute that reads inactive lanes as zero");
+                }
+                let x = s(self, 0)?;
+                // The selectors must be constants; a register selector would
+                // need the lane picks at runtime, which is not modelled.
+                let selector = |k: usize| -> Option<u64> {
+                    match v.src.get(k)? {
+                        Operand::Const(code) => crate::resource::inline(*code).map(u64::from),
+                        Operand::Literal(x) => Some(u64::from(*x)),
+                        _ => None,
+                    }
+                };
+                let (Some(lo), Some(hi)) = (selector(1), selector(2)) else {
+                    return Err("a lane permute with a register selector");
+                };
+                let cross = name == "v_permlanex16_b32";
+                let r = self.permlane16(x, lo, hi, cross);
                 int(self, r)
             }
             _ => {
@@ -11122,6 +11207,89 @@ mod tests {
             container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    /// VOP3 `op vdst, src0, src1, src2` as two words (no modifiers). `src`
+    /// codes: 0..=105 SGPR, 128..=255 inline/literal constants, 256+ VGPR.
+    fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+        [
+            0x35 << 26 | (u32::from(op) & 0x3FF) << 16 | u32::from(vdst),
+            (u32::from(src0) & 0x1FF)
+                | (u32::from(src1) & 0x1FF) << 9
+                | (u32::from(src2) & 0x1FF) << 18,
+        ]
+    }
+
+    /// The shader feature flags the DXIL declares (its `SFI0` part): a lane
+    /// permute lowers to a host wave operation, which sets the wave-ops
+    /// feature bit.
+    fn feature_flags(dxil: &[u8]) -> u64 {
+        let container = crate::Container::parse(dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    /// The `D3D_SHADER_FEATURE_WAVE_OPS` bit in the `SFI0` part.
+    const WAVE_OPS: u64 = 0x4000;
+
+    /// A compute program that permutes v0 (the thread id, so reading another
+    /// lane cannot fold to a constant) into v1 and stores it to LDS so the
+    /// permute stays live; `op` is the VOP3 opcode of the permute (0x377
+    /// `v_permlane16_b32`, 0x378 `v_permlanex16_b32`).
+    fn permlane_program(op: u16) -> Vec<u32> {
+        // op v1, v0, 0, 0 (inline-constant selectors, code 128).
+        let mut words = vop3(op, 1, 256, 128, 128).to_vec();
+        words.extend_from_slice(&[
+            0x3408_0082, // v_lshlrev_b32 v4, 2, v0 (LDS byte address)
+            0xD834_0000,
+            0x0000_0104, // ds_write_b32 v4, v1
+            S_ENDPGM,
+        ]);
+        words
+    }
+
+    #[test]
+    fn v_permlanex16_lowers_to_a_wave_operation() {
+        // The console compiler's wave reductions emit `v_permlanex16_b32`
+        // with inline-constant selectors. It crosses the two 16-lane halves
+        // of a 32-lane group, which a host wave of 32 (NVIDIA) holds whole,
+        // so it lowers to a host wave lane-read instead of leaving the
+        // program to fail translation. Before this it was unsupported.
+        let lowered = lower_with(&permlane_program(0x378), vec![], vec![]).expect("lower");
+        assert_ne!(
+            feature_flags(&lowered.dxil) & WAVE_OPS,
+            0,
+            "a cross-half permute should lower to a wave operation",
+        );
+    }
+
+    #[test]
+    fn v_permlane16_within_half_lowers_to_a_wave_operation() {
+        // `v_permlane16_b32` keeps every pick in the lane's own 16-lane
+        // half; it lowers the same way.
+        let lowered = lower_with(&permlane_program(0x377), vec![], vec![]).expect("lower");
+        assert_ne!(
+            feature_flags(&lowered.dxil) & WAVE_OPS,
+            0,
+            "a within-half permute should lower to a wave operation",
+        );
+    }
+
+    #[test]
+    fn v_permlanex16_keeps_a_wave64_console_in_wave32() {
+        // A wave64 console program whose only cross-lane op is a cross-half
+        // permute translates on a Wave32-only host: the permute never leaves
+        // the 32-lane group, so the program stays in waves of 32 with no
+        // `WaveSize=64` metadata, the pipeline D3D12 rejects on NVIDIA.
+        let was = super::TEST_HOST_WAVE.replace(Some(32));
+        let lowered = lower_wave(&permlane_program(0x378), vec![], vec![], true);
+        super::TEST_HOST_WAVE.set(was);
+        let lowered = lowered.expect("lower a wave64 permlanex16 program");
+        assert_ne!(
+            feature_flags(&lowered.dxil) & WAVE_OPS,
+            0,
+            "permlanex16 should lower to a wave operation on a Wave32 host",
+        );
     }
 
     #[test]
