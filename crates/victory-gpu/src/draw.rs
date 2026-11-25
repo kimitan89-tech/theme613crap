@@ -64,6 +64,9 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// Depth view was created with `D3D12_DSV_FLAG_READ_ONLY_DEPTH`: bind as
+    /// `DEPTH_READ | SHADER_RESOURCE` so the same texture can also be an SRV.
+    depth_readonly: bool,
     /// The title's primitive topology (the host's may differ).
     topology: u32,
     /// What the host list has: pipeline, root signature, heaps.
@@ -352,9 +355,15 @@ impl State {
             rtvs.push(host.rtv(texture, record.desc().as_ref()));
         }
         self.depth = 0;
+        self.depth_readonly = false;
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
+            // D3D12_DSV_FLAG_READ_ONLY_DEPTH = 0x1.
+            self.depth_readonly = record
+                .depth_desc()
+                .as_ref()
+                .is_some_and(|d| (d.Flags.0 & 1) != 0);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
@@ -473,11 +482,31 @@ impl State {
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
+        // DEPTH_READ | NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE:
+        // valid as both a read-only DSV and an SRV in the same draw.
+        const DEPTH_READ_SRV: u32 = 0x20 | 0x40 | 0x80;
+        #[cfg(feature = "diagnostics")]
+        {
+            let pending = PENDING_UAVS.lock().unwrap_or_else(|e| e.into_inner());
+            for &t in &self.targets {
+                if pending.contains(&t) {
+                    once!(
+                        resource = format_args!("{t:#x}"),
+                        "a render target is also bound as a UAV in the same draw"
+                    );
+                }
+            }
+        }
         for &t in &self.targets {
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
-            crate::list::ensure_state(list, self.depth as This, DEPTH_WRITE);
+            let state = if self.depth_readonly {
+                DEPTH_READ_SRV
+            } else {
+                DEPTH_WRITE
+            };
+            crate::list::ensure_state(list, self.depth as This, state);
         }
         true
     }
@@ -572,13 +601,23 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(Root::View(address)) => root_view(list, *address, srv),
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
+                        }
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
-                        continue;
+                    let gpu = match gpu {
+                        Some(g) if g != 0 => g,
+                        _ => {
+                            let g = null_const_view();
+                            if g == 0 {
+                                once!(slot, "no null root view buffer; dropping draw/dispatch");
+                                return false;
+                            }
+                            g
+                        }
                     };
                     // SAFETY: an open list; the address is in live memory.
                     unsafe {
@@ -592,17 +631,27 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
-                let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                else {
-                    once!(slot, "a shader writes a root UAV the title did not set");
-                    continue;
+                let bound = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(Root::View(address)) => crate::shadow::find(*address, 1).map(|s| (*address, s)),
+                    _ => {
+                        once!(slot, "a shader writes a root UAV the title did not set");
+                        None
+                    }
                 };
-                let Some(shadow) = crate::shadow::find(*address, 1) else {
-                    continue;
+                let gpu = if let Some((address, shadow)) = bound {
+                    let len = shadow.left(address).min(1 << 20);
+                    shadow.refresh(list, address, len);
+                    let gpu = shadow.gpu(address);
+                    shadow.gpu_writes(list, address, len);
+                    gpu
+                } else {
+                    let g = null_const_view();
+                    if g == 0 {
+                        once!(slot, "no null root UAV buffer; dropping draw/dispatch");
+                        return false;
+                    }
+                    g
                 };
-                let len = shadow.left(*address).min(1 << 20);
-                shadow.refresh(list, *address, len);
-                let gpu = shadow.gpu(*address);
                 // SAFETY: an open list; the address is in live memory.
                 unsafe {
                     if compute {
@@ -611,7 +660,6 @@ impl State {
                         l.SetGraphicsRootUnorderedAccessView(param, gpu);
                     }
                 }
-                shadow.gpu_writes(list, *address, len);
             }
             for &(cv, param) in &stage.const_views {
                 let addr = match self.roots_ref(compute).get(usize::from(cv.slot)) {
@@ -642,7 +690,17 @@ impl State {
                 } else {
                     None
                 };
-                let gpu = gpu.unwrap_or_else(null_const_view);
+                let gpu = match gpu {
+                    Some(g) if g != 0 => g,
+                    _ => {
+                        let g = null_const_view();
+                        if g == 0 {
+                            once!("no null const view buffer; dropping draw/dispatch");
+                            return false;
+                        }
+                        g
+                    }
+                };
                 // SAFETY: an open list; the address is a live buffer.
                 unsafe {
                     match (compute, cv.uav) {

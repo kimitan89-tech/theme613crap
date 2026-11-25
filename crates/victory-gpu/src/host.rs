@@ -498,6 +498,72 @@ fn timing() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_GPU_TIMING").is_some())
 }
 
+/// One command list / compute segment per `ExecuteCommandLists` without
+/// requiring timestamp queries (`VICTORY_SUBMIT_ONE=1`, diagnostics).
+#[cfg(feature = "diagnostics")]
+fn submit_one() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SUBMIT_ONE").ok().as_deref() == Some("1"))
+}
+
+/// Ranges of `firsts` indices covered by each submit chunk.
+/// `one_per_first` → one chunk per first; otherwise pack up to
+/// `lists_per_submit` firsts (or a single chunk when that fits).
+fn chunk_first_ranges(
+    firsts_len: usize,
+    lists_per_submit: usize,
+    one_per_first: bool,
+) -> Vec<(usize, usize)> {
+    if firsts_len == 0 {
+        return Vec::new();
+    }
+    if one_per_first {
+        return (0..firsts_len).map(|i| (i, i + 1)).collect();
+    }
+    if firsts_len <= lists_per_submit {
+        return vec![(0, firsts_len)];
+    }
+    let mut out = Vec::with_capacity(firsts_len.div_ceil(lists_per_submit));
+    let mut idx = 0;
+    while idx < firsts_len {
+        let next = (idx + lists_per_submit).min(firsts_len);
+        out.push((idx, next));
+        idx = next;
+    }
+    out
+}
+
+#[cfg(test)]
+mod chunk_ranges_tests {
+    use super::chunk_first_ranges;
+
+    #[test]
+    fn one_per_first_splits_each() {
+        assert_eq!(
+            chunk_first_ranges(3, 2, true),
+            vec![(0, 1), (1, 2), (2, 3)]
+        );
+    }
+
+    #[test]
+    fn packs_when_under_limit() {
+        assert_eq!(chunk_first_ranges(3, 4, false), vec![(0, 3)]);
+    }
+
+    #[test]
+    fn packs_into_batches() {
+        assert_eq!(
+            chunk_first_ranges(5, 2, false),
+            vec![(0, 2), (2, 4), (4, 5)]
+        );
+    }
+
+    #[test]
+    fn empty_firsts() {
+        assert!(chunk_first_ranges(0, 2, false).is_empty());
+    }
+}
+
 /// Names a host object for the device-removed report, which names the
 /// allocations a page fault hit (only with device-removed data on).
 pub(crate) fn name(object: &impl Interface, text: impl FnOnce() -> String) {
@@ -727,7 +793,14 @@ impl Host {
                     lists.push(Some(p));
                 }
                 segment_keep.push(seg.clone());
-                lists.push(seg.cast().ok());
+                // GraphicsCommandList always QI's to CommandList; None would
+                // leave a root-slot hole in ExecuteCommandLists.
+                match seg.cast() {
+                    Ok(cl) => lists.push(Some(cl)),
+                    Err(e) => fail(format_args!(
+                        "a host compute segment did not cast to a command list ({e})"
+                    )),
+                }
             }
             firsts.push(lists.len());
             chunk_runs.push(run_idx);
@@ -735,7 +808,12 @@ impl Host {
                 lists.push(Some(p));
             }
             segment_keep.push(active.clone());
-            lists.push(active.cast().ok());
+            match active.cast() {
+                Ok(cl) => lists.push(Some(cl)),
+                Err(e) => fail(format_args!(
+                    "a host command list did not cast to ID3D12CommandList ({e})"
+                )),
+            }
         }
         let _ = &segment_keep;
         batch.flush();
@@ -750,32 +828,23 @@ impl Host {
         let timing_mode = timing();
         #[cfg(not(feature = "diagnostics"))]
         let timing_mode = false;
-        let groups: Vec<&[Option<ID3D12CommandList>]> = if timing_mode {
-            firsts
-                .iter()
-                .zip(firsts.iter().skip(1).chain([&lists.len()]))
-                .map(|(&a, &b)| &lists[a..b])
-                .collect()
-        } else if firsts.len() > lists_per_submit {
-            let mut chunks = Vec::with_capacity(firsts.len().div_ceil(lists_per_submit));
-            let mut idx = 0;
-            while idx < firsts.len() {
-                let a = firsts[idx];
-                let next = (idx + lists_per_submit).min(firsts.len());
-                let b = if next < firsts.len() {
-                    firsts[next]
+        #[cfg(feature = "diagnostics")]
+        let one_per = timing_mode || submit_one();
+        #[cfg(not(feature = "diagnostics"))]
+        let one_per = timing_mode;
+        let ranges = chunk_first_ranges(firsts.len(), lists_per_submit, one_per);
+        let groups: Vec<&[Option<ID3D12CommandList>]> = ranges
+            .iter()
+            .map(|&(a, b)| {
+                let start = firsts[a];
+                let end = if b < firsts.len() {
+                    firsts[b]
                 } else {
                     lists.len()
                 };
-                if a < b {
-                    chunks.push(&lists[a..b]);
-                }
-                idx = next;
-            }
-            chunks
-        } else {
-            vec![&lists[..]]
-        };
+                &lists[start..end]
+            })
+            .collect();
         // Overlay already dropped hanging compute-only lists: queue every
         // chunk then wait once so the GPU stays busy. Mid-chunk waits return
         // if a prior deep-queue submit approached the TDR limit.
@@ -795,6 +864,7 @@ impl Host {
             *submitted += 1;
             let fence_val = *submitted;
             let started = std::time::Instant::now();
+            let mut waited = false;
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -805,6 +875,7 @@ impl Host {
                             match self.fence.SetEventOnCompletion(fence_val, self.event) {
                                 Ok(()) => {
                                     WaitForSingleObject(self.event, INFINITE);
+                                    waited = true;
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, "host submission not waited for")
@@ -815,18 +886,66 @@ impl Host {
                     Err(e) => tracing::warn!(error = %e, "host submission not signalled"),
                 }
             }
+            // Mid-submit pinpoint: after each waited chunk, stop before more
+            // ExecuteCommandLists so the report names this chunk's lists.
+            if waited && !deep_queue {
+                // SAFETY: a plain query.
+                if let Err(reason) = unsafe { self.device.GetDeviceRemovedReason() } {
+                    let (fa, fb) = ranges.get(i).copied().unwrap_or((0, 0));
+                    let mut failing_idxs: Vec<usize> = chunk_runs[fa..fb].to_vec();
+                    failing_idxs.sort_unstable();
+                    failing_idxs.dedup();
+                    let failing_runs: Vec<&HostList> = failing_idxs
+                        .iter()
+                        .filter_map(|&r| runs.get(r).copied())
+                        .collect();
+                    let segs: Vec<String> = (fa..fb)
+                        .map(|fi| {
+                            let run_idx = chunk_runs[fi];
+                            // Last first of a run is always the active list;
+                            // earlier firsts of the same run are closed segments.
+                            let run_last = chunk_runs
+                                .iter()
+                                .rposition(|&r| r == run_idx)
+                                .unwrap_or(fi);
+                            let kind = if fi < run_last { "segment" } else { "active" };
+                            format!("first {fi}: run {run_idx} ({kind})")
+                        })
+                        .collect();
+                    let pipelines: std::collections::BTreeSet<String> = failing_runs
+                        .iter()
+                        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .collect();
+                    fail(format_args!(
+                        "host GPU device removed after chunk {}/{} ({} cmdlists; runs {:?}; {}; pipelines {:?}); reason {reason}{}{}",
+                        i + 1,
+                        groups.len(),
+                        group.len(),
+                        failing_idxs,
+                        segs.join("; "),
+                        pipelines,
+                        self.removal_data(&failing_runs),
+                        chunk_notes(&failing_runs, &failing_idxs, runs.len()),
+                    ));
+                }
+            }
             #[cfg(feature = "diagnostics")]
             if timing_mode && started.elapsed() > std::time::Duration::from_millis(50) {
                 // SAFETY: a plain query.
                 let frequency = unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(1);
-                // Map chunk index → originating HostList (a list may own many
-                // segment chunks after a compute split).
-                let run = chunk_runs.get(i).copied().and_then(|r| runs.get(r));
-                if let Some(run) = run {
-                    let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
-                    tracing::warn!(ms = started.elapsed().as_millis(), commands, "slow host list");
-                    for (ms, op) in run.slowest(frequency, 6) {
-                        tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                let (fa, fb) = ranges.get(i).copied().unwrap_or((i, i + 1));
+                for &run_idx in &chunk_runs[fa..fb.min(chunk_runs.len())] {
+                    if let Some(run) = runs.get(run_idx) {
+                        let commands = run.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+                        tracing::warn!(
+                            ms = started.elapsed().as_millis(),
+                            commands,
+                            run = run_idx,
+                            "slow host list"
+                        );
+                        for (ms, op) in run.slowest(frequency, 6) {
+                            tracing::warn!("slow list command, {ms:.1} ms: {op}");
+                        }
                     }
                 }
             }
@@ -854,7 +973,7 @@ impl Host {
                 "overlay deep-queue slow; forcing mid-wait submits"
             );
         }
-        // SAFETY: a plain query.
+        // SAFETY: a plain query (also covers deep_queue's single final wait).
         if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
             if deep_queue {
                 OVERLAY_FORCE_MID_WAIT.store(true, Ordering::Relaxed);
@@ -3035,6 +3154,42 @@ fn last_notes(runs: &[&HostList]) -> String {
     #[cfg(not(feature = "diagnostics"))]
     {
         let _ = runs;
+        String::new()
+    }
+}
+
+/// Focused notes for the HostLists implicated in a removed-device chunk.
+/// `<= 40` notes → all; otherwise first 8 + last 32.
+fn chunk_notes(failing: &[&HostList], failing_idxs: &[usize], total_lists: usize) -> String {
+    #[cfg(feature = "diagnostics")]
+    {
+        let mut text = String::new();
+        for (run, &run_idx) in failing.iter().zip(failing_idxs) {
+            let notes = run.notes.lock().unwrap_or_else(|e| e.into_inner());
+            let n = notes.len();
+            let show: Vec<(usize, &str)> = if n <= 40 {
+                notes.iter().enumerate().map(|(k, (s, _))| (k, s.as_str())).collect()
+            } else {
+                notes
+                    .iter()
+                    .enumerate()
+                    .take(8)
+                    .chain(notes.iter().enumerate().skip(n.saturating_sub(32)))
+                    .map(|(k, (s, _))| (k, s.as_str()))
+                    .collect()
+            };
+            for (k, note) in show {
+                text.push_str(&format!(
+                    "; list {run_idx} of {total_lists}, note {}/{n}: {note}",
+                    k + 1
+                ));
+            }
+        }
+        text
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = (failing, failing_idxs, total_lists);
         String::new()
     }
 }
