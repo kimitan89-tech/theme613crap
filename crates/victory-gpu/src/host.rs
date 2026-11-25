@@ -25,12 +25,13 @@ pub(crate) fn pc_state(state: u32) -> u32 {
     state & 0x01ff_ffff
 }
 
-/// A console state as a host texture state: PC bits only, and none of the
-/// buffer-only ones the console allows on textures (vertex, constant and
-/// index buffer, stream out, indirect arguments, as in "generic read").
+/// A console state as a host texture state: only valid direct-queue PC
+/// texture bits (strips console-only / video / shading-rate / buffer-only).
 pub(crate) fn texture_state(state: u32) -> u32 {
-    const BUFFER_ONLY: u32 = 0x1 | 0x2 | 0x100 | 0x200;
-    pc_state(state) & !BUFFER_ONLY
+    // RENDER_TARGET | UAV | DEPTH_WRITE | DEPTH_READ | NON_PIXEL_SRV |
+    // PIXEL_SRV | COPY_DEST | COPY_SOURCE | RESOLVE_DEST | RESOLVE_SOURCE.
+    const ALLOWED: u32 = 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x400 | 0x800 | 0x1000 | 0x2000;
+    pc_state(state) & ALLOWED
 }
 
 /// Render target views live only until their command is recorded, so a
@@ -447,6 +448,8 @@ pub(crate) struct HostList {
     graphics_ops: AtomicU32,
     /// Successful compute dispatches (skipped + not prepared under overlay).
     compute_ops: AtomicU32,
+    /// Whether [`HostList::close`] has been called since the last reset.
+    closed: AtomicBool,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
@@ -718,6 +721,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 graphics_ops: AtomicU32::new(0),
                 compute_ops: AtomicU32::new(0),
+                closed: AtomicBool::new(false),
                 budget: OnceLock::new(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -732,6 +736,13 @@ impl Host {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a plain query — catch removal that happened before this submit.
+        if let Err(reason) = unsafe { self.device.GetDeviceRemovedReason() } {
+            fail(format_args!(
+                "host GPU device was ALREADY removed before submission of {} lists; reason {reason}",
+                runs.len()
+            ));
+        }
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
@@ -778,6 +789,13 @@ impl Host {
         // Keep segment COM refs alive across ExecuteCommandLists.
         let mut segment_keep: Vec<ID3D12GraphicsCommandList> = Vec::new();
         for (run_idx, list) in runs.iter().enumerate() {
+            if !list.is_closed() {
+                tracing::warn!(
+                    run = run_idx,
+                    "submitting an unclosed host command list; closing it now"
+                );
+                list.close();
+            }
             list.run_deferred(&mut batch);
             let segs: Vec<ID3D12GraphicsCommandList> = {
                 let segs = list.segments.lock().unwrap_or_else(|e| e.into_inner());
@@ -865,6 +883,19 @@ impl Host {
             let fence_val = *submitted;
             let started = std::time::Instant::now();
             let mut waited = false;
+            // SAFETY: a plain query — don't submit more work on a dead device.
+            if let Err(reason) = unsafe { self.device.GetDeviceRemovedReason() } {
+                let (fa, fb) = ranges.get(i).copied().unwrap_or((0, 0));
+                let mut idxs: Vec<usize> = chunk_runs[fa..fb].to_vec();
+                idxs.sort_unstable();
+                idxs.dedup();
+                fail(format_args!(
+                    "host GPU device was ALREADY removed before chunk {}/{} (runs {:?}); reason {reason}",
+                    i + 1,
+                    groups.len(),
+                    idxs
+                ));
+            }
             // SAFETY: closed lists; the fence and event are ours.
             unsafe {
                 self.queue.ExecuteCommandLists(group);
@@ -916,14 +947,19 @@ impl Host {
                         .iter()
                         .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
                         .collect();
+                    let states_n = failing_runs
+                        .first()
+                        .map(|r| r.states_summary())
+                        .unwrap_or(0);
                     fail(format_args!(
-                        "host GPU device removed after chunk {}/{} ({} cmdlists; runs {:?}; {}; pipelines {:?}); reason {reason}{}{}",
+                        "host GPU device removed after chunk {}/{} ({} cmdlists; runs {:?}; {}; pipelines {:?}; states={states_n}; had_prelude={}); reason {reason}{}{}",
                         i + 1,
                         groups.len(),
                         group.len(),
                         failing_idxs,
                         segs.join("; "),
                         pipelines,
+                        group.len() > 1,
                         self.removal_data(&failing_runs),
                         chunk_notes(&failing_runs, &failing_idxs, runs.len()),
                     ));
@@ -1387,6 +1423,9 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if self.closed.swap(true, Ordering::Relaxed) {
+            return;
+        }
         let list = self.cmd();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
@@ -1405,6 +1444,16 @@ impl HostList {
         }
     }
 
+    /// Whether [`HostList::close`] has finished for this recording epoch.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
+    /// Number of host textures this list tracks state for (device-removed reports).
+    pub(crate) fn states_summary(&self) -> usize {
+        self.states.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
@@ -1413,6 +1462,7 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.graphics_ops.store(0, Ordering::Relaxed);
         self.compute_ops.store(0, Ordering::Relaxed);
+        self.closed.store(false, Ordering::Relaxed);
         self.segment_dispatches.store(0, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2215,7 +2265,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no upload buffer");
+                // SAFETY: a plain query — surface device-removed at first notice.
+                let removed = unsafe { self.device.GetDeviceRemovedReason() }.err();
+                tracing::warn!(error = %e, size, ?removed, "no upload buffer");
                 None
             }
         }
@@ -3035,10 +3087,54 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         (0x2, false, 0x10 | 0x20),
         (0x8, true, 0x40 | 0x80),
     ];
-    FORBIDDEN
+    let s = FORBIDDEN
         .iter()
         .filter(|&&(flag, deny, _)| (flags & flag != 0) == deny)
-        .fold(state, |s, &(_, _, bits)| s & !bits)
+        .fold(state, |s, &(_, _, bits)| s & !bits);
+    // D3D12: a write state bit cannot combine with any other state bit.
+    const WRITES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+    if s & WRITES != 0 && s.count_ones() > 1 {
+        // Prefer the "most destination-like" write when collapsing.
+        for bit in [0x400u32, 0x1000, 0x10, 0x4, 0x8] {
+            if s & bit != 0 {
+                return bit;
+            }
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+mod texture_state_tests {
+    use super::{legal_for, texture_state};
+
+    #[test]
+    fn texture_state_keeps_valid_pc_bits_only() {
+        assert_eq!(texture_state(0x4 | 0x80), 0x4 | 0x80);
+        assert_eq!(texture_state(0x1 | 0x2 | 0x100 | 0x200), 0); // buffer-only
+        assert_eq!(texture_state(1 << 25), 0); // console high bit
+        assert_eq!(texture_state(0x3cfc), 0x3cfc);
+        assert_eq!(texture_state(0xffff_ffff), 0x3cfc);
+    }
+
+    #[test]
+    fn legal_for_collapses_combined_write_and_read() {
+        // Resource flags that allow the write states under test.
+        const ALLOW_RT: u32 = 0x1;
+        const ALLOW_DEPTH: u32 = 0x2;
+        const ALLOW_UAV: u32 = 0x4;
+        assert_eq!(legal_for(ALLOW_RT, 0x4 | 0x80), 0x4); // RT | PIXEL_SRV → RT
+        assert_eq!(legal_for(ALLOW_DEPTH, 0x10 | 0x20), 0x10); // DEPTH_WRITE | READ
+        assert_eq!(legal_for(ALLOW_UAV, 0x8 | 0x40), 0x8); // UAV | NON_PIXEL_SRV
+        assert_eq!(legal_for(ALLOW_RT, 0x400 | 0x4), 0x400); // COPY_DEST preferred
+        assert_eq!(legal_for(ALLOW_DEPTH, 0x1000 | 0x10), 0x1000); // RESOLVE_DEST
+        // Read-only combinations stay (no depth flag → depth bits stripped).
+        assert_eq!(legal_for(0, 0x40 | 0x80), 0x40 | 0x80);
+        // Without ALLOW_UAV, UAV state is cleared.
+        assert_eq!(legal_for(0, 0x8), 0);
+        // DENY_SHADER_RESOURCE (flag 0x8 set) strips SRV bits.
+        assert_eq!(legal_for(0x8, 0x40 | 0x80), 0);
+    }
 }
 
 impl Host {
@@ -3088,7 +3184,9 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
-                tracing::warn!(error = %e, size, "no shared buffer");
+                // SAFETY: a plain query — surface device-removed at first notice.
+                let removed = unsafe { self.device.GetDeviceRemovedReason() }.err();
+                tracing::warn!(error = %e, size, ?removed, "no shared buffer");
                 None
             }
         }

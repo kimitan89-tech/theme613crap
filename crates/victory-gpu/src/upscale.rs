@@ -322,6 +322,13 @@ void main(uint3 id : SV_DispatchThreadID) {
                 uav_cpu,
             );
             let l = host_list.cmd();
+            #[cfg(feature = "diagnostics")]
+            host_list.note_op(|| {
+                format!(
+                    "upscale {src_w}x{src_h} f{} -> {out_w}x{out_h} f{}",
+                    src_desc.Format.0, dst_desc.Format.0
+                )
+            });
             l.ResourceBarrier(&[uav_barrier()]);
             l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
             l.SetComputeRootSignature(&pass.root);

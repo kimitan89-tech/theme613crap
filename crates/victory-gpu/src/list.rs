@@ -322,6 +322,8 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             })
         }
         1 => Some(Barrier {
+            kind: 1,
+            flags: 0,
             first: if b.first.is_null() {
                 b.first
             } else {
@@ -332,16 +334,29 @@ fn host_barrier(list: &crate::host::HostList, b: &Barrier) -> Option<Barrier> {
             } else {
                 host(b.second as This)? as u64
             },
-            ..*b
+            last: b.last,
         }),
-        2 => Some(Barrier {
-            first: if b.first.is_null() {
-                b.first
-            } else {
-                host(b.first)?
-            },
-            ..*b
-        }),
+        2 => {
+            // UAV barriers never carry split flags. Naming a non-UAV texture
+            // is DXGI_ERROR_INVALID_CALL on PC — fall back to a global UAV barrier.
+            if b.first.is_null() {
+                return Some(UAV_BARRIER);
+            }
+            let texture = crate::resource::host_resource(b.first)?;
+            // SAFETY: a live host texture.
+            let flags = unsafe { texture.GetDesc() }.Flags.0;
+            const ALLOW_UAV: i32 = 0x4; // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            if flags & ALLOW_UAV == 0 {
+                return Some(UAV_BARRIER);
+            }
+            Some(Barrier {
+                kind: 2,
+                flags: 0,
+                first: texture.as_raw().cast_const().cast(),
+                second: 0,
+                last: 0,
+            })
+        }
         _ => None,
     }
 }
@@ -376,6 +391,30 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
             host.push(UAV_BARRIER);
         }
         if !host.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            {
+                let summary: String = host
+                    .iter()
+                    .map(|b| match b.kind {
+                        0 => format!(
+                            "T({:#x}->{:#x})",
+                            (b.second >> 32) as u32,
+                            b.last as u32
+                        ),
+                        1 => "A".into(),
+                        2 => {
+                            if b.first.is_null() {
+                                "U(null)".into()
+                            } else {
+                                "U(res)".into()
+                            }
+                        }
+                        _ => "?".into(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                list.note_op(|| format!("barrier {} [{summary}]", host.len()));
+            }
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
             // SAFETY: the same layout; borrowed resource pointers, never
@@ -710,17 +749,20 @@ extern "system" fn clear_rtv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const RENDER_TARGET: u32 = 0x4;
+        ensure_state(list, record.resource, RENDER_TARGET);
         let rtv = host.rtv(texture, record.desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        {
+            let fmt = record.desc().map(|d| d.Format.0).unwrap_or(0);
+            list.note_op(|| {
+                format!(
+                    "clear_rtv resource={:#x} format={fmt} rects={count}",
+                    record.resource as usize
+                )
+            });
+        }
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
-                use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.cmd().ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    State(before as i32),
-                    State(RENDER_TARGET as i32),
-                )]);
-            }
             list.cmd().ClearRenderTargetView(rtv, color, rects);
         }
     }
@@ -759,6 +801,13 @@ extern "system" fn clear_dsv(
         const DEPTH_WRITE: u32 = 0x10;
         ensure_state(list, record.resource, DEPTH_WRITE);
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| {
+            format!(
+                "clear_dsv resource={:#x} flags={flags:#x} rects={count}",
+                record.resource as usize
+            )
+        });
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
             list.cmd()
@@ -1246,6 +1295,8 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| format!("barrier_groups {count}"));
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };

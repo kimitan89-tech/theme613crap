@@ -345,8 +345,8 @@ mod tests {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             )]);
-            list.cmd().Close().expect("close");
         }
+        list.close();
         host.execute(&[&list]);
         let mut out = [[0u32; 4]; 3];
         let mut src_after = [[0u32; 4]; 3];
