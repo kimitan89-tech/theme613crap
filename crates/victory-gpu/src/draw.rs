@@ -1700,7 +1700,7 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 256);
+        let (due, census) = host.texture_slots_due(frame, 512);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1735,10 +1735,10 @@ impl State {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .filter(|&ms| ms >= 2)
-                .unwrap_or(12)
+                .unwrap_or(20)
         });
         let span_normal = std::time::Duration::from_millis(base_ms);
-        let span_catch_up = std::time::Duration::from_millis(base_ms.saturating_mul(2).min(24));
+        let span_catch_up = std::time::Duration::from_millis(base_ms.saturating_mul(2).min(40));
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
             (PER_FRAME_CATCHING_UP, span_catch_up)
         } else {
