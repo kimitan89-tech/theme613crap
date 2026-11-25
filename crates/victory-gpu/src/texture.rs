@@ -288,8 +288,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT`; on by
+/// default, `=0` disables).
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -311,7 +311,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// is remapping may show a frame later. It never shows partly read.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_none_or(|v| v != "0"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read

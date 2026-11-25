@@ -1300,10 +1300,11 @@ impl HostHeap {
         }
     }
 
-    /// The title slots that hold buffer views.
-    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+    /// The title slots that hold buffer views with `index % 16 == bucket`
+    /// (one sixteenth of all buffer slots, for the amortized heap rescan).
+    pub(crate) fn buffer_slots_bucket(&self, bucket: u32) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        buffers.iter().copied().filter(|&i| i % 16 == bucket).collect()
     }
 
     /// The title slots whose buffer view was written, or went, since the

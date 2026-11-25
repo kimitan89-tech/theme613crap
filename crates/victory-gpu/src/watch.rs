@@ -544,25 +544,17 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     if !view_guard() {
         return;
     }
-    for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
-        let first = (base / BLOCK).max(from);
-        let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
-        for block in first..last {
-            let shown = crate::inplace::pages_of(block * BLOCK);
-            // One view (nothing else to guard), or the page the title shows
-            // wherever it has nothing (thousands of views): each view of
-            // that one is guarded by itself.
-            if shown.len() < 2 || shown.len() > MANY_VIEWS {
-                continue;
-            }
-            #[cfg(feature = "diagnostics")]
-            ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for alias in shown {
-                let alias = alias / BLOCK;
-                g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
-                }
+    // One lock over the views table for every aliased block in the range.
+    for (block, shown) in
+        crate::inplace::aliases_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK))
+    {
+        #[cfg(feature = "diagnostics")]
+        ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        for alias in shown {
+            let alias = alias / BLOCK;
+            g.aliased.insert(alias);
+            if alias != block {
+                protect_alias(g, alias);
             }
         }
     }
@@ -703,6 +695,8 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 }
 
 /// [`open`] for one range, without the other views of its pages.
+/// Contiguous protected runs are opened with one `VirtualProtect` each;
+/// a run that fails (view boundaries) falls back to per-block.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g
@@ -710,14 +704,41 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    let mut i = 0;
+    while i < blocks.len() {
+        let run_start = blocks[i];
+        let mut run_end = run_start + 1;
+        while i + 1 < blocks.len() && blocks[i + 1] == run_end {
+            i += 1;
+            run_end += 1;
+        }
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        let ok = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                (run_end - run_start) * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            ) != 0
+        };
+        if !ok {
+            for block in run_start..run_end {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -890,6 +911,48 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Four contiguous guarded view blocks open in one call and leave
+    /// `protected` / `clean`.
+    #[test]
+    fn open_here_coalesces_contiguous_view_blocks() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, PAGE_READWRITE,
+        };
+        // SAFETY: a pagefile section of four blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (4 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 4 * BLOCK).is_some());
+        {
+            let mut g = guards();
+            let from = view / BLOCK;
+            assert!(g.protected.contains(&from));
+            assert!(g.protected.contains(&(from + 3)));
+            assert!(open_here(&mut g, view, view + 4 * BLOCK));
+            for b in from..from + 4 {
+                assert!(!g.protected.contains(&b), "block {b} still protected");
+                assert!(!g.clean.contains(&b), "block {b} still clean");
+            }
+        }
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, 4 * BLOCK);
+    }
 
     /// Guarded view memory whose blocks are already clean returns without
     /// allocating a dirty list, and a later write is still seen.
