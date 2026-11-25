@@ -484,6 +484,10 @@ struct Guards {
     protected: BTreeSet<usize>,
     /// Of those, the ones not written since a copy took them.
     clean: BTreeSet<usize>,
+    /// Coalesced `[start, end)` runs of `clean` (block numbers). A fully
+    /// clean 174 MB view is one run: all-clean checks are then a map lookup
+    /// instead of walking tens of thousands of set nodes per asking.
+    clean_runs: BTreeMap<usize, usize>,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
@@ -496,9 +500,82 @@ struct Guards {
 static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
+    clean_runs: BTreeMap::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
+
+/// Inserts `[from, to)` into coalesced clean runs, merging overlaps and
+/// touches.
+fn clean_run_insert(runs: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let mut start = from;
+    let mut end = to;
+    if let Some((&s, &e)) = runs.range(..=from).next_back()
+        && e >= from
+    {
+        start = s;
+        end = end.max(e);
+        runs.remove(&s);
+    }
+    while let Some((&s, &e)) = runs.range(start..).next() {
+        if s > end {
+            break;
+        }
+        end = end.max(e);
+        runs.remove(&s);
+    }
+    runs.insert(start, end);
+}
+
+/// Removes `[from, to)` from coalesced clean runs.
+fn clean_run_remove_range(runs: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let victims: Vec<(usize, usize)> = runs
+        .range(..to)
+        .filter_map(|(&s, &e)| (e > from).then_some((s, e)))
+        .collect();
+    for (s, e) in victims {
+        runs.remove(&s);
+        if s < from {
+            runs.insert(s, from);
+        }
+        if to < e {
+            runs.insert(to, e);
+        }
+    }
+}
+
+/// Notes `[from, to)` clean (set + coalesced runs).
+fn note_clean(g: &mut Guards, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    g.clean.extend(from..to);
+    clean_run_insert(&mut g.clean_runs, from, to);
+}
+
+/// Notes one block clean.
+fn note_clean_one(g: &mut Guards, block: usize) {
+    if g.clean.insert(block) {
+        clean_run_insert(&mut g.clean_runs, block, block + 1);
+    }
+}
+
+/// Whether `[first, last)` is entirely in one coalesced clean run.
+fn clean_run_covers(g: &Guards, first: usize, last: usize) -> bool {
+    if last <= first {
+        return true;
+    }
+    matches!(
+        g.clean_runs.range(..=first).next_back(),
+        Some((&s, &e)) if s <= first && e >= last
+    )
+}
 
 fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
     GUARDS.read().unwrap_or_else(|e| e.into_inner())
@@ -546,7 +623,12 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     // Fast path under the write lock: another thread may have cleaned it.
+    // Prefer coalesced runs (one lookup for a 174 MB heap) over walking the set.
+    if clean_run_covers(&g, first, last) {
+        return Some(written);
+    }
     if g.clean.range(first..last).count() == last - first {
+        clean_run_insert(&mut g.clean_runs, first, last);
         return Some(written);
     }
     // The range's clean blocks, in order: read off the set in one pass,
@@ -578,7 +660,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
+                note_clean_one(&mut g, block);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -722,7 +804,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        note_clean(g, from, to);
     };
     // One range check: per-block `in_place_covers` was the guards storm
     // (lock + scan of every loose/buffer entry per 64 KiB block).
@@ -763,6 +845,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
 /// hole that has since been committed without [`title_memory_remapped`]).
 fn range_unchanged_under_read(g: &Guards, first: usize, last: usize) -> Option<Vec<usize>> {
     if last <= first {
+        return Some(Vec::new());
+    }
+    // One coalesced run covers the whole ask (the title's big mapped heaps).
+    if clean_run_covers(g, first, last) {
         return Some(Vec::new());
     }
     let n = last - first;
@@ -853,6 +939,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
             i += 1;
             run_end += 1;
         }
+        clean_run_remove_range(&mut g.clean_runs, run_start, run_end);
         let mut old = 0;
         // SAFETY: blocks we made read-only.
         let ok = unsafe {
@@ -986,11 +1073,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    clean_run_remove_range(&mut g.clean_runs, range.start, range.end);
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
@@ -1135,11 +1223,19 @@ mod tests {
             let from = view / BLOCK;
             assert!(g.protected.contains(&from));
             assert!(g.protected.contains(&(from + 3)));
+            assert!(
+                clean_run_covers(&g, from, from + 4),
+                "guard should leave one coalesced clean run"
+            );
             assert!(open_here(&mut g, view, view + 4 * BLOCK));
             for b in from..from + 4 {
                 assert!(!g.protected.contains(&b), "block {b} still protected");
                 assert!(!g.clean.contains(&b), "block {b} still clean");
             }
+            assert!(
+                !clean_run_covers(&g, from, from + 4),
+                "open must drop the coalesced clean run"
+            );
         }
         // SAFETY: our view.
         unsafe {
