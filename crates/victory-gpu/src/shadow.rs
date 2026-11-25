@@ -2618,23 +2618,27 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer. Card copies already filled
-    /// by a merge skip the re-upload when title bytes match (`copy_card_diff`).
+    /// asking), whole pages within the buffer. First loads keep the kernel
+    /// read (`copy`); already-loaded runs read locally with hole checks
+    /// (`copy_card_diff` for card copies so identical bytes stay clean,
+    /// `copy_again` otherwise).
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
         // `(first page, first load)`: first loads always take [`copy`]; later
-        // card pages take [`copy_card_diff`] so identical bytes stay clean.
+        // pages take [`copy_card_diff`] (carded) or [`copy_again`] (non-carded).
         let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
         let last = (to - 1) / PAGE;
         let flush = |first_page: usize, first_load: bool, end: usize| -> usize {
             let a = (first_page * PAGE).max(from);
             let b = end.min(to);
-            if self.card.is_some() && !first_load {
+            if first_load {
+                self.copy(a, b)
+            } else if self.card.is_some() {
                 self.copy_card_diff(a, b)
             } else {
-                self.copy(a, b)
+                self.copy_again(a, b)
             }
         };
         for page in from / PAGE..=last {
@@ -2694,7 +2698,7 @@ impl Shadow {
                 let n = c_to - c_from;
                 let off = c_from - start;
                 scratch.resize(n, 0);
-                crate::host::copy_mapped(scratch.as_mut_ptr(), c_from as *const u8, n, false);
+                crate::host::copy_local(scratch.as_mut_ptr(), c_from as *const u8, n);
                 // SAFETY: inside the mapping; `copy_stale` only runs outside
                 // ranges shaders may still be writing (`self.pending`).
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
@@ -2707,6 +2711,24 @@ impl Shadow {
             }
         });
         copied
+    }
+
+    /// Copies title memory `[from, to)`, cut to the buffer, into the copy for
+    /// pages already copied once: reads committed spans locally and zeroes
+    /// holes ([`crate::host::copy_local`]) without kernel read calls.
+    fn copy_again(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+        let at = unsafe { self.data.add(from - start) };
+        crate::host::copy_local(at, from as *const u8, to - from);
+        // After the bytes are in: a snapshot taken meanwhile is not current.
+        self.changed(from - start, to - start);
+        self.card_changed(from - start, to - start);
+        to - from
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.

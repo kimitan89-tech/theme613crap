@@ -711,6 +711,127 @@ mod tests {
         }
     }
 
+    #[test]
+    fn copy_local_copies_committed_and_zeroes_holes_and_remaps() {
+        use windows_sys::Win32::System::Memory::*;
+        const N: usize = 6 << 16;
+        // SAFETY: we reserve a private region, commit selected pages inside it,
+        // and only directly write pages while they are `PAGE_READWRITE`.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), N, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let mut expected = vec![0u8; N];
+
+            let commit_fill = |offset: usize, value: u8, protect: Option<u32>| {
+                let at = base.add(offset);
+                assert_eq!(VirtualAlloc(at.cast(), 4096, MEM_COMMIT, PAGE_READWRITE), at.cast());
+                at.write_bytes(value, 4096);
+                if let Some(prot) = protect {
+                    let mut old = 0;
+                    assert_ne!(VirtualProtect(at.cast(), 4096, prot, &mut old), 0);
+                }
+            };
+
+            // Committed readable spans across multiple protection types, plus
+            // reserved (never committed), `PAGE_NOACCESS`, and `PAGE_GUARD` holes.
+            commit_fill(0, 0x09, None);
+            expected[..4096].fill(0x09);
+            commit_fill(1 << 16, 0x2a, Some(PAGE_READONLY));
+            expected[1 << 16..(1 << 16) + 4096].fill(0x2a);
+            commit_fill(2 << 16, 0x6b, Some(PAGE_READWRITE | PAGE_GUARD));
+            commit_fill(3 << 16, 0x7c, Some(PAGE_NOACCESS));
+            commit_fill(4 << 16, 0x4d, Some(PAGE_EXECUTE_READ));
+            expected[4 << 16..(4 << 16) + 4096].fill(0x4d);
+            commit_fill(N - 4096, 0x55, None);
+            expected[N - 4096..].fill(0x55);
+
+            for remap in [false, true] {
+                if remap {
+                    let mut old = 0;
+                    assert_ne!(VirtualProtect(base.cast(), 4096, PAGE_NOACCESS, &mut old), 0);
+                    expected[..4096].fill(0);
+                    assert_ne!(VirtualFree(base.add(4 << 16).cast(), 4096, MEM_DECOMMIT), 0);
+                    expected[4 << 16..(4 << 16) + 4096].fill(0);
+                    commit_fill(0x8000, 0xc7, None);
+                    expected[0x8000..0x8000 + 4096].fill(0xc7);
+                }
+                let mut out = vec![0xee; N];
+                super::copy_local(out.as_mut_ptr().add(27), base.add(27), N - 54);
+                assert_eq!(out[27..N - 27], expected[27..N - 27]);
+                assert!(out[..27].iter().chain(&out[N - 27..]).all(|&v| v == 0xee));
+
+                // `copy_local` must neither fault on nor clear `PAGE_GUARD`.
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_eq!(
+                    VirtualQuery(base.add(2 << 16).cast(), &mut info, size_of_val(&info)),
+                    size_of_val(&info)
+                );
+                assert_ne!(info.Protect & PAGE_GUARD, 0, "PAGE_GUARD preserved");
+            }
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn copy_local_handles_empty_partial_and_unaddressable_ranges() {
+        // Empty copy must be a no-op even with null pointers.
+        super::copy_local(std::ptr::null_mut(), std::ptr::null(), 0);
+        let mut dst = vec![0xeeu8; 128];
+        super::copy_local(dst.as_mut_ptr(), dst.as_ptr(), 0);
+        assert!(dst.iter().all(|&b| b == 0xee));
+
+        // Partial sub-page copy preserves surrounding bytes in `dst`.
+        let src: Vec<u8> = (0..256u16).map(|i| (i * 17 + 3) as u8).collect();
+        // SAFETY: slices are in-bounds for 77 bytes.
+        unsafe { super::copy_local(dst.as_mut_ptr().add(11), src.as_ptr().add(13), 77) };
+        assert!(dst[..11].iter().all(|&b| b == 0xee));
+        assert_eq!(&dst[11..88], &src[13..90]);
+        assert!(dst[88..].iter().all(|&b| b == 0xee));
+
+        // Unmapped low (`MEM_FREE`) and non-user-mode high addresses zero `dst` without panic.
+        dst.fill(0xee);
+        super::copy_local(dst.as_mut_ptr(), std::ptr::null(), 64);
+        assert!(dst[..64].iter().all(|&b| b == 0));
+        assert!(dst[64..].iter().all(|&b| b == 0xee));
+
+        dst.fill(0xee);
+        super::copy_local(dst.as_mut_ptr(), (usize::MAX - 15) as *const u8, 32);
+        assert!(dst[..32].iter().all(|&b| b == 0));
+        assert!(dst[32..].iter().all(|&b| b == 0xee));
+    }
+
+    #[test]
+    fn readable_protect_classifies_windows_flags() {
+        use windows_sys::Win32::System::Memory::*;
+        for ok in [
+            PAGE_READONLY,
+            PAGE_READWRITE,
+            PAGE_WRITECOPY,
+            PAGE_EXECUTE_READ,
+            PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY,
+            PAGE_READWRITE | PAGE_NOCACHE,
+            PAGE_READWRITE | PAGE_WRITECOMBINE,
+            PAGE_READONLY | PAGE_NOCACHE,
+        ] {
+            assert!(super::readable_protect(ok), "expected readable: {ok:#x}");
+        }
+        for bad in [
+            0,
+            PAGE_NOACCESS,
+            PAGE_NOACCESS | PAGE_NOCACHE,
+            PAGE_EXECUTE,
+            PAGE_READONLY | PAGE_GUARD,
+            PAGE_READWRITE | PAGE_GUARD,
+            PAGE_WRITECOPY | PAGE_GUARD,
+            PAGE_EXECUTE_READ | PAGE_GUARD,
+            PAGE_EXECUTE_READWRITE | PAGE_GUARD,
+            PAGE_EXECUTE_WRITECOPY | PAGE_GUARD,
+        ] {
+            assert!(!super::readable_protect(bad), "expected unreadable: {bad:#x}");
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -5758,6 +5879,100 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+}
+
+/// Whether a committed page's Windows protection flags allow plain user-space
+/// reads without faulting or tripping `PAGE_GUARD`.
+fn readable_protect(protect: u32) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    if protect & PAGE_GUARD != 0 {
+        return false;
+    }
+    matches!(
+        protect & 0xff,
+        PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY
+    )
+}
+
+/// Copies title memory into writable host memory without kernel read calls
+/// (`ReadProcessMemory` / `NtReadVirtualMemory`): asks `VirtualQuery` for each
+/// contiguous span, copies committed readable spans in user space, and fills
+/// holes (reserved, free, `PAGE_NOACCESS`, `PAGE_GUARD`, or non-readable
+/// protections) with zeros. Used for pages already copied once; never caches
+/// queries across copies because the title may remap the same address.
+pub(crate) fn copy_local(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    match crate::copystat::mode() {
+        1 => {
+            // SAFETY: timing only: the caller vouches for the source.
+            unsafe { std::ptr::copy(src, dst, len) };
+            return;
+        }
+        2 => return,
+        _ => {}
+    }
+    if len == 0 {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut offset = 0;
+    while offset < len {
+        let at = src.wrapping_add(offset);
+        let to = dst.wrapping_add(offset);
+        let remaining = len - offset;
+        #[cfg(feature = "diagnostics")]
+        let queried = std::time::Instant::now();
+        // SAFETY: the query inspects an address and fills a local structure.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::Queries, 1);
+            crate::copystat::add(
+                crate::copystat::C::QueryUs,
+                queried.elapsed().as_micros() as u64,
+            );
+        }
+        let n = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .saturating_sub(at as usize)
+            .min(remaining);
+        if size != size_of_val(&info) || n == 0 {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, remaining as u64);
+            // SAFETY: this path is only used with a writable host destination.
+            unsafe { to.write_bytes(0, remaining) };
+            break;
+        }
+        if info.State != MEM_COMMIT || !readable_protect(info.Protect) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+            // SAFETY: this path is only used with a writable host destination.
+            unsafe { to.write_bytes(0, n) };
+        } else {
+            #[cfg(feature = "diagnostics")]
+            let moved = std::time::Instant::now();
+            // SAFETY: `VirtualQuery` reported `[at, at + n)` committed and
+            // readable without `PAGE_GUARD`; `to` is writable host memory.
+            unsafe { std::ptr::copy(at, to, n) };
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::MoveUs,
+                moved.elapsed().as_micros() as u64,
+            );
+        }
+        offset += n;
+    }
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
