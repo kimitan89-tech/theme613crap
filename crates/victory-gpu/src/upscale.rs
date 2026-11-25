@@ -436,19 +436,31 @@ mod tests {
         );
 
         // Verify all console target formats that PC forbids directly now get
-        // promoted host copies.
-        for (w, h, fmt, flags, expected) in [
-            (16u64, 16u32, 67u32, 5u32, DXGI_FORMAT_R16G16B16A16_FLOAT),
-            (16, 16, 67, 4, DXGI_FORMAT_R16G16B16A16_FLOAT),
-            (16, 16, 86, 5, DXGI_FORMAT_R8G8B8A8_UNORM),
-            (16, 16, 115, 1, DXGI_FORMAT_R8G8B8A8_UNORM),
+        // promoted host copies. The 16-bit targets stand in as 8-bit RGBA
+        // only on hosts that refuse them for render target + unordered
+        // access; a host that takes the native format keeps it, so the
+        // expected host format is whatever `target_format` says.
+        // R9G9B9E5_SHAREDEXP promotes unconditionally: PC D3D12 forbids
+        // RTV/UAV for it on every host.
+        assert_eq!(
+            crate::resource::target_format(67),
+            DXGI_FORMAT_R16G16B16A16_FLOAT.0 as u32
+        );
+        for (w, h, fmt, flags) in [
+            (16u64, 16u32, 67u32, 5u32),
+            (16, 16, 67, 4),
+            (16, 16, 86, 5),
+            (16, 16, 115, 1),
         ] {
             let desc = tex_desc(w, h, fmt, flags);
             let mut r = null;
             assert_eq!(create(device, &heap, 0, &desc, 0, null_void, &iid, &mut r), S_OK);
             let host_tex = crate::resource::host_resource(r).expect("host texture promoted");
             // SAFETY: live host resource.
-            assert_eq!(unsafe { host_tex.GetDesc() }.Format, expected);
+            assert_eq!(
+                unsafe { host_tex.GetDesc() }.Format.0 as u32,
+                crate::resource::target_format(fmt)
+            );
             slot::<extern "system" fn(This) -> u32>(r, 0x10)(r);
         }
 
