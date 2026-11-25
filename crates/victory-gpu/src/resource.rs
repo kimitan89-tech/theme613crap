@@ -1799,8 +1799,14 @@ fn hand_out_resource(
     }
     #[cfg(windows)]
     if desc.dimension == BUFFER {
+        const UNORDERED_ACCESS: u32 = 0x4;
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        crate::shadow::register(
+            at,
+            resource.data() as u64,
+            desc.width,
+            desc.flags & UNORDERED_ACCESS != 0,
+        );
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }

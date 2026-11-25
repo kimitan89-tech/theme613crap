@@ -101,6 +101,9 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Counted under [`CARD_UAV_BYTES`] (a small `ALLOW_UNORDERED_ACCESS`
+    /// buffer placed on the card below [`card_limits`]' floor).
+    small_uav: bool,
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -159,6 +162,13 @@ fn card_limits() -> (u64, u64) {
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Bytes alive of small `ALLOW_UNORDERED_ACCESS` buffers on the card
+/// ([`card_uav_most`]).
+static CARD_UAV_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Small UAV buffers placed on the card since the start (throttled log).
+static CARD_UAV_PLACED: AtomicU64 = AtomicU64::new(0);
+
 /// The copies in the card's memory.
 static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 
@@ -178,6 +188,28 @@ pub(crate) fn card_stats() -> [u64; 10] {
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed) + WINDOW_CARD_BYTES.load(Ordering::Relaxed);
     out[9] = CARD_BYTES[1].load(Ordering::Relaxed);
     out
+}
+
+/// Whether `< 1 MiB` `ALLOW_UNORDERED_ACCESS` title buffers go to the
+/// card's memory (`VICTORY_CARD_UAV_BUFFERS`; on by default, `=0`
+/// disables). NVIDIA GPUs cannot L2-cache atomics in system RAM; those
+/// buffers are only tens of MB total and belong in GDDR6.
+fn card_uav_buffers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_UAV_BUFFERS").is_none_or(|v| v != "0"))
+}
+
+/// The most bytes of small UAV buffers on the card (`VICTORY_CARD_UAV_MB`,
+/// 256).
+fn card_uav_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_CARD_UAV_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(256)
+            << 20
+    })
 }
 
 /// The bytes of the hashes kept on the card for a copy of `size` bytes: 16
@@ -223,6 +255,53 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
     buffer
+}
+
+/// As [`card_for`], or a small `ALLOW_UNORDERED_ACCESS` buffer below the
+/// usual floor ([`card_uav_buffers`]). Returns `(buffer, small_uav)`.
+fn card_for_entry(size: u64, uav: bool) -> Option<(ID3D12Resource, bool)> {
+    let (least, most) = card_limits();
+    if size >= least {
+        return card_for(size).map(|b| (b, false));
+    }
+    if !(uav && card_uav_buffers() && cards() && size > 0 && size < 1 << 30) {
+        return None;
+    }
+    let host = host()?;
+    if !host.card_ready() {
+        return None;
+    }
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 10 * 8
+    {
+        return None;
+    }
+    let most_uav = card_uav_most();
+    if CARD_UAV_BYTES.fetch_add(size, Ordering::Relaxed) + size > most_uav {
+        CARD_UAV_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        CARD_UAV_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let buffer = host.uav_buffer(size);
+    if buffer.is_none() {
+        CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        CARD_UAV_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    let n = CARD_UAV_PLACED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        tracing::info!(
+            size,
+            placed = n,
+            on_card = CARD_UAV_BYTES.load(Ordering::Relaxed),
+            "a small unordered-access buffer's host copy is in the card's memory"
+        );
+    }
+    buffer.map(|b| (b, true))
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
@@ -477,6 +556,47 @@ mod card_tests {
     fn ranges_join_where_they_touch() {
         assert_eq!(joined(vec![(8, 12), (0, 4), (4, 6), (10, 20), (30, 31)]), [(0, 6), (8, 20), (30, 31)]);
         assert!(joined(Vec::new()).is_empty());
+    }
+
+    /// A sub-64 KiB unaligned range (skew 0xffe0, len 256) cuts into two
+    /// pieces with exact lo/hi inside `[0, len)` — what `CARD_COMPARE` hashes.
+    #[test]
+    fn sub_64kib_unaligned_span_cuts_two_pieces_without_oob() {
+        let start = 0x1000_ffe0usize;
+        let len = 256usize;
+        let span = card_span_of(start, 0, len);
+        assert_eq!(span.skew, 0xffe0);
+        assert_eq!(span.pieces, 2);
+        assert_eq!(card_piece_of(start, len, &span, 0), (0, 32));
+        assert_eq!(card_piece_of(start, len, &span, 1), (32, 256));
+        for i in 0..span.pieces {
+            let (lo, hi) = card_piece_of(start, len, &span, i);
+            assert!(lo < hi && hi <= len);
+            assert_eq!(shader_piece(&span, i), (lo as u32, hi as u32));
+        }
+    }
+}
+
+#[cfg(test)]
+mod uav_card_tests {
+    use super::{register, registered_uav, unregister};
+
+    /// `register` stores the unordered-access flag; only UAV entries are
+    /// eligible for the small-card path below the usual floor.
+    #[test]
+    fn register_stores_uav_flag_for_small_card_eligibility() {
+        let resource = 0xa110usize;
+        let start = 0xd_a110_0000u64;
+        register(resource, start, 160 << 10, true);
+        assert_eq!(registered_uav(resource, start), Some(true));
+        unregister(resource, start);
+        register(resource, start, 160 << 10, false);
+        assert_eq!(registered_uav(resource, start), Some(false));
+        // Small non-UAV stays below the card floor eligibility rule.
+        let size = (160u64 << 10).next_multiple_of(1 << 16);
+        assert!(size < 1 << 20, "fixture stays under the card floor");
+        unregister(resource, start);
+        assert_eq!(registered_uav(resource, start), None);
     }
 }
 
@@ -1433,6 +1553,9 @@ impl Drop for Shadow {
                 WINDOW_CARD_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             } else {
                 CARD_BYTES[0].fetch_sub(card.size, Ordering::Relaxed);
+            }
+            if card.small_uav {
+                CARD_UAV_BYTES.fetch_sub(card.size, Ordering::Relaxed);
             }
             if card.before.get_mut().unwrap_or_else(|e| e.into_inner()).is_some() {
                 CARD_BYTES[1].fetch_sub(card_hash_bytes(card.size), Ordering::Relaxed);
@@ -2690,6 +2813,9 @@ impl Shadow {
 
 struct Entry {
     end: u64,
+    /// `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`: eligible for a small
+    /// card-side copy below [`card_limits`]' floor.
+    uav: bool,
     shadow: Option<Arc<Shadow>>,
 }
 
@@ -2700,15 +2826,23 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// A title buffer exists at `start` (`len` bytes).
-pub(crate) fn register(resource: usize, start: u64, len: u64) {
+/// A title buffer exists at `start` (`len` bytes). `uav`: the title created
+/// it with `ALLOW_UNORDERED_ACCESS`.
+pub(crate) fn register(resource: usize, start: u64, len: u64, uav: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
+            uav,
             shadow: None,
         },
     );
+}
+
+/// The unordered-access flag stored for `(start, resource)`, if registered.
+#[cfg(test)]
+fn registered_uav(resource: usize, start: u64) -> Option<bool> {
+    buffers().get(&(start, resource)).map(|e| e.uav)
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -2863,33 +2997,36 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let size = len.next_multiple_of(1 << 16);
-        // In place, if asked for and the memory can be opened
-        // (`crate::inplace::place_for`): the buffer is the title's own
-        // memory. Not the big ones `cards` puts in the card's memory: those
-        // are read too often to stay in the PC's.
-        let big = cards() && size >= card_limits().0;
-        if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
+        let uav = entry.uav;
+        // Prefer the card for big copies and for small UAV atomics
+        // ([`card_uav_buffers`]): do not place those in system RAM.
+        let want_card = cards() && (size >= card_limits().0 || (uav && card_uav_buffers()));
+        if !want_card && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
-            Some(on_card) => {
+        // With `cards`: shaders get a buffer in the card's own memory, and
+        // the one just made is the CPU's side. Small UAV buffers that miss
+        // the VRAM cap fall back to the shared buffer as before.
+        let (buffer, card) = match card_for_entry(size, uav) {
+            Some((on_card, small_uav)) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
+                if !small_uav {
+                    tracing::info!(
+                        start = format_args!("{:#x}", key.0),
+                        len,
+                        "a buffer's host copy is in the card's memory"
+                    );
+                }
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    small_uav,
                 };
                 (on_card, Some(card))
             }
@@ -3106,6 +3243,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                small_uav: false,
             };
             (on_card, Some(card))
         }

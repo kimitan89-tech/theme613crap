@@ -338,24 +338,6 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
-    if start >= end {
-        return Vec::new();
-    }
-    let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
-    }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
-    }
-    out
-}
-
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
@@ -368,6 +350,50 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
         return Vec::new();
     }
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+}
+
+/// Alias pages in `[start, end)` that share 2..=[`crate::watch::MANY_VIEWS`]
+/// views: `(block index, shown addresses)`. Acquires the views table once.
+pub(crate) fn aliases_between(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    if start >= end {
+        return Vec::new();
+    }
+    let v = views();
+    let mut overlapping = Vec::new();
+    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
+        && base + bytes > start
+    {
+        overlapping.push((base, bytes));
+    }
+    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
+        overlapping.push((base, bytes));
+    }
+    let from = start / K64;
+    let to = end.div_ceil(K64);
+    let mut out = Vec::new();
+    for (base, bytes) in overlapping {
+        let first = (base / K64).max(from);
+        let last = (base.saturating_add(bytes).div_ceil(K64)).min(to);
+        for block in first..last {
+            let page = block * K64;
+            let Some((&vbase, &(vbytes, section, offset))) = v.views.range(..=page).next_back() else {
+                continue;
+            };
+            let within = page.wrapping_sub(vbase);
+            if within >= vbytes || !within.is_multiple_of(K64) {
+                continue;
+            }
+            let shown = v
+                .pages
+                .get(&(section, offset + within as u64))
+                .cloned()
+                .unwrap_or_default();
+            if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+                out.push((block, shown));
+            }
+        }
+    }
+    out
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -1115,6 +1141,27 @@ pub(crate) fn tick() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two views of the same section pages: `aliases_between` returns both
+    /// addresses in one lock.
+    #[test]
+    fn aliases_between_returns_both_views_of_shared_pages() {
+        let a = 0x7_9000_0000usize;
+        let b = 0x7_9100_0000usize;
+        title_memory_view(a, 2 * K64, 42, 0);
+        title_memory_view(b, 2 * K64, 42, 0);
+        let aliases = aliases_between(a, a + 2 * K64);
+        assert_eq!(aliases.len(), 2);
+        let (_, shown0) = aliases.iter().find(|(block, _)| *block == a / K64).expect("block 0");
+        assert!(shown0.contains(&a) && shown0.contains(&b), "{shown0:?}");
+        let (_, shown1) = aliases
+            .iter()
+            .find(|(block, _)| *block == a / K64 + 1)
+            .expect("block 1");
+        assert!(shown1.contains(&(a + K64)) && shown1.contains(&(b + K64)), "{shown1:?}");
+        views_gone(a, 2 * K64);
+        views_gone(b, 2 * K64);
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over

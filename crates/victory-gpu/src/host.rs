@@ -1599,16 +1599,16 @@ fn rehash_runs() -> bool {
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// Whether what shaders wrote to copies in the card's memory is merged
-/// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
-/// default). The pieces the card's compare found differing come down in
-/// one fetch and were then merged one after the other on the thread that
-/// settles: about 630 pieces and 40 MB a frame (run 104), each compared
-/// with the copy's CPU side byte by byte and put into title memory through
-/// the kernel. A piece is its own bytes of its copy and of title memory,
-/// so eight threads take an eighth of them each.
+/// into title memory on several threads (`VICTORY_WIDE_MERGE`; on by
+/// default, `=0` disables). The pieces the card's compare found differing
+/// come down in one fetch and were then merged one after the other on the
+/// thread that settles: about 630 pieces and 40 MB a frame (run 104), each
+/// compared with the copy's CPU side byte by byte and put into title memory
+/// through the kernel. A piece is its own bytes of its copy and of title
+/// memory, so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_none_or(|v| v != "0"))
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -3503,13 +3503,51 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+        let mut written = 0usize;
+        if wide_merge() && pieces.len() >= 4 {
+            // One job per copy: `card_merge_relay` takes that copy's lock,
+            // and pieces of one copy are disjoint. `relay_fetched` stays
+            // after every job returns.
+            use std::collections::HashMap;
+            use std::sync::atomic::AtomicUsize;
+            let fetched = data;
+            let total_written = std::sync::Arc::new(AtomicUsize::new(0));
+            let mut by_copy: HashMap<usize, Vec<_>> = HashMap::new();
+            for (shadow, lo, hi, at) in pieces {
+                by_copy
+                    .entry(std::sync::Arc::as_ptr(&shadow) as usize)
+                    .or_default()
+                    .push((shadow, lo, hi, at));
+            }
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = by_copy
+                .into_values()
+                .map(|chunk| {
+                    let total_written = total_written.clone();
+                    Box::new(move || {
+                        let mut title = Vec::new();
+                        let mut w = 0usize;
+                        for (shadow, lo, hi, at) in chunk {
+                            // SAFETY: the mapping of the fetched bytes; the
+                            // copy into it has run, and the caller waits.
+                            let gpu = unsafe {
+                                std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo)
+                            };
+                            w += shadow.card_merge_relay(lo, gpu, after, &mut title);
+                        }
+                        total_written.fetch_add(w, Ordering::Relaxed);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            written = total_written.load(Ordering::Relaxed);
+        } else {
+            let mut title = Vec::new();
+            for (shadow, lo, hi, at) in &pieces {
+                // SAFETY: the mapping of the fetched bytes, `total` of them;
+                // the copy into it has run.
+                let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
+                written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            }
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -5189,9 +5227,10 @@ impl HostList {
         scratch.chunks.iter().map(|c| c.1).sum()
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
-    /// submission of the list from the first use after a reset on.
-    pub(crate) fn budget(&self) -> Option<u64> {
+    /// The list's indirect-work budget buffer and its GPU address, zeroed at
+    /// each submission of the list from the first use after a reset on.
+    /// The resource is needed for a targeted UAV barrier around the clamp.
+    pub(crate) fn budget_resource(&self) -> Option<(&ID3D12Resource, u64)> {
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -5218,7 +5257,7 @@ impl HostList {
             })));
         }
         // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer, unsafe { buffer.GetGPUVirtualAddress() }))
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
