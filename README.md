@@ -8,10 +8,11 @@ of the title. Not affiliated with or endorsed by its developer or publisher.
 
 ## Status
 
-Integrates the **ztrx** (`90b529f`) world-rendering and performance core on
-top of VIctory, plus Series S multi-plane `PresentX` compositing and a
-bilinear FFX upscaler for 1080p Series S presentation on modest GPUs
-(e.g. RTX 3050 laptop).
+Integrates the **ztrx** (`90b529f`) world-rendering and performance core and
+**victory-amd** (`070df42`) streaming/view-guard/shader-warming fixes on top
+of VIctory, plus Series S multi-plane `PresentX` compositing and a bilinear
+FFX upscaler for 1080p Series S presentation on modest GPUs (e.g. RTX 3050
+laptop).
 
 ## Requirements
 
@@ -43,13 +44,18 @@ powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your title fol
 (a DualShock/DualSense through DS4Windows works). With no pad connected the
 keyboard acts as one while the title window has focus.
 
-## Series S / performance settings (optional, off by default)
+## Series S / performance & streaming settings
 
 | Switch | Effect |
 |---|---|
-| `VICTORY_RELAY=2` | relay presentation / reduce CPU wait |
-| `VICTORY_LATE_WAIT=3` | defer GPU waits |
-| `VICTORY_WIDE_BACK=1` | wider copy-back windows |
+| `victory warm <title.exe>` | pre-translate shaders into the disk cache before play |
+| `VICTORY_RELAY=2` | relay presentation / reduce CPU wait (off by default) |
+| `VICTORY_LATE_WAIT=3` | defer GPU waits (off by default) |
+| `VICTORY_WIDE_BACK=1` | wider copy-back windows (off by default) |
+| `VICTORY_VIEW_GUARD=0` | disable cross-view page write tracking (on by default) |
+| `VICTORY_HEAP_RECHECK=0` | disable delayed re-checks of indexed textures (on by default) |
+| `VICTORY_TEXTURE_SWEEP=0` | disable recovery sweep for lost placed-texture views (on by default) |
+| `VICTORY_RT_RESOLVE=1` | compile ray-tracing resolve shaders when BVH builder is off |
 | (Series S 1080p) | multi-plane `PresentX` compositing + bilinear FFX upscaler are built in |
 
 Set env vars in PowerShell before running the script. Example:
@@ -76,7 +82,8 @@ GPL-3.0-or-later (see `LICENSE`).
 
 Credits (in no particular order of importance beyond lineage):
 
-- **VIctory** — Marvisak & contributors (upstream base)
-- **victory-fork** — fxceless
+- **VIctory** — Marvisak & contributors (upstream base, incl. `#1122` by tightfall)
+- **victory-fork** — fxceless (incl. `#115` by Spexivus with correction by joroyt)
 - **ztrx** — Zettrox & contributors (commit `90b529f`: world rendering, Wave64-on-Wave32, shader opts, relay/late-wait/wide-back, pipeline prewarm, …)
+- **victory-amd** — myokex & contributors (commit `070df42`: partial-mip detiling, true texture spans, split >65,535 dispatches, DirectStorage page-array reads, persistent early pipelines, cross-view page guard, indexed texture re-check, `warm` CLI)
 - **XCL** — ivall & contributors
