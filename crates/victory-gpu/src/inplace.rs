@@ -82,9 +82,13 @@ pub(crate) fn probe_level() -> u8 {
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
-/// it). The title's heaps are allocated once and kept, and nothing of the
-/// kind was seen; [`title_memory_freeing`] is there for the runtime to
-/// call before such a call once it takes them over.
+/// it). The view guard (`VICTORY_VIEW_GUARD`) also skips those pages
+/// (`shadow::in_place_covers`) so it never asks `VirtualProtect` on an
+/// in-place heap. Safe with `VICTORY_RELAY` (the card reads title memory
+/// itself; no copy-back). Do not combine stage 2 with `VICTORY_LATE_WAIT`
+/// (see above). The title's heaps are allocated once and kept, and
+/// nothing of the kind was seen; [`title_memory_freeing`] is there for
+/// the runtime to call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))

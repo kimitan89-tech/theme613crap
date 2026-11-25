@@ -53,6 +53,10 @@ keyboard acts as one while the title window has focus.
 | `VICTORY_LATE_WAIT=3` | defer GPU waits (off by default) |
 | `VICTORY_WIDE_BACK=1` | wider copy-back windows (off by default) |
 | `VICTORY_VIEW_GUARD=0` | disable cross-view page write tracking (on by default) |
+| `VICTORY_CARD_REHASH_RUNS=0` | disable joining card hash passes (on by default) |
+| `VICTORY_JOIN_COPIES=0` | disable joining consecutive title buffer copies (on by default) |
+| `VICTORY_SWEEP_PRESSURE=0` | disable faster idle reclaim when RAM load ≥ 85% (on by default) |
+| `VICTORY_INPLACE=1` / `=2` | place windows (1) or title buffers too (2) over title pages; skips view-guard on those pages |
 | `VICTORY_HEAP_RECHECK=0` | disable delayed re-checks of indexed textures (on by default) |
 | `VICTORY_TEXTURE_SWEEP=0` | disable recovery sweep for lost placed-texture views (on by default) |
 | `VICTORY_RT_RESOLVE=1` | compile ray-tracing resolve shaders when BVH builder is off |

@@ -430,8 +430,11 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    const IDLE_MS: u64 = 10_000;
-    const IDLE_FRAMES: u64 = 4;
+    let (idle_ms, idle_frames) = if crate::host::memory_pressure() {
+        (2_000, 2)
+    } else {
+        (10_000, 4)
+    };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let Some(map) = map.as_mut() else {
         return;
@@ -442,7 +445,7 @@ pub(crate) fn let_go_idle() {
     let (mut went, mut bytes) = (0u64, 0u64);
     map.retain(|_, s| {
         let keep = Arc::strong_count(s) > 1
-            || !crate::host::long_ago(s.used.load(Relaxed), IDLE_MS, IDLE_FRAMES);
+            || !crate::host::long_ago(s.used.load(Relaxed), idle_ms, idle_frames);
         if !keep {
             LET_GO[0].fetch_add(1, Relaxed);
             LET_GO[1].fetch_add(s.bytes, Relaxed);

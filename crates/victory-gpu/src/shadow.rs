@@ -1565,8 +1565,13 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// The next read of that memory makes a new copy and copies the window
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
-    const IDLE_MS: u64 = 10_000;
-    const IDLE_FRAMES: u64 = 4;
+    // Under memory pressure (16 GB hosts paging during `copies`): reclaim
+    // sooner so duplicate shadow windows do not push the machine to 93%.
+    let (idle_ms, idle_frames) = if crate::host::memory_pressure() {
+        (2_000, 2)
+    } else {
+        (10_000, 4)
+    };
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -1575,7 +1580,7 @@ pub(crate) fn let_go_idle() {
             .iter()
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), IDLE_MS, IDLE_FRAMES)
+                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, idle_frames)
                     && crate::host::references(&s.buffer) == 1
             })
             .map(|(key, _)| *key)
@@ -2727,6 +2732,30 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
+}
+
+/// Whether title memory `[at, at + len)` is covered by a buffer or window
+/// placed over the title's own pages (`crate::inplace`). Those pages must
+/// not be made `PAGE_READONLY` by the view guard: the host heap stands on
+/// them, and `VirtualProtect` fails (error 87) or would break GPU access.
+pub(crate) fn in_place_covers(at: usize, len: usize) -> bool {
+    if crate::inplace::level() == 0 || len == 0 {
+        return false;
+    }
+    let start = at as u64;
+    let end = start.saturating_add(len as u64);
+    {
+        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        if loose.iter().any(|(key, shadow)| {
+            shadow.place.is_some() && key.0 < end && key.0.saturating_add(key.1) > start
+        }) {
+            return true;
+        }
+    }
+    let map = buffers();
+    map.range(..(end, 0)).rev().take(256).any(|(_, entry)| {
+        entry.end > start && entry.shadow.as_ref().is_some_and(|s| s.place.is_some())
+    })
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
