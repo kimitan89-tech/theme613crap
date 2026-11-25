@@ -307,6 +307,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // Known view memory before taking the journal: `GetWriteWatch` fails
+    // on views and forces a binary-split walk (the title's 174 MB heap was
+    // asked ~10×/frame). `inplace::cover` takes no journal/guards lock.
+    let cover_view = guarded && crate::inplace::cover(start, 1) != crate::inplace::Cover::None;
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
@@ -319,35 +323,50 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 .collect(),
         ));
     }
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    // Lock order stays JOURNAL → GUARDS (as `guard` takes `GUARDS`).
+    let known_view = cover_view || {
+        guarded && {
+            let g = guards();
+            g.protected.contains(&(start / BLOCK)) || g.absent.contains(&(start / BLOCK))
+        }
+    };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
-        if !guarded {
-            return None;
-        }
+    let (count, guarded_pages) = if known_view {
         #[cfg(feature = "diagnostics")]
         let guarding = std::time::Instant::now();
         let written = guard(first * PAGE, last * PAGE);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
-        written?
+        (0usize, written?)
     } else {
-        Vec::new()
+        let mut count = (last - first) * PAGE / KERNEL_PAGE;
+        j.found.resize(count.max(j.found.len()), 0);
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                j.found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if failed {
+            if !guarded {
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            let guarding = std::time::Instant::now();
+            let written = guard(first * PAGE, last * PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardUs, guarding.elapsed().as_micros() as u64);
+            (0usize, written?)
+        } else {
+            (count, Vec::new())
+        }
     };
     #[cfg(feature = "diagnostics")]
     {
@@ -358,7 +377,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
+    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded_pages);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
@@ -424,16 +443,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    // Fast path: every block is already clean — no Vec allocation.
+    if g.clean.range(first..last).count() == last - first {
+        return Some(written);
+    }
     // The range's clean blocks, in order: read off the set in one pass,
     // not looked up one block at a time. A frame asks about some 10 GB of
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
     let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
-        // Nothing written, mapped or new since the range was last taken.
-        return Some(written);
-    }
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     for block in first..=last {
@@ -611,16 +630,28 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    let skip_inplace = |block: usize| {
-        crate::shadow::in_place_covers(block.saturating_mul(BLOCK), BLOCK)
-    };
-    // Whole range only when no in-place block is inside it.
-    if !(from..to).any(skip_inplace) && set(from, to) {
-        note(g, from, to);
+    // One range check: per-block `in_place_covers` was the guards storm
+    // (lock + scan of every loose/buffer entry per 64 KiB block).
+    let has_inplace = crate::shadow::in_place_covers(
+        from.saturating_mul(BLOCK),
+        to.saturating_sub(from).saturating_mul(BLOCK),
+    );
+    if !has_inplace {
+        if set(from, to) {
+            note(g, from, to);
+            return;
+        }
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+        }
         return;
     }
     for block in from..to {
-        if skip_inplace(block) {
+        if crate::shadow::in_place_covers(block.saturating_mul(BLOCK), BLOCK) {
             continue;
         }
         if set(block, block + 1) {
@@ -859,6 +890,46 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// Guarded view memory whose blocks are already clean returns without
+    /// allocating a dirty list, and a later write is still seen.
+    #[test]
+    fn clean_view_blocks_fast_path_still_sees_writes() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, PAGE_READWRITE,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        // First ask guards the view (may report every block as newly taken).
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        // Second ask: every block clean — empty without error (no Vec walk).
+        assert_eq!(guard(view, view + 2 * BLOCK), Some(Vec::new()));
+        // A title write through the view faults into the handler and opens
+        // the block; the next guard reports it written.
+        // SAFETY: committed view bytes of ours.
+        unsafe { ((view + 8) as *mut u8).write_volatile(0xab) };
+        let written = guard(view, view + 2 * BLOCK).expect("view");
+        assert!(written.contains(&(view / PAGE)), "write must be seen: {written:?}");
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, 2 * BLOCK);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

@@ -1360,13 +1360,20 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
+        // Always rescan what changed; each pass also walks 1/16 of all
+        // slots (and prunes that bucket's stale keys) so a released view
+        // goes within 16 frames without clearing ~83,000 slots in one hitch.
+        let bucket = (*passes % 16) as u32;
+        let all = host.buffer_slots();
+        let all_set: std::collections::HashSet<u32> = all.iter().copied().collect();
+        let mut scan: std::collections::HashSet<u32> = host.buffer_changes().into_iter().collect();
+        for &index in &all {
+            if index % 16 == bucket {
+                scan.insert(index);
+            }
+        }
+        ranges.retain(|k, _| *k % 16 != bucket || all_set.contains(k));
+        let slots: Vec<u32> = scan.into_iter().collect();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
         // it is named below.

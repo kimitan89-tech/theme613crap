@@ -16,8 +16,8 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -142,16 +142,17 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
-/// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
-/// 1,650 MB of the card's budget free.
+/// `VICTORY_CARD_BUFFERS_MIN_MB` (1) and `VICTORY_CARD_BUFFERS_MB` (1024).
+/// Live Series S runs left 113–132 MB/frame on the CPU with the old 16/512
+/// floor; `MIN_MB=1` and `MB=1024` cut that to ~1.8 MB while card buffers
+/// stayed inside a 6 GB card's budget (~657 MB).
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
         let mb = |name: &str, default: u64| {
             std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
         };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 1).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 1024))
     })
 }
 
@@ -385,6 +386,33 @@ fn card_span_of(start: usize, from: usize, to: usize) -> CardSpan {
 fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, usize) {
     let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
     (lo.max(span.from as usize), hi.min(span.to as usize))
+}
+
+#[cfg(test)]
+mod in_place_cover_tests {
+    use super::{in_place_covers, register_in_place, unregister_in_place};
+
+    /// The lightweight tracker answers overlaps without locking LOOSE/BUFFERS,
+    /// and drop removes the span.
+    #[test]
+    fn in_place_covers_tracks_register_and_drop() {
+        assert!(!in_place_covers(0, 0));
+        assert!(!in_place_covers(0x1000, 0x100));
+        register_in_place(0x1000, 0x100); // [0x1000, 0x1100)
+        assert!(in_place_covers(0x1000, 1));
+        assert!(in_place_covers(0x10f0, 0x20)); // overlaps end
+        assert!(!in_place_covers(0x1100, 0x10)); // touches end only
+        assert!(!in_place_covers(0x0f00, 0x100)); // touches start only
+        assert!(in_place_covers(0x0f80, 0x100)); // overlaps start
+        register_in_place(0x2000, 0x80);
+        assert!(in_place_covers(0x2010, 0x10));
+        assert!(!in_place_covers(0x1800, 0x100));
+        unregister_in_place(0x1000, 0x100);
+        assert!(!in_place_covers(0x1050, 0x10));
+        assert!(in_place_covers(0x2010, 0x10));
+        unregister_in_place(0x2000, 0x80);
+        assert!(!in_place_covers(0x2010, 0x10));
+    }
 }
 
 #[cfg(test)]
@@ -1390,6 +1418,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
+            unregister_in_place(self.start, self.len);
             crate::inplace::gone(self.window, self.len);
             return;
         }
@@ -1689,6 +1718,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        register_in_place(start, len);
         shadow
     }
 
@@ -1746,11 +1776,17 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back. With late wait / relay the range
+        // still joins `Line::written` so a host read of that memory settles
+        // the flight first.
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            if crate::host::late() {
+                let len = len.min(self.left(address));
+                list.defer_in_place_write(address as usize, len as usize);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -2734,28 +2770,46 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// How many in-place buffers / windows are alive ([`IN_PLACE_RANGES`]).
+static IN_PLACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Sorted `(start, end)` spans of title memory that stand in place. Kept
+/// beside `LOOSE` / `BUFFERS` so [`in_place_covers`] never locks those maps
+/// (protect walks every 64 KiB block of a range).
+static IN_PLACE_RANGES: RwLock<Vec<(u64, u64)>> = RwLock::new(Vec::new());
+
+fn register_in_place(start: u64, len: u64) {
+    let end = start.saturating_add(len);
+    let mut ranges = IN_PLACE_RANGES.write().unwrap_or_else(|e| e.into_inner());
+    let at = ranges.partition_point(|(s, _)| *s < start);
+    ranges.insert(at, (start, end));
+    IN_PLACE_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+fn unregister_in_place(start: u64, len: u64) {
+    let end = start.saturating_add(len);
+    let mut ranges = IN_PLACE_RANGES.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = ranges.iter().position(|&(s, e)| s == start && e == end) {
+        ranges.remove(i);
+        IN_PLACE_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Whether title memory `[at, at + len)` is covered by a buffer or window
 /// placed over the title's own pages (`crate::inplace`). Those pages must
 /// not be made `PAGE_READONLY` by the view guard: the host heap stands on
 /// them, and `VirtualProtect` fails (error 87) or would break GPU access.
 pub(crate) fn in_place_covers(at: usize, len: usize) -> bool {
-    if crate::inplace::level() == 0 || len == 0 {
+    if len == 0 || IN_PLACE_COUNT.load(Ordering::Relaxed) == 0 {
         return false;
     }
     let start = at as u64;
     let end = start.saturating_add(len as u64);
-    {
-        let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        if loose.iter().any(|(key, shadow)| {
-            shadow.place.is_some() && key.0 < end && key.0.saturating_add(key.1) > start
-        }) {
-            return true;
-        }
-    }
-    let map = buffers();
-    map.range(..(end, 0)).rev().take(256).any(|(_, entry)| {
-        entry.end > start && entry.shadow.as_ref().is_some_and(|s| s.place.is_some())
-    })
+    let ranges = IN_PLACE_RANGES.read().unwrap_or_else(|e| e.into_inner());
+    // Spans are sorted by start: skip those that end at or before `start`,
+    // stop once a span starts at or after `end`.
+    let at = ranges.partition_point(|&(_, e)| e <= start);
+    ranges[at..].iter().take_while(|(s, _)| *s < end).any(|&(s, e)| s < end && e > start)
 }
 
 /// The copy of the innermost title buffer holding `[address, address +
