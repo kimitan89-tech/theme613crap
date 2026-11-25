@@ -263,24 +263,74 @@ fn fresh_list() -> Option<crate::host::HostList> {
 /// kept for [`fresh_list`].
 #[cfg(windows)]
 pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
+    recycle_all(vec![(lists, ran.to_vec())]);
+}
+
+/// [`recycle`] for several settled flights at once: drops their state and
+/// upload buffers, then resets up to [`IDLE_MOST`] ran host lists in
+/// parallel across worker buckets before returning them to [`IDLE`].
+#[cfg(windows)]
+pub(crate) fn recycle_all(batches: Vec<(Vec<Detached>, Vec<usize>)>) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
-        // The descriptor slots and the upload memory its commands named.
-        drop(_state);
-        drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
-            continue;
+    let current_idle = IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len();
+    let mut room = IDLE_MOST.0.saturating_sub(current_idle);
+    let mut to_reset = Vec::new();
+    for (lists, ran) in batches {
+        for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+            // The descriptor slots and the upload memory its commands named.
+            drop(_state);
+            drop(_uploads);
+            if room == 0 || !ran.contains(&i) {
+                continue;
+            }
+            room -= 1;
+            to_reset.push(host);
         }
-        // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
-        let bytes = host.scratch_kept();
-        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
-            idle.0.push(Idle(host, bytes));
-            idle.1 += bytes;
+    }
+    if to_reset.is_empty() {
+        return;
+    }
+    let ready: Vec<Idle> = if to_reset.len() >= 4 {
+        let n_buckets = to_reset.len().min(4);
+        let mut buckets: Vec<Vec<Idle>> = (0..n_buckets).map(|_| Vec::new()).collect();
+        for (idx, host) in to_reset.into_iter().enumerate() {
+            buckets[idx % n_buckets].push(Idle(host, 0));
+        }
+        let out = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+            .into_iter()
+            .filter(|b| !b.is_empty())
+            .map(|mut chunk| {
+                let out = out.clone();
+                Box::new(move || {
+                    for entry in &mut chunk {
+                        entry.0.reset();
+                        entry.1 = entry.0.scratch_kept();
+                    }
+                    out.lock().unwrap_or_else(|e| e.into_inner()).extend(chunk);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let mut guard = out.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    } else {
+        to_reset
+            .into_iter()
+            .map(|host| {
+                host.reset();
+                let bytes = host.scratch_kept();
+                Idle(host, bytes)
+            })
+            .collect()
+    };
+    let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in ready {
+        if idle.0.len() < IDLE_MOST.0 && idle.1 + entry.1 <= IDLE_MOST.1 {
+            idle.1 += entry.1;
+            idle.0.push(entry);
         }
     }
 }
@@ -1300,16 +1350,25 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
+        && len > 0
     {
+        let overlaps = dst < src.saturating_add(len) && src < dst.saturating_add(len);
         let len = len as usize;
-        list.defer(move || {
-            if crate::texture::committed(src as *const u8, len)
-                && crate::texture::committed(dst as *const u8, len)
-            {
-                // SAFETY: both ranges are committed title memory.
-                unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
-            }
-        });
+        if !overlaps {
+            // Non-overlapping copy: route through `Step::Copy` so contiguous
+            // copies coalesce, `ask_once` stays intact, and guarded views open.
+            list.defer_copy(dst as *mut u8, src as *const u8, len);
+        } else {
+            list.defer(move || {
+                if crate::texture::committed(src as *const u8, len)
+                    && crate::texture::committed(dst as *const u8, len)
+                {
+                    crate::watch::writing(dst as usize, len);
+                    // SAFETY: both ranges are committed title memory; guards opened.
+                    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, len) };
+                }
+            });
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);

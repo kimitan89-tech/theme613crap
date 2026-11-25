@@ -295,7 +295,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -314,9 +314,11 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
+    // Return `j.asked` (not `j.ahead_asked`) so writes recorded via `wrote()`
+    // during this submission are marked current once copied.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         return Some((
-            j.ahead_asked,
+            j.asked,
             j.written
                 .range(first..last)
                 .map(|(&p, &w)| (p, w))
@@ -1099,6 +1101,48 @@ mod tests {
             )
             .is_none()
         );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Under `ask_once`, `wrote()` bumps `j.asked`, and `writes()` returns
+    /// `j.asked` so a copied page is not treated as stale on the next flush
+    /// of the same submission, while a second `wrote()` is seen as newer.
+    #[test]
+    fn ask_once_wrote_advances_timestamp_without_redundant_dirty() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let end = p + 2 * PAGE;
+        ask_once(&[(p, end)]);
+        wrote(p, PAGE);
+        let (now1, w1) = writes(p, end, false).expect("covered by ask_once");
+        let ts1 = w1.iter().find(|&&(pg, _)| pg == p / PAGE).expect("page noted").1;
+        assert!(now1 >= ts1, "returned now ({now1}) must cover wrote ts ({ts1})");
+        // Second refresh without another write: write ts is not newer than now1.
+        let (now2, w2) = writes(p, end, false).expect("still covered");
+        let ts2 = w2.iter().find(|&&(pg, _)| pg == p / PAGE).expect("page noted").1;
+        assert_eq!(ts2, ts1);
+        assert!(ts2 <= now1 && now2 >= now1);
+        // Another write in the same submission bumps ts above now1.
+        wrote(p, PAGE);
+        let (now3, w3) = writes(p, end, false).expect("still covered after second write");
+        let ts3 = w3.iter().find(|&&(pg, _)| pg == p / PAGE).expect("page noted").1;
+        assert!(ts3 > now1 && now3 >= ts3);
+        ask_once_end();
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            for pg in p / PAGE..end / PAGE {
+                j.written.remove(&pg);
+            }
+        }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }

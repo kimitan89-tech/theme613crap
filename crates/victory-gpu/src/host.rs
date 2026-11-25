@@ -1693,6 +1693,13 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+type DeferredDrops = (
+    Vec<Step>,
+    Vec<ID3D12Resource>,
+    Vec<windows::core::IUnknown>,
+    Vec<(ID3D12Resource, usize, [usize; 3])>,
+);
+
 impl Deferred {
     /// Holds `buffer` (`size` bytes of upload memory) until the list is
     /// reset.
@@ -1701,6 +1708,34 @@ impl Deferred {
         ALIVE[7].fetch_add(size, Ordering::Relaxed);
         self.upload_bytes += size;
         self.uploads.push(buffer);
+    }
+
+    /// Clears deferred work while keeping Vec/HashSet capacities (capped so a
+    /// spike does not stick forever) and returns heavy owned vectors to drop
+    /// outside the `HostList::deferred` lock.
+    fn reset_for_reuse(&mut self) -> DeferredDrops {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.upload_bytes = 0;
+        self.budget_zeroed = false;
+        self.refreshed.clear();
+        if self.refreshed.capacity() > 1024 {
+            self.refreshed.shrink_to(1024);
+        }
+        self.textures.clear();
+        if self.textures.capacity() > 1024 {
+            self.textures.shrink_to(1024);
+        }
+        self.writes.clear();
+        if self.writes.capacity() > 1024 {
+            self.writes.shrink_to(1024);
+        }
+        (
+            std::mem::take(&mut self.copies),
+            std::mem::take(&mut self.uploads),
+            std::mem::take(&mut self.kept),
+            std::mem::take(&mut self.backs),
+        )
     }
 }
 
@@ -2294,11 +2329,11 @@ pub(crate) fn settle_for_fence() {
 }
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
-/// a queue does for the lists it ran (`crate::list::recycle`).
+/// a queue does for the lists it ran (`crate::list::recycle_all`).
 fn land() {
     let landed = std::mem::take(&mut line().landed);
-    for (lists, order) in landed {
-        crate::list::recycle(lists, &order);
+    if !landed.is_empty() {
+        crate::list::recycle_all(landed);
     }
 }
 
@@ -2699,6 +2734,36 @@ mod late_tests {
             assert_eq!(touches(&ranges, from, to), hit, "{from}..{to}");
         }
         assert!(!touches(&[], 0, usize::MAX));
+    }
+
+    #[test]
+    fn pack_buckets_preserves_items_and_balances_weights() {
+        let items = vec![100usize, 100, 50, 50, 25, 25, 10, 10, 10, 10];
+        let buckets = super::pack_buckets(items.clone(), 4, |&w| w);
+        assert_eq!(buckets.len(), 4);
+        let mut flat: Vec<usize> = buckets.iter().flatten().copied().collect();
+        flat.sort_unstable();
+        let mut expected = items;
+        expected.sort_unstable();
+        assert_eq!(flat, expected);
+        let sums: Vec<usize> = buckets.iter().map(|b| b.iter().sum()).collect();
+        assert!(sums.iter().max().unwrap() - sums.iter().min().unwrap() <= 25, "unbalanced: {sums:?}");
+    }
+
+    #[test]
+    fn deferred_reset_for_reuse_clears_state_and_is_drop_safe() {
+        let mut d = super::Deferred::default();
+        d.refreshed.insert((1, 2, 3));
+        d.textures.insert(42);
+        d.budget_zeroed = true;
+        let drops = d.reset_for_reuse();
+        drop(drops);
+        assert!(d.refreshed.is_empty());
+        assert!(d.textures.is_empty());
+        assert!(!d.budget_zeroed);
+        assert_eq!(d.upload_bytes, 0);
+        // Dropping afterwards must not underflow ALIVE counters.
+        drop(d);
     }
 }
 
@@ -4675,7 +4740,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        let drops = self.deferred().reset_for_reuse();
+        drop(drops);
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -5469,20 +5535,31 @@ impl HostList {
 }
 
 /// Whether a submission's refreshes of host copies run on several threads,
-/// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
-///
-/// A submission brings some sixty copies up to date, one after the other
-/// on the submitting thread: for each, the pages the title wrote are asked
-/// for and read through the kernel into the copy. That is the frame line's
-/// "copies", 45-50 ms a frame, and the copies have nothing to do with one
-/// another: each refresh writes its own copy and its own notes, and reads
-/// title memory. With the switch the copies of a flush (four or more) are
-/// spread over the threads kept for the snapshots (`crate::shadow::wide`).
-/// The write-watch journal and the guards are behind their own locks, as
-/// they are for the title's threads.
+/// packed into balanced worker buckets (`VICTORY_WIDE_REFRESH`; on by
+/// default, `=0` disables).
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_none_or(|v| v != "0"))
+}
+
+/// Packs `items` into at most `max_buckets` load-balanced buckets using
+/// longest-processing-time-first by `weight`.
+fn pack_buckets<T>(mut items: Vec<T>, max_buckets: usize, weight: impl Fn(&T) -> usize) -> Vec<Vec<T>> {
+    if items.is_empty() || max_buckets == 0 {
+        return Vec::new();
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(weight(item)));
+    let n = items.len().min(max_buckets);
+    let mut buckets: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+    let mut loads = vec![0usize; n];
+    for item in items {
+        let w = weight(&item);
+        let i = (0..n).min_by_key(|&i| loads[i]).unwrap_or(0);
+        loads[i] = loads[i].saturating_add(w);
+        buckets[i].push(item);
+    }
+    buckets.retain(|b| !b.is_empty());
+    buckets
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -5576,15 +5653,22 @@ impl Batch {
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         if wide_refresh() && self.refreshes.len() >= 4 {
-            // Each copy on its own, several at a time: a copy's refresh
-            // writes that copy and reads title memory, nothing of another's.
-            // The time counted is the time it took, not the threads' sum.
+            // Pack distinct copies into at most 8 balanced buckets by byte
+            // range so one flush never queues thousands of tiny jobs.
+            // The time counted is wall time, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            let items = std::mem::take(&mut self.refreshes);
+            let buckets = pack_buckets(items, 8, |(_, from, to)| to.saturating_sub(*from));
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = buckets
+                .into_iter()
+                .map(|chunk| {
+                    Box::new(move || {
+                        for (shadow, from, to) in chunk {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
