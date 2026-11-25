@@ -1360,18 +1360,18 @@ impl State {
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
             .or_insert_with(|| (0, Ranges::new()));
-        // Always rescan what changed; each pass also walks 1/16 of all
-        // slots (and prunes that bucket's stale keys) so a released view
-        // goes within 16 frames without clearing ~83,000 slots in one hitch.
-        let bucket = (*passes % 16) as u32;
-        // Only the ~1/16 bucket this pass rescans — not all ~83,000 slots.
-        let bucket_slots = host.buffer_slots_bucket(bucket);
+        // Always rescan what changed; each pass also walks 1/128 of all
+        // slots (~650 slots/frame instead of ~5,200) and prunes that bucket's
+        // stale keys so released views clear without stalling every frame.
+        const RESCAN_BUCKETS: u32 = 128;
+        let bucket = (*passes % u64::from(RESCAN_BUCKETS)) as u32;
+        let bucket_slots = host.buffer_slots_bucket(bucket, RESCAN_BUCKETS);
         let bucket_set: std::collections::HashSet<u32> = bucket_slots.iter().copied().collect();
         let mut scan: std::collections::HashSet<u32> = host.buffer_changes().into_iter().collect();
         for &index in &bucket_slots {
             scan.insert(index);
         }
-        ranges.retain(|k, _| *k % 16 != bucket || bucket_set.contains(k));
+        ranges.retain(|k, _| *k % RESCAN_BUCKETS != bucket || bucket_set.contains(k));
         let slots: Vec<u32> = scan.into_iter().collect();
         *passes += 1;
         // Whether the device was there before the pass: a view that removes
@@ -1502,11 +1502,10 @@ impl State {
             return;
         }
         /// Bytes of texture memory staged per frame, and while the queue is
-        /// long (the world's first minutes: over 20,000 slots, which at the
-        /// usual pace took three and a half minutes with the materials
-        /// black) as much more as `CATCH_UP` in all allows.
-        const PER_FRAME: u64 = 192 << 20;
-        const PER_FRAME_CATCHING_UP: u64 = 512 << 20;
+        /// long (the world's first minutes) a bounded catch-up budget so
+        /// texture streaming never freezes frames for 250–1,500 ms.
+        const PER_FRAME: u64 = 48 << 20;
+        const PER_FRAME_CATCHING_UP: u64 = 128 << 20;
         const LONG: u64 = 2_000;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
@@ -1563,16 +1562,23 @@ impl State {
             user_data: 0,
             slot: 0,
         };
-        // Also within a time per pass: the pass runs on a thread that
-        // records the frame, and making and staging 192 MB of textures took
-        // 1.6-2.2 s of each of the world's first twenty frames (run 20).
-        // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
-        const SPAN_CATCHING_UP: std::time::Duration = std::time::Duration::from_millis(1500);
+        // Keep per-frame texture upload time tightly bounded so recording
+        // never stalls for 250–1,500 ms/frame. Override with
+        // `VICTORY_HEAP_TEXTURE_MS` if desired.
+        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let base_ms = *SPAN_MS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&ms| ms >= 2)
+                .unwrap_or(20)
+        });
+        let span_normal = std::time::Duration::from_millis(base_ms);
+        let span_catch_up = std::time::Duration::from_millis(base_ms.saturating_mul(3).min(60));
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
-            (PER_FRAME_CATCHING_UP, SPAN_CATCHING_UP)
+            (PER_FRAME_CATCHING_UP, span_catch_up)
         } else {
-            (PER_FRAME, SPAN)
+            (PER_FRAME, span_normal)
         };
         let began = std::time::Instant::now();
         for (index, write) in due {
@@ -1713,7 +1719,7 @@ impl State {
                 host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
             }
         }
-        catching_up(began.elapsed().saturating_sub(SPAN));
+        catching_up(began.elapsed().saturating_sub(span_normal));
     }
 
     /// For the frame listing, after a dropped dispatch's line: its group

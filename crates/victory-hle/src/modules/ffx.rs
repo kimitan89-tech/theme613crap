@@ -47,7 +47,20 @@ struct UpscalerContext {
     dispatches: AtomicU64,
 }
 
+fn upscale_ratio_override() -> Option<f32> {
+    static RATIO: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *RATIO.get_or_init(|| {
+        std::env::var("VICTORY_UPSCALE_RATIO")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|r| r.is_finite() && (1.0..=3.0).contains(r))
+    })
+}
+
 fn upscale_ratio(quality_mode: u32) -> f32 {
+    if let Some(ratio) = upscale_ratio_override() {
+        return ratio;
+    }
     match quality_mode {
         0 => 1.0, // NativeAA
         1 => 1.5, // Quality
