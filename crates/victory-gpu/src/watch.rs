@@ -299,6 +299,68 @@ pub(crate) fn wrote(at: usize, len: usize) {
     }
 }
 
+/// After a host copy wrote title memory that already matches its own bytes
+/// (shader settle / card merge): clear the kernel write-watch dirty bits for
+/// `[at, at + len)`, re-guard view blocks we opened, and stamp the journal.
+/// Returns the asking number to mark those pages current on that copy so its
+/// next refresh does not copy them again. Other copies still see the write
+/// through the journal.
+pub(crate) fn synced(at: usize, len: usize) -> u64 {
+    let end = at.saturating_add(len);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    if at < end {
+        for page in at / PAGE..end.div_ceil(PAGE) {
+            j.written.insert(page, now);
+        }
+    }
+    drop(j);
+    if at < end {
+        reset_write_watch(at, end);
+        reprotect_synced(at, end);
+    }
+    now
+}
+
+/// Clears write-watch dirty bits for the pages of `[at, end)`. No-op when
+/// the range is not write-watched (views, ordinary reservations).
+fn reset_write_watch(at: usize, end: usize) {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    const WRITE_WATCH_FLAG_RESET: u32 = 1;
+    let (first, last) = (at / PAGE, end.div_ceil(PAGE));
+    if first >= last {
+        return;
+    }
+    let mut count = (last - first) * PAGE / KERNEL_PAGE;
+    let mut found = vec![0usize; count.max(1)];
+    let mut granularity = 0;
+    // SAFETY: answer buffer holds `count` entries; failure means not watched.
+    let _ = unsafe {
+        GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            (first * PAGE) as *const _,
+            (last - first) * PAGE,
+            found.as_mut_ptr().cast(),
+            &mut count,
+            &mut granularity,
+        )
+    };
+}
+
+/// View blocks opened for our write: make them read-only and clean again so
+/// the next guard check does not report them as title writes.
+fn reprotect_synced(at: usize, end: usize) {
+    if !view_guard() || at >= end {
+        return;
+    }
+    if crate::inplace::cover(at, 1) == crate::inplace::Cover::None {
+        return;
+    }
+    let mut g = guards_write();
+    protect_here(&mut g, at / BLOCK, end.div_ceil(BLOCK));
+}
+
 /// One kernel asking for `pieces` (page ranges in order); by halves if it
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].

@@ -2158,14 +2158,12 @@ impl Shadow {
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
                     crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    // Host and title match: absorb our write so the next
+                    // refresh does not copy these pages again.
+                    self.mark_synced(at, n);
                     written += n;
                 }
             }
-            // Our write shows as a title write at the copy's next refresh,
-            // which copies those pages once more (some dozens of MB a
-            // frame). Asking about the whole range here, to note them
-            // current, cost more: 19-31 askings a frame over 110-174 MB of
-            // view memory, each a walk of its guards.
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
         }
@@ -2247,6 +2245,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.mark_synced(at, n);
         n
     }
 
@@ -2723,6 +2722,24 @@ impl Shadow {
         to - from
     }
 
+    /// After this copy wrote title memory that already matches its host
+    /// bytes: note those pages current so the next refresh does not copy
+    /// them again (our write would otherwise look like a title write).
+    fn mark_synced(&self, at: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let start = self.start as usize;
+        let now = crate::watch::synced(start + at, n);
+        let base = start / PAGE;
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        for page in (start + at) / PAGE..(start + at + n).div_ceil(PAGE) {
+            if let Some(slot) = copied.get_mut(page.saturating_sub(base)) {
+                *slot = now;
+            }
+        }
+    }
+
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
     pub(crate) fn carded(&self) -> bool {
@@ -2831,6 +2848,7 @@ impl Shadow {
             if differs != 0 {
                 crate::watch::writing(start + at, n);
                 crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.mark_synced(at, n);
                 written = n;
             }
         } else {
@@ -2906,6 +2924,7 @@ impl Shadow {
         }
         crate::watch::writing(start + at, n);
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.mark_synced(at, n);
         n
     }
 }
