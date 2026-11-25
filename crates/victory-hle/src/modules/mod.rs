@@ -16,7 +16,6 @@ pub mod display;
 pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
-pub mod ffx;
 #[cfg(windows)]
 pub mod files;
 pub mod gameinput;
@@ -53,7 +52,6 @@ pub(crate) fn all() -> Vec<HleModule> {
         d3d12x::module(),
         audio::module(),
         dsp::module(),
-        ffx::module(),
         xg::module(),
     ];
     #[cfg(windows)]

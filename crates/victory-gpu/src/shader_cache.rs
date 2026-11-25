@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use victory_pipeline::{Cache, Converter};
 use victory_shader::emit::{HostShader, StaticSampler, UserData};
+use victory_shader::resource::RootIndexedView;
 use victory_shader::{HwStage, RootType};
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -53,6 +54,27 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // Which group barriers wait is part of the translation too.
+                bytes.push(victory_shader::emit::group_sync());
+                // So are the switches that pick the form of a wave64 program:
+                // without them here a run with `VICTORY_WAVE_WIDE=0` was
+                // served the translations an earlier run of the same
+                // executable had cached with the switch unset.
+                for name in [
+                    "VICTORY_WAVE_WIDE",
+                    "VICTORY_WAVE_DEEP_SKIPS",
+                    "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_F16_NEAREST",
+                ] {
+                    bytes.extend_from_slice(name.as_bytes());
+                    bytes.push(b'=');
+                    if let Some(value) = std::env::var_os(name) {
+                        bytes.extend_from_slice(value.as_encoded_bytes());
+                    }
+                    bytes.push(0);
+                }
+                // And which clean-up passes ran over the translated code.
+                bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -210,12 +232,17 @@ fn encode(s: &HostShader) -> Vec<u8> {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
-    word(&mut out, s.const_views.len() as u32);
-    for v in &s.const_views {
-        word(&mut out, u32::from(v.slot));
-        word(&mut out, u32::from(v.dword));
-        word(&mut out, u32::from(v.shift));
-        word(&mut out, u32::from(v.uav));
+    word(&mut out, s.root_indexed_views.len() as u32);
+    for view in &s.root_indexed_views {
+        for value in [
+            u32::from(view.table_slot),
+            u32::from(view.constant_slot),
+            view.constant_dword,
+            view.byte_offset,
+            u32::from(view.shift),
+        ] {
+            word(&mut out, value);
+        }
     }
     out
 }
@@ -273,23 +300,17 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     }
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
-    // Older cache entries omit root UAVs / const_views.
-    let root_uavs = if r.0.is_empty() {
-        Vec::new()
-    } else {
-        r.list()?
-    };
-    let mut const_views = Vec::new();
-    if !r.0.is_empty() {
-        let n = r.word()? as usize;
-        for _ in 0..n {
-            const_views.push(victory_shader::emit::ConstView {
-                slot: u8::try_from(r.word()?).ok()?,
-                dword: u16::try_from(r.word()?).ok()?,
-                shift: u8::try_from(r.word()?).ok()?,
-                uav: r.word()? != 0,
-            });
-        }
+    let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut root_indexed_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_indexed_views.push(RootIndexedView {
+            table_slot: u8::try_from(r.word()?).ok()?,
+            constant_slot: u8::try_from(r.word()?).ok()?,
+            constant_dword: r.word()?,
+            byte_offset: r.word()?,
+            shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
+        });
     }
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -300,7 +321,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
-        const_views,
+        root_indexed_views,
     })
 }
 
@@ -327,12 +348,13 @@ mod tests {
             ])],
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
-            root_uavs: vec![4],
-            const_views: vec![victory_shader::emit::ConstView {
-                slot: 0,
-                dword: 2,
-                shift: 8,
-                uav: false,
+            root_uavs: vec![1],
+            root_indexed_views: vec![RootIndexedView {
+                table_slot: 1,
+                constant_slot: 2,
+                constant_dword: 3,
+                byte_offset: 32,
+                shift: 5,
             }],
         }
     }
