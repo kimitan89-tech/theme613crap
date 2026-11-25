@@ -1356,15 +1356,18 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
-        if crate::pipeline::is_skipped(self.pipeline as This) {
-            crate::pipeline::note_drop(self.pipeline as This);
-            return false;
-        }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(self.pipeline as This) {
+            crate::pipeline::note_drop(self.pipeline as This);
+            if kind == DISPATCH {
+                self.note_watched_writers(false);
+            }
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -1374,6 +1377,8 @@ impl State {
         if kind == DISPATCH && crate::host::scene_overlay_active() {
             once!("indirect compute skipped while PresentX scene overlay is active");
             list.note_compute_op();
+            #[cfg(feature = "diagnostics")]
+            self.note_watched_writers(false);
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
@@ -1452,12 +1457,17 @@ impl State {
         if !ran {
             crate::indirect::done(list, &exec_args.0);
             #[cfg(feature = "diagnostics")]
-            match crate::pipeline::host_pipeline(self.pipeline as This) {
-                None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!(
-                    "prepare failed (topo {}, compute {}, mesh {}, {})",
-                    self.topology, p.compute, p.mesh, p.name
-                )),
+            {
+                match crate::pipeline::host_pipeline(self.pipeline as This) {
+                    None => crate::pipeline::note_drop(self.pipeline as This),
+                    Some(p) => why(&format!(
+                        "prepare failed (topo {}, compute {}, mesh {}, {})",
+                        self.topology, p.compute, p.mesh, p.name
+                    )),
+                }
+                if kind == DISPATCH {
+                    self.note_watched_writers(false);
+                }
             }
             return false;
         }
@@ -1473,9 +1483,17 @@ impl State {
             );
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| {
-            self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
-        });
+        {
+            list.note_op(|| {
+                self.op_text(
+                    format!("indirect kind {kind} max {max} at {arguments:#x}"),
+                    kind == DISPATCH,
+                )
+            });
+            if kind == DISPATCH {
+                self.note_watched_writers(true);
+            }
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {

@@ -120,9 +120,23 @@ pub(super) fn has_divergent_s_barrier(p: &Program, st: &Structured, a: &Analysis
             if inst.name() != "s_barrier" {
                 continue;
             }
-            if a.divergent[b] || st.guards[b][i].is_some_and(|g| !a.uniform(st, g)) {
+            // A non-uniform inline guard: only some live threads execute it.
+            if st.guards[b][i].is_some_and(|g| !a.uniform(st, g)) {
                 return true;
             }
+            if !a.divergent[b] {
+                continue;
+            }
+            // Analyze over-approx: a divergent early-exit marks the whole
+            // continue path as divergent. A join-point barrier (several
+            // predecessors, no guard) is where live threads reconverge — safe
+            // under DXIL group barriers (returned threads do not participate).
+            // A barrier on only one arm of a divergent branch (single pred)
+            // remains unsafe.
+            if block.preds.len() > 1 && st.guards[b][i].is_none() {
+                continue;
+            }
+            return true;
         }
     }
     false
@@ -152,9 +166,8 @@ fn barriers_for(p: &Program, st: &Structured, a: &Analysis) -> Option<HashSet<Si
 }
 
 /// Fences for LDS accesses that sit in group-uniform blocks only. Divergent
-/// `ds_*` are skipped (never insert a barrier there). Kept for analysis /
-/// tests; Wave64-on-Wave32 now requires a full [`split_barriers`] proof.
-#[allow(dead_code)]
+/// `ds_*` are skipped (never insert a barrier there). Used when a single
+/// console wave runs as WaveSize(32) with convergent `any64` control flow.
 pub(super) fn uniform_split_barriers(
     p: &Program,
     _st: &Structured,

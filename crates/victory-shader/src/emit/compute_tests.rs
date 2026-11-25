@@ -1702,6 +1702,154 @@ mod lds_wave_device {
         }
     }
 
+    /// Only half 0 (lanes 0..31) or only half 1 (32..63) is active for an
+    /// `if`-style EXEC mask and a divergent `loop` that contain `v_mbcnt`,
+    /// `v_readfirstlane`, `v_readlane`, and `s_barrier`. Proves on a Wave32
+    /// GPU that Wave64-on-Wave32 completes with no deadlock and bit-exact
+    /// results for the active half.
+    #[test]
+    fn wave64_divergent_half_if_and_loop_no_deadlock_on_device() {
+        let _lock = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let readlane = |sdst: u32, lane: u32| -> [u32; 2] {
+            [0xd760_0000 | sdst, 0x100 | ((128 + lane) << 9)]
+        };
+
+        for only_high in [false, true] {
+            // Half-masked EXEC: mbcnt + readfirstlane + readlane + s_barrier,
+            // then store readfirstlane (bit-exact) and mbcnt in a second run.
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9, // v0 = console lane
+            ]);
+            if only_high {
+                words.extend([0x7d82_009f, 0xbe82_246a]); // saveexec: v0 >= 32
+            } else {
+                words.extend([0x7d88_00a0, 0xbe82_246a]); // saveexec: v0 < 32
+            }
+            words.extend([
+                // Live mbcnt / readlane so those ops are in the PSO + barrier path.
+                0xd765_0001,
+                193 | 128 << 9,
+                0xd766_0001,
+                193 | 257 << 9, // v1 = mbcnt
+            ]);
+            words.extend(readlane(4, if only_high { 63 } else { 0 }));
+            words.extend([
+                0x7e00_0500, // s0 = readfirstlane(v0)
+                0x7e06_0200, // v3 = s0
+                SYNC,
+                0x3404_0082,
+            ]);
+            words.extend(STORE);
+            words.push(END);
+
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(
+                wave(&cs),
+                (32, 32),
+                "half-divergent if (high={only_high}) must emulate"
+            );
+            let out = dispatch(&cs, 64);
+            let first = if only_high { 32u32 } else { 0 };
+            for (i, &v) in out.iter().enumerate() {
+                let i = i as u32;
+                let in_half = if only_high { i >= 32 } else { i < 32 };
+                if in_half {
+                    assert_eq!(v, first, "lane {i} readfirst high={only_high}: {out:?}");
+                }
+            }
+
+            // Same mask: store mbcnt (= console lane) after barrier.
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9,
+            ]);
+            if only_high {
+                words.extend([0x7d82_009f, 0xbe82_246a]);
+            } else {
+                words.extend([0x7d88_00a0, 0xbe82_246a]);
+            }
+            words.extend([
+                0xd765_0003,
+                193 | 128 << 9,
+                0xd766_0003,
+                193 | 259 << 9,
+                0x7e00_0500,
+                0x7e08_0200,
+            ]);
+            words.extend(readlane(4, 0));
+            words.extend([SYNC, 0x3404_0082]);
+            words.extend(STORE);
+            words.push(END);
+            let cs = shader(&words, compute([64, 1, 1]));
+            let out = dispatch(&cs, 64);
+            for (i, &v) in out.iter().enumerate() {
+                let i = i as u32;
+                let in_half = if only_high { i >= 32 } else { i < 32 };
+                if in_half {
+                    assert_eq!(v, i, "lane {i} mbcnt high={only_high}: {out:?}");
+                }
+            }
+        }
+
+        for only_high in [false, true] {
+            let mut words = UAV.to_vec();
+            words.extend([
+                0xd765_0000,
+                193 | 128 << 9,
+                0xd766_0000,
+                193 | 256 << 9,
+                0x7e06_0280, // v3 = 0
+                0xbe82_0381, // s2 = 1
+            ]);
+            words.extend([
+                0xBF07_8002, // s_cmp_lg_u32 s2, 0
+                0xbf84_0009, // s_cbranch_scc0 → after
+                0x8082_8102, // s2 += -1
+            ]);
+            if only_high {
+                words.push(0x7da2_009f);
+            } else {
+                words.push(0x7da8_00a0);
+            }
+            words.extend([
+                0xbf88_0006,
+                0xd765_0003,
+                193 | 128 << 9,
+                0xd766_0003,
+                193 | 259 << 9,
+                SYNC,
+                0xbf82_fff5,
+            ]);
+            words.push(0x3404_0082);
+            words.extend(STORE);
+            words.push(END);
+
+            let cs = shader(&words, compute([64, 1, 1]));
+            assert_eq!(
+                wave(&cs),
+                (32, 32),
+                "half-divergent loop (high={only_high}) must emulate"
+            );
+            let out = dispatch(&cs, 64);
+            for (i, &v) in out.iter().enumerate() {
+                let i = i as u32;
+                let in_half = if only_high { i >= 32 } else { i < 32 };
+                if in_half {
+                    assert_eq!(v, i, "lane {i} loop high={only_high}: {out:?}");
+                } else {
+                    assert_eq!(v, 0, "lane {i} loop else high={only_high}: {out:?}");
+                }
+            }
+        }
+    }
+
 }
 
 #[test]
@@ -1878,22 +2026,23 @@ fn wave64_without_cross32_ops_uses_wave32() {
 }
 
 #[test]
-fn divergent_s_barrier_keeps_wave64() {
-    // A divergent s_barrier is a no-op inside one console wave, but hangs when
-    // the group is two host Wave32s: keep WaveSize(64).
+fn divergent_s_barrier_uses_wave32_via_any64() {
+    // A divergent s_barrier is a no-op inside one console wave. On two host
+    // Wave32s, `any64` makes both halves take the arm so the group barrier
+    // cannot hang — WaveSize(32) with Wave64Emu.
     let words = [
         0x7da4_0080, // v_cmpx_gt_u32 exec, v0, 0 (half the lanes leave)
         0xbf88_0001, // s_cbranch_execz +1
         SYNC,
         END,
     ];
-    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (32, 32));
 }
 
 #[test]
-fn divergent_cross32_readlane_keeps_wave64() {
-    // v_readlane in a divergent block needs an LDS barrier there: refuse
-    // Wave32 emulation rather than deadlock.
+fn divergent_cross32_readlane_uses_wave32_via_any64() {
+    // v_readlane in a divergent block needs an LDS barrier: `any64` keeps both
+    // halves in lockstep so Wave64-on-Wave32 is safe.
     let readlane = [0xd760_0002u32, 0x100 | ((128 + 32) << 9)]; // s2 = readlane(v0, 32)
     let mut words = vec![
         0xd765_0000,
@@ -1905,13 +2054,13 @@ fn divergent_cross32_readlane_keeps_wave64() {
     ];
     words.extend(readlane);
     words.push(END);
-    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (32, 32));
 }
 
 #[test]
-fn divergent_ballot_keeps_wave64() {
-    // A compare defined inside a divergent block, then read as data: the
-    // Wave64-on-Wave32 ballot barrier would land in that block and hang.
+fn divergent_ballot_uses_wave32_via_any64() {
+    // A compare defined inside a divergent block, then read as data: ballot
+    // barriers land in that block, but `any64` makes both halves enter together.
     let words = [
         0x7da4_0080u32, // v_cmpx_gt_u32 exec, v0, 0
         0xbf88_0002,    // s_cbranch_execz skip compare+bcnt
@@ -1919,7 +2068,7 @@ fn divergent_ballot_keeps_wave64() {
         0xbe86_106a,    // s_bcnt1_i32_b64 s6, vcc
         END,
     ];
-    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (64, 64));
+    assert_eq!(wave(&shader(&words, compute([64, 1, 1]))), (32, 32));
 }
 
 #[test]

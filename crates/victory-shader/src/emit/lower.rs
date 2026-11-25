@@ -420,20 +420,35 @@ fn try_wave64_on_wave32(
         return None;
     }
     let analysis = super::lds::analyze(p, st);
-    // A divergent s_barrier is a no-op inside one console wave, but deadlocks
-    // when the group is two host Wave32s.
-    if super::lds::has_divergent_s_barrier(p, st, &analysis) {
-        return None;
-    }
-    for b in wave64_barrier_blocks(p, st, res) {
-        if analysis.divergent[b] {
+    // Exactly one console wave (= two host Wave32s): divergent CF is rewritten
+    // to workgroup-convergent `any64` at lower time so both halves hit every
+    // Wave64Emu / s_barrier in lockstep. Larger groups need workgroup-wide
+    // any (not yet), so keep the strict proof there.
+    let single_console_wave = threads == 64;
+    if !single_console_wave {
+        // A divergent s_barrier is a no-op inside one console wave, but
+        // deadlocks when the group is two host Wave32s.
+        if super::lds::has_divergent_s_barrier(p, st, &analysis) {
             return None;
+        }
+        for b in wave64_barrier_blocks(p, st, res) {
+            if analysis.divergent[b] {
+                return None;
+            }
         }
     }
     let barriers = if orig_lds > 0 {
-        // Need a full proof: divergent user LDS or s_barrier means we cannot
-        // keep the two host waves in lockstep on the group's own LDS.
-        super::lds::split_barriers(p, st)?
+        if single_console_wave {
+            // Prefer a full proof; fall back to uniform-only fences when
+            // divergent LDS sits behind convergent any64 CF (live threads
+            // still share the same iteration/branch counts).
+            super::lds::split_barriers(p, st)
+                .unwrap_or_else(|| super::lds::uniform_split_barriers(p, st, &analysis))
+        } else {
+            // Need a full proof: divergent user LDS or s_barrier means we
+            // cannot keep the two host waves in lockstep on the group's LDS.
+            super::lds::split_barriers(p, st)?
+        }
     } else {
         HashSet::new()
     };
@@ -641,12 +656,14 @@ impl<'a> Lower<'a> {
             let divergent_s_barrier = analysis
                 .as_ref()
                 .is_some_and(|a| super::lds::has_divergent_s_barrier(p, x.st, a));
-            if console_lanes && wave == 64 {
-                if refuse_emu || divergent_s_barrier {
-                    // Never split a shader with a divergent s_barrier (or one
-                    // whose prior lower already saw a divergent emu barrier).
+            // One console wave (= 64 threads): divergent barriers are rewritten
+            // to convergent `any64` under Wave64Emu — even with no cross-32 ops.
+            let emu_for_any64 = divergent_s_barrier && threads == 64;
+            if (console_lanes || emu_for_any64) && wave == 64 {
+                if refuse_emu {
+                    // Prior lower saw a divergent emu barrier: keep WaveSize(64).
                     s.wave_size = Some(64);
-                } else if !cross32 {
+                } else if console_lanes && !cross32 && !emu_for_any64 {
                     // DPP / ds_swizzle stay inside a 32-lane half: WaveSize(32)
                     // with thread remapping matches the console bit for bit.
                     s.wave_size = Some(32);
@@ -665,7 +682,8 @@ impl<'a> Lower<'a> {
                     lds_barriers = super::lds::split_barriers(p, x.st);
                 }
                 // A divergent s_barrier on Wave32 is an instant GPU hang when
-                // the group spans more than one host wave: keep WaveSize(64).
+                // the group spans more than one host wave. (threads == 64 is
+                // handled above via Wave64Emu + any64.)
                 if divergent_s_barrier && wave == 64 {
                     s.wave_size = Some(64);
                 } else if lds_barriers.is_none() && (console_lanes || wave == 32) {
@@ -1697,8 +1715,14 @@ impl<'a> Lower<'a> {
 
     /// SM 6.1 `SV_Barycentrics`: console VGPRs hold i (index 0) and j (index 1).
     fn lower_barycentric_input(&mut self, v: Value) -> Result<Val, Why> {
-        let Some(&Input::Barycentric { kind, index }) =
-            self.x.io.inputs.iter().find(|&&(val, _)| val == v).map(|(_, i)| i)
+        let Some(Input::Barycentric { kind, index }) = self
+            .x
+            .io
+            .inputs
+            .iter()
+            .find(|(val, _)| *val == v)
+            .map(|(_, i)| i)
+            .copied()
         else {
             return Err("barycentrics read directly");
         };
@@ -2548,8 +2572,20 @@ impl<'a> Lower<'a> {
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
-            None => Ok(None),
             Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+            None if self.wave64_emu.is_some() => {
+                // Structurisation omits guards when "reaching the block"
+                // already implies EXEC. Wave64-on-Wave32 `any64` forces both
+                // halves into those blocks, so inactive lanes need the reach
+                // condition restored for wave ops and VGPR writes.
+                let r = self.x.st.reach[b];
+                if r == Bool::TRUE {
+                    Ok(None)
+                } else {
+                    Ok(Some(self.boolean(r, self.cur)?))
+                }
+            }
+            None => Ok(None),
         }
     }
 
@@ -3230,16 +3266,40 @@ impl<'a> Lower<'a> {
         // only some threads reach deadlocks the group. Track every such site
         // so `run` can abort the split before finish.
         let splitting = self.x.native.wave64 && self.s.wave_size != Some(64);
+        // One console wave on Wave32: `exit` rewrites branches that reach
+        // barriers to convergent `any64`, so both halves lockstep — barriers
+        // in formerly-divergent *blocks* are then safe. Real per-lane guards
+        // (`begin_guarded`) still deadlock and must refuse.
+        let single_wave_emu = self.wave64_emu.is_some()
+            && self
+                .s
+                .threads
+                .is_some_and(|t| t.iter().product::<u32>() == 64);
+        // Join-point barriers (several preds, not under a lane guard): live
+        // threads reconverge here. Analyze may still mark the block divergent
+        // from an early-exit over-approx; those barriers are safe (matches
+        // `lds::has_divergent_s_barrier`).
+        let join_reconverge = at == self.cur
+            && self.in_guard == 0
+            && !self.llvm_guarded.contains(&at)
+            && self
+                .x
+                .p
+                .blocks
+                .get(self.cur_ir)
+                .is_some_and(|b| b.preds.len() > 1);
+        let under_lane_guard =
+            self.llvm_guarded.contains(&at) || (at == self.cur && self.in_guard > 0);
+        let in_divergent_block = self.llvm_divergent.contains(&at)
+            || (at == self.cur
+                && self
+                    .divergent
+                    .get(self.cur_ir)
+                    .copied()
+                    .unwrap_or(false));
         if splitting
-            && (self.llvm_guarded.contains(&at)
-                || self.llvm_divergent.contains(&at)
-                || (at == self.cur && self.in_guard > 0)
-                || (at == self.cur
-                    && self
-                        .divergent
-                        .get(self.cur_ir)
-                        .copied()
-                        .unwrap_or(false)))
+            && !join_reconverge
+            && (under_lane_guard || (!single_wave_emu && in_divergent_block))
         {
             self.divergent_barrier = true;
         }
@@ -3357,6 +3417,63 @@ impl<'a> Lower<'a> {
         let hi = self.scratch_load(at, hi_i);
         self.group_barrier_at(at, false);
         (lo, hi)
+    }
+
+    /// `ballot_64(bit) != 0`: both host Wave32 halves see the same boolean.
+    fn any64(&mut self, bit: V, at: usize) -> V {
+        let (lo, hi) = self.ballot_64(bit, at);
+        let z = self.s.m.i32(0);
+        let lo_nz = self.s.m.cmp(at, pred::NE, lo, z);
+        let hi_nz = self.s.m.cmp(at, pred::NE, hi, z);
+        self.s.m.bin(at, Bin::Or, lo_nz, hi_nz)
+    }
+
+    /// A 64-thread Wave64-on-Wave32 group: rewrite lane-divergent branches
+    /// that can reach an emu / `s_barrier` so both halves take the same arm.
+    fn branch_needs_any64(&self, taken: usize, not_taken: usize) -> bool {
+        if self.wave64_emu.is_none() {
+            return false;
+        }
+        let threads = self
+            .s
+            .threads
+            .map(|t| t.iter().product::<u32>())
+            .unwrap_or(0);
+        if threads != 64 {
+            return false;
+        }
+        self.reaches_barrier_site(taken) || self.reaches_barrier_site(not_taken)
+    }
+
+    /// Whether IR block `start` can reach an `s_barrier` or a Wave64Emu
+    /// barrier site without ending.
+    fn reaches_barrier_site(&self, start: usize) -> bool {
+        let p = self.x.p;
+        let mut sites = wave64_barrier_blocks(p, self.x.st, self.x.res);
+        for (b, block) in p.blocks.iter().enumerate() {
+            if block.insts.iter().any(|i| i.name() == "s_barrier") {
+                sites.insert(b);
+            }
+        }
+        if sites.is_empty() {
+            return false;
+        }
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = vec![start];
+        while let Some(b) = stack.pop() {
+            if seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            if sites.contains(&b) {
+                return true;
+            }
+            if matches!(self.x.st.exits[b], LaneExit::End | LaneExit::Indirect) {
+                continue;
+            }
+            stack.extend(p.blocks[b].exit.successors());
+        }
+        false
     }
 
     fn first_set_lane_64(&mut self, lo: V, hi: V, at: usize) -> V {
@@ -8547,6 +8664,16 @@ impl<'a> Lower<'a> {
                             .map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
+                };
+                // Wave64-on-Wave32 (one console wave): both host halves must
+                // take the same arm whenever either path can hit an emu /
+                // s_barrier — otherwise one half waits forever. `any64` is
+                // computed here in still-convergent flow; per-lane guards on
+                // stores / atomics / wave ops keep inactive lanes inert.
+                let cond = if self.branch_needs_any64(taken, not_taken) {
+                    self.any64(cond, self.cur)
+                } else {
+                    cond
                 };
                 // A back edge is taken only below the iteration limit.
                 let back =
