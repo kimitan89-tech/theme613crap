@@ -1356,8 +1356,11 @@ impl State {
         // walks 1/128 of the keys when pruning. Per shadow, the list of
         // active (from, to) ranges lets a boundary change recompute that
         // shadow's span in O(k) instead of rebuilding from all ~83,000 slots.
+        // Bucket entry: host copy range plus the view generation key that
+        // produced it (avoids locking `made` on every 1/128 rescan).
+        type Slot = (std::sync::Arc<crate::shadow::Shadow>, u64, u64, u64);
         type Range = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
-        type Ranges = std::collections::HashMap<u32, Range>;
+        type Ranges = std::collections::HashMap<u32, Slot>;
         type Buckets = Vec<Ranges>;
         type SpansMap = std::collections::HashMap<usize, Range>;
         type ShadowParts = std::collections::HashMap<usize, Vec<(u64, u64)>>;
@@ -1451,7 +1454,7 @@ impl State {
                     false
                 }
             });
-            for (shadow, from, to) in removed {
+            for (shadow, from, to, _) in removed {
                 if span_remove(spans_map, shadow_parts, &shadow, from, to) {
                     boundary_rebuilds += 1;
                     spans_touched = true;
@@ -1469,7 +1472,7 @@ impl State {
             let b = (index % RESCAN_BUCKETS) as usize;
             let prev = buckets[b].remove(&index);
             let Some(handle) = heap.handle(index) else {
-                if let Some((shadow, from, to)) = prev
+                if let Some((shadow, from, to, _)) = prev
                     && span_remove(spans_map, shadow_parts, &shadow, from, to)
                 {
                     boundary_rebuilds += 1;
@@ -1477,17 +1480,18 @@ impl State {
                 }
                 continue;
             };
-            // Bucket rescan of a slot whose host key is unchanged: keep the
-            // cached range without mirror/buffer_copy.
-            if let Some(kept) = prev.clone()
-                && host.made_matches(index, handle)
+            let key = crate::descriptor::host::HostHeap::view_key(handle);
+            // Bucket rescan of a slot whose view key is unchanged: keep the
+            // cached range without locking `made` or calling mirror/buffer_copy.
+            if let (Some(kept), Some(key)) = (prev.as_ref(), key)
+                && kept.3 == key
             {
-                buckets[b].insert(index, kept);
+                buckets[b].insert(index, kept.clone());
                 continue;
             }
             let need_copy = prev.is_none();
             let Some((remade, copy)) = host.mirror_buffer(index, handle, need_copy) else {
-                if let Some((shadow, from, to)) = prev
+                if let Some((shadow, from, to, _)) = prev
                     && span_remove(spans_map, shadow_parts, &shadow, from, to)
                 {
                     boundary_rebuilds += 1;
@@ -1514,11 +1518,11 @@ impl State {
             // this slot was new to the cache; otherwise the previous range.
             let resolved = match copy {
                 Some((shadow, address, len)) => Some((shadow, address, address + len)),
-                None if !remade => prev.clone(),
+                None if !remade => prev.as_ref().map(|(s, a, e, _)| (s.clone(), *a, *e)),
                 None => None,
             };
             let Some((shadow, address, end)) = resolved else {
-                if let Some((shadow, from, to)) = prev
+                if let Some((shadow, from, to, _)) = prev
                     && span_remove(spans_map, shadow_parts, &shadow, from, to)
                 {
                     boundary_rebuilds += 1;
@@ -1530,19 +1534,20 @@ impl State {
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            let same = prev.as_ref().is_some_and(|(s, a, b)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && *a == address && *b == end
+            let same = prev.as_ref().is_some_and(|(s, a, e, _)| {
+                std::sync::Arc::ptr_eq(s, &shadow) && *a == address && *e == end
             });
             if !same {
                 spans_touched = true;
-                if let Some((ps, pa, pb)) = prev
+                if let Some((ps, pa, pb, _)) = prev
                     && span_remove(spans_map, shadow_parts, &ps, pa, pb)
                 {
                     boundary_rebuilds += 1;
                 }
                 span_add(spans_map, shadow_parts, shadow.clone(), address, end);
             }
-            buckets[b].insert(index, (shadow, address, end));
+            let made_key = key.unwrap_or(0);
+            buckets[b].insert(index, (shadow, address, end, made_key));
         }
         let t_scan = started.elapsed();
         let views = buckets.iter().map(|b| b.len() as u32).sum::<u32>();

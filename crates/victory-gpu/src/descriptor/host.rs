@@ -1653,20 +1653,16 @@ impl HostHeap {
             .map(|(_, remade, copy)| (remade, copy))
     }
 
-    /// Whether host slot `index` was already made from the view at `handle`
-    /// (same generation key): the heap buffer pass can keep its cached range.
-    pub(crate) fn made_matches(&self, index: u32, handle: u64) -> bool {
-        if index >= self.count || handle == 0 {
-            return false;
+    /// Generation key of the view at `handle`, if it is a live view record.
+    /// The heap buffer pass caches this beside each slot so a rescan can
+    /// skip remakes without locking [`HostHeap::made`].
+    pub(crate) fn view_key(handle: u64) -> Option<u64> {
+        if handle == 0 {
+            return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        if tag != VIEW_TAG {
-            return false;
-        }
-        let key = u64::from(generation) << 32 | u64::from(i);
-        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-        made.get(index as usize).is_some_and(|&k| k == key)
+        (tag == VIEW_TAG).then_some(u64::from(generation) << 32 | u64::from(i))
     }
 
     fn mirror_inner(
