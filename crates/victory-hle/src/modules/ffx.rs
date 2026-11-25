@@ -1,4 +1,4 @@
-//! `amd_fidelityfx_loader_xbox.dll`: FidelityFX API upscaler HLE shim.
+﻿//! `amd_fidelityfx_loader_xbox.dll`: FidelityFX API upscaler HLE shim.
 //!
 //! Console upscaler DLLs embed console-compiled shader blobs without DXIL
 //! parts, so running the title DLL drops every upscaling compute pass and

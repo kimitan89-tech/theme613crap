@@ -31,6 +31,8 @@ pub mod frame;
 mod host;
 #[cfg(windows)]
 mod indirect;
+#[cfg(windows)]
+mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -45,10 +47,13 @@ mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
+mod memory;
+#[cfg(windows)]
 mod shadow;
 pub mod signature;
 #[cfg(windows)]
 mod texture;
+#[cfg(windows)]
 pub mod upscale;
 #[cfg(windows)]
 mod watch;
@@ -56,4 +61,8 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use watch::{
+    title_memory_reading, title_memory_remapped, title_memory_remapping, writing as kernel_will_write,
+};

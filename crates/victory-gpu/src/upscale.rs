@@ -1,4 +1,4 @@
-//! Host GPU spatial bilinear upscaler used by console upscaler HLE paths
+﻿//! Host GPU spatial bilinear upscaler used by console upscaler HLE paths
 //! (for example when a title's console upscaler DLL embeds console-only
 //! shader containers without DXIL).
 
@@ -263,7 +263,11 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::list::ensure_state(host_list, output, UNORDERED_ACCESS);
         crate::texture::host_written(output);
         #[cfg(feature = "diagnostics")]
-        crate::capture::note_target(output);
+        {
+            crate::capture::note_upscale();
+            crate::capture::note_target(color);
+            crate::capture::note_target(output);
+        }
 
         let pair = pass.next.fetch_add(1, Ordering::Relaxed) % PAIRS;
         let base_slot = pair * 2;
@@ -318,6 +322,13 @@ void main(uint3 id : SV_DispatchThreadID) {
                 uav_cpu,
             );
             let l = &host_list.list;
+            #[cfg(feature = "diagnostics")]
+            host_list.note_op(|| {
+                format!(
+                    "upscale {src_w}x{src_h} f{} -> {out_w}x{out_h} f{}",
+                    src_desc.Format.0, dst_desc.Format.0
+                )
+            });
             l.ResourceBarrier(&[uav_barrier()]);
             l.SetDescriptorHeaps(&[Some(pass.heap.clone())]);
             l.SetComputeRootSignature(&pass.root);
