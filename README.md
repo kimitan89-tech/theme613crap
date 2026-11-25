@@ -1,18 +1,20 @@
-# VIctory / ztrx
+# theme613crap
 
-Runs Xbox Series title builds natively on Windows PCs with Direct3D 12
-(shader model 6.6, mesh shaders), from title files you supply yourself.
+Custom fork of VIctory focused on running Xbox Series S 1080p title builds smoothly
+on modest Windows PCs with Direct3D 12 (shader model 6.6, mesh shaders, e.g. 16 GB RAM
++ NVIDIA RTX 3050 6 GB laptop), from title files you supply yourself.
 
 **This repository contains no title files or assets.** You need your own copy
 of the title. Not affiliated with or endorsed by its developer or publisher.
 
 ## Status
 
-Integrates the **ztrx** (`90b529f`) world-rendering and performance core and
-**victory-amd** (`070df42`) streaming/view-guard/shader-warming fixes on top
-of VIctory, plus Series S multi-plane `PresentX` compositing and a bilinear
-FFX upscaler for 1080p Series S presentation on modest GPUs (e.g. RTX 3050
-laptop).
+Builds on VIctory with **theme613crap** Series S 1080p additions (multi-plane
+`PresentX` overlay compositing, host bilinear FFX upscaler, `R9G9B9E5` target
+promotion, DirectStorage/`ReadFile` view-guard race recovery, batched card-copy
+fetches, adaptive 16 GB RAM pressure reclaim, and in-place guard safety),
+incorporating world-rendering, streaming, and performance work from `ztrx`
+(`90b529f`) and `victory-amd` (`070df42`).
 
 ## Requirements
 
@@ -53,6 +55,10 @@ keyboard acts as one while the title window has focus.
 | `VICTORY_LATE_WAIT=3` | defer GPU waits (off by default) |
 | `VICTORY_WIDE_BACK=1` | wider copy-back windows (off by default) |
 | `VICTORY_VIEW_GUARD=0` | disable cross-view page write tracking (on by default) |
+| `VICTORY_CARD_REHASH_RUNS=0` | disable joining card hash passes (on by default) |
+| `VICTORY_JOIN_COPIES=0` | disable joining consecutive title buffer copies (on by default) |
+| `VICTORY_SWEEP_PRESSURE=0` | disable faster idle reclaim when RAM load ≥ 85% (on by default) |
+| `VICTORY_INPLACE=1` / `=2` | place windows (1) or title buffers too (2) over title pages; skips view-guard on those pages |
 | `VICTORY_HEAP_RECHECK=0` | disable delayed re-checks of indexed textures (on by default) |
 | `VICTORY_TEXTURE_SWEEP=0` | disable recovery sweep for lost placed-texture views (on by default) |
 | `VICTORY_RT_RESOLVE=1` | compile ray-tracing resolve shaders when BVH builder is off |

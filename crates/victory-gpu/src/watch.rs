@@ -578,6 +578,10 @@ fn protect_alias(g: &mut Guards, block: usize) {
     if g.protected.contains(&block) {
         return;
     }
+    // In-place heaps stand on title pages: never make them read-only.
+    if crate::shadow::in_place_covers(block.saturating_mul(BLOCK), BLOCK) {
+        return;
+    }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
@@ -586,6 +590,9 @@ fn protect_alias(g: &mut Guards, block: usize) {
 }
 
 /// [`protect`] for one range, without the other views of its pages.
+/// Blocks covered by an in-place host heap (`VICTORY_INPLACE`) are left
+/// alone: making them `PAGE_READONLY` fails (error 87) or would break the
+/// GPU's view of the same pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     let set = |from: usize, to: usize| {
@@ -604,11 +611,18 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
     };
-    if set(from, to) {
+    let skip_inplace = |block: usize| {
+        crate::shadow::in_place_covers(block.saturating_mul(BLOCK), BLOCK)
+    };
+    // Whole range only when no in-place block is inside it.
+    if !(from..to).any(skip_inplace) && set(from, to) {
         note(g, from, to);
         return;
     }
     for block in from..to {
+        if skip_inplace(block) {
+            continue;
+        }
         if set(block, block + 1) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {

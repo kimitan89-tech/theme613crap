@@ -911,6 +911,13 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
 
+/// `ERROR_INVALID_USER_BUFFER` (1784) or `ERROR_NOACCESS` (998): the kernel
+/// refused a write into a page our GPU-side guard made read-only between
+/// [`victory_gpu::kernel_will_write`] and the `ReadFile`.
+fn kernel_guard_race(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(1784 | 998))
+}
+
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
@@ -931,6 +938,29 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         match file.seek_read(&mut out[done..], request.offset + done as u64) {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
+            Err(error) if kernel_guard_race(&error) => {
+                // Kernel I/O never hits our VEH. Read the rest into a heap
+                // scratch, re-open the guarded pages, and copy in user mode
+                // (which faults into the VEH if they are re-guarded).
+                let mut tmp = vec![0u8; out.len() - done];
+                let mut got = 0;
+                let scratch = loop {
+                    if got == tmp.len() {
+                        break Ok(());
+                    }
+                    match file.seek_read(&mut tmp[got..], request.offset + done as u64 + got as u64) {
+                        Ok(0) => break Err(END_OF_FILE),
+                        Ok(n) => got += n,
+                        Err(e) => break Err(from_win32(&e)),
+                    }
+                };
+                if let Err(hr) = scratch {
+                    break Err(hr);
+                }
+                victory_gpu::kernel_will_write(out[done..].as_ptr() as usize, got);
+                out[done..done + got].copy_from_slice(&tmp[..got]);
+                done += got;
+            }
             Err(error) => break Err(from_win32(&error)),
         }
     };
@@ -960,9 +990,12 @@ fn into_destination(
     let offset = (request.page_offset & 0xffff) as usize;
     let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
-    // place through one view.
+    // place through one view. Open GPU guards first: a raw `ReadFile` into
+    // the window does not fault into the VEH (same race as the address path).
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let bytes = window.bytes();
+        victory_gpu::kernel_will_write(bytes.as_ptr() as usize, bytes.len());
+        return fill(bytes).map(drop);
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1170,6 +1203,75 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// Opens a faulting page for the test (stand-in for the GPU-side VEH).
+    unsafe extern "system" fn open_faulted_page(
+        info: *mut windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+    ) -> i32 {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        const AV: i32 = 0xC000_0005_u32 as i32;
+        const CONTINUE: i32 = -1;
+        const SEARCH: i32 = 0;
+        // SAFETY: Windows passes a live exception record for this handler.
+        let record = unsafe { &*(*info).ExceptionRecord };
+        if record.ExceptionCode != AV || record.NumberParameters < 2 {
+            return SEARCH;
+        }
+        let page = record.ExceptionInformation[1] & !0xfff;
+        let mut old = 0;
+        // SAFETY: a page of the test's own allocation.
+        if unsafe { VirtualProtect(page as *const _, 0x1000, PAGE_READWRITE, &mut old) } != 0 {
+            CONTINUE
+        } else {
+            SEARCH
+        }
+    }
+
+    /// A destination left `PAGE_READONLY` (as after a view-guard race) must
+    /// not surface `0x800706f8`: the scratch path recovers.
+    #[test]
+    fn read_into_recovers_when_destination_is_read_only() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let want = pattern(4096);
+        let (_dir, file) = file_with(&want);
+        // SAFETY: a page of our own for the destination.
+        let dest = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4096,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!dest.is_null());
+        let mut old = 0;
+        // SAFETY: the page we just committed.
+        assert_ne!(
+            unsafe { VirtualProtect(dest, 4096, PAGE_READONLY, &mut old) },
+            0
+        );
+        // SAFETY: first-chance handler for this test only.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(open_faulted_page)) };
+        assert!(!handler.is_null());
+        let req = request(0, dest, want.len(), file, 0, want.len());
+        // SAFETY: `dest` holds 4096 bytes until we free it.
+        let out = unsafe { std::slice::from_raw_parts_mut(dest.cast::<u8>(), want.len()) };
+        assert_eq!(read_into(&req, out), Ok(()));
+        assert_eq!(out, want.as_slice());
+        // SAFETY: remove our handler; free our page.
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            let mut old = 0;
+            VirtualProtect(dest, 4096, PAGE_READWRITE, &mut old);
+            VirtualFree(dest, 0, MEM_RELEASE);
+        }
     }
 
     #[test]
