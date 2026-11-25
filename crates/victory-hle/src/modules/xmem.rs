@@ -341,8 +341,23 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 // mapping is a view of consecutive slices in place of a host placeholder.
 
 const PAGE: usize = 64 << 10;
+/// Pages per on-demand `SEC_COMMIT` chunk (64 MiB: 16× the GPU layer's 4 MiB
+/// window size, so nearly every contiguous run stays in one committed section
+/// without committing the whole 6 GiB pool upfront).
+const CHUNK_PAGES: usize = 1024;
 
-struct Section(HANDLE);
+/// Whether physical-page sections are created with `SEC_COMMIT` (chunked on
+/// demand for large pools) so the GPU layer can open them in place with
+/// `OpenExistingHeapFromFileMapping` (`VICTORY_SECTION_COMMIT=0` disables).
+fn section_commit() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SECTION_COMMIT").is_none_or(|v| v != "0"))
+}
+
+struct Section {
+    handle: HANDLE,
+    committed: bool,
+}
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -351,8 +366,106 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        victory_gpu::title_memory_section_gone(self.handle as usize);
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Creates a pagefile-backed section of `size` bytes. When `want_commit` is
+/// set, tries `SEC_COMMIT` first so D3D12 can open it as an in-place heap,
+/// falling back cleanly to `SEC_RESERVE` if the host commit limit refuses it.
+fn create_section(size: usize, want_commit: bool) -> Option<Arc<Section>> {
+    let make = |flag: u32| -> HANDLE {
+        // SAFETY: plain section creation.
+        unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | flag,
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        }
+    };
+    let (handle, committed) = if want_commit {
+        let h = make(SEC_COMMIT);
+        if !h.is_null() {
+            (h, true)
+        } else {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(
+                mb = size >> 20,
+                %err,
+                "SEC_COMMIT physical-page chunk refused; falling back to SEC_RESERVE"
+            );
+            (make(SEC_RESERVE), false)
+        }
+    } else {
+        (make(SEC_RESERVE), false)
+    };
+    if handle.is_null() {
+        return None;
+    }
+    victory_gpu::title_memory_section(handle as usize, size as u64, committed);
+    Some(Arc::new(Section { handle, committed }))
+}
+
+/// On-demand 64 MiB sections for a large physical-page pool: zero bytes are
+/// committed until a page in a chunk is first mapped or written.
+struct ChunkPool {
+    total_pages: usize,
+    chunk_pages: usize,
+    chunks: Vec<Mutex<Option<Arc<Section>>>>,
+}
+
+impl ChunkPool {
+    fn new(total_pages: usize, chunk_pages: usize) -> Self {
+        let count = total_pages.div_ceil(chunk_pages);
+        let mut chunks = Vec::with_capacity(count);
+        for _ in 0..count {
+            chunks.push(Mutex::new(None));
+        }
+        Self {
+            total_pages,
+            chunk_pages,
+            chunks,
+        }
+    }
+
+    fn get_or_create(&self, chunk: usize) -> Option<Arc<Section>> {
+        let mut slot = self.chunks.get(chunk)?.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(section) = slot.as_ref() {
+            return Some(section.clone());
+        }
+        let pages = (self.total_pages - chunk * self.chunk_pages).min(self.chunk_pages);
+        let section = create_section(pages * PAGE, true)?;
+        *slot = Some(section.clone());
+        Some(section)
+    }
+}
+
+/// Backing for a physical page number: either a direct slice of a section, or
+/// a page inside a lazily-materialised [`ChunkPool`].
+#[derive(Clone)]
+enum PageBacking {
+    Direct(Slice),
+    Pooled { pool: Arc<ChunkPool>, page: usize },
+}
+
+impl PageBacking {
+    fn resolve(&self) -> Option<Slice> {
+        match self {
+            PageBacking::Direct(slice) => Some(slice.clone()),
+            PageBacking::Pooled { pool, page } => {
+                let section = pool.get_or_create(page / pool.chunk_pages)?;
+                Some(Slice {
+                    section,
+                    index: page % pool.chunk_pages,
+                })
+            }
+        }
     }
 }
 
@@ -367,7 +480,7 @@ struct Slice {
 #[derive(Default)]
 struct Physical {
     next_page: usize,
-    pages: HashMap<usize, Slice>,
+    pages: HashMap<usize, PageBacking>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each page is shown, by section and index in it.
@@ -407,50 +520,47 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
         return 0;
     };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
+    let use_chunks = !on_wine() && section_commit() && n > CHUNK_PAGES;
+    let backing_pool = if use_chunks {
+        Some(Arc::new(ChunkPool::new(n, CHUNK_PAGES)))
+    } else {
+        None
     };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
-    }
+    let direct_section = if backing_pool.is_none() {
+        let Some(section) = create_section(size, on_wine() || section_commit()) else {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        Some(section)
+    } else {
+        None
+    };
     tracing::debug!(
         n,
+        chunked = use_chunks,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
     for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
+        let backing = if let Some(pool) = &backing_pool {
+            PageBacking::Pooled {
+                pool: pool.clone(),
+                page: index,
+            }
+        } else {
+            PageBacking::Direct(Slice {
+                section: direct_section.as_ref().expect("direct section").clone(),
+                index,
+            })
         };
         let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
+        physical.pages.insert(number, backing);
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(number) };
     }
@@ -490,7 +600,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -501,7 +611,7 @@ impl View {
             return None;
         }
         let view = View { at, len };
-        commit(at.Value as usize, len).then_some(view)
+        commit(at.Value as usize, len, slice.section.committed).then_some(view)
     }
 
     fn bytes(&mut self) -> &mut [u8] {
@@ -531,7 +641,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     let physical = physical();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
-        let slice = physical.pages.get(page)?;
+        let slice = physical.pages.get(page)?.resolve()?;
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -539,7 +649,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
             {
                 *n += 1;
             }
-            _ => runs.push((slice.clone(), 1)),
+            _ => runs.push((slice, 1)),
         }
     }
     Some(runs)
@@ -646,23 +756,28 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
-    let mut i = 0;
-    while i < n {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
+    // Resolve all page numbers first so lazy chunk creation succeeds before
+    // mapping runs.
+    let mut resolved = Vec::with_capacity(n);
+    for &page in pages {
+        let Some(slice) = physical.pages.get(&page).and_then(PageBacking::resolve) else {
+            tracing::warn!(page, "XMemMapPhysicalPages: unknown or unallocatable page");
             return std::ptr::null_mut();
         };
+        resolved.push(slice);
+    }
+    let mut i = 0;
+    while i < n {
+        let first = &resolved[i];
         // One view per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
+        let run = 1 + resolved[i + 1..]
             .iter()
             .zip(1..)
-            .take_while(|&(page, k)| {
-                physical.pages.get(page).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
-                })
+            .take_while(|&(s, k)| {
+                Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map(&mut physical, base + i * PAGE, run * PAGE, first.clone()) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -747,7 +862,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -767,7 +882,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !commit(base, len, slice.section.committed) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -775,7 +890,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.handle as usize,
+        (slice.index * PAGE) as u64,
+    );
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         shown.push(base + k * PAGE);
@@ -785,9 +905,9 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).
-fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+fn commit(base: usize, len: usize, section_committed: bool) -> bool {
+    if section_committed || on_wine() {
+        return true; // section is already backed by SEC_COMMIT
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
@@ -1298,7 +1418,11 @@ mod tests {
 
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
-        let slice = physical().pages.get(&page).cloned().expect("known page");
+        let slice = physical()
+            .pages
+            .get(&page)
+            .and_then(PageBacking::resolve)
+            .expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
     }
 
@@ -1361,7 +1485,7 @@ mod tests {
         let at = base as usize;
         let shown = |page: usize| {
             let physical = physical();
-            let key = physical.pages[&page].key(0);
+            let key = physical.pages[&page].resolve().expect("resolved").key(0);
             let mut shown = physical.shown.get(&key).cloned().unwrap_or_default();
             shown.sort_unstable();
             shown

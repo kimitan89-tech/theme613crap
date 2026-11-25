@@ -463,16 +463,53 @@ impl TextureQueue {
         }
         // By the number of the write, counted over the run.
         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+        if again.len() > max {
+            again.select_nth_unstable_by(max, newest_first);
+            again.truncate(max);
+        }
         again.sort_unstable_by(newest_first);
-        fresh.sort_unstable_by(newest_first);
         let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
-        let (mut new, mut old) = (0, fresh.len());
-        while new < old && order.len() < max {
-            order.push((fresh[new].1, fresh[new].2));
-            new += 1;
-            if new < old && order.len() < max {
-                old -= 1;
-                order.push((fresh[old].1, fresh[old].2));
+        let need = max.saturating_sub(order.len());
+        if need > 0 && !fresh.is_empty() {
+            if fresh.len() <= need.saturating_mul(2) {
+                fresh.sort_unstable_by(newest_first);
+                let (mut new, mut old) = (0, fresh.len());
+                while new < old && order.len() < max {
+                    order.push((fresh[new].1, fresh[new].2));
+                    new += 1;
+                    if new < old && order.len() < max {
+                        old -= 1;
+                        order.push((fresh[old].1, fresh[old].2));
+                    }
+                }
+            } else {
+                // Only pick the `half` newest and `half` oldest without
+                // sorting all 20,000+ waiting slots every frame.
+                let new_take = need.div_ceil(2);
+                let old_take = need - new_take;
+                fresh.select_nth_unstable_by(new_take, newest_first);
+                let (newest, rest) = fresh.split_at_mut(new_take);
+                newest.sort_unstable_by(newest_first);
+                let oldest_slice: &mut [(u64, u32, u64)] = if old_take > 0 && !rest.is_empty() {
+                    let keep = old_take.min(rest.len());
+                    let oldest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| a.2.cmp(&b.2);
+                    if rest.len() > keep {
+                        rest.select_nth_unstable_by(keep, oldest_first);
+                    }
+                    let slice = &mut rest[..keep];
+                    slice.sort_unstable_by(oldest_first);
+                    slice
+                } else {
+                    &mut []
+                };
+                for i in 0..new_take.max(oldest_slice.len()) {
+                    if i < newest.len() && order.len() < max {
+                        order.push((newest[i].1, newest[i].2));
+                    }
+                    if i < oldest_slice.len() && order.len() < max {
+                        order.push((oldest_slice[i].1, oldest_slice[i].2));
+                    }
+                }
             }
         }
         order.truncate(max);
