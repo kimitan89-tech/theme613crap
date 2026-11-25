@@ -1450,6 +1450,9 @@ impl State {
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
         for (shadow, from, to) in &spans {
+            if shadow.is_in_place() {
+                continue;
+            }
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
                 // (`shadow::let_go_idle`) has never been refreshed.
@@ -1471,9 +1474,30 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let t_slots = started.elapsed();
         self.heap_textures(list, heap, host);
+        let total_elapsed = started.elapsed();
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
-        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(total_elapsed.as_micros() as u64, Ordering::Relaxed);
+        if total_elapsed.as_millis() >= 80 {
+            static LAST_SLOW: AtomicU64 = AtomicU64::new(0);
+            let now = crate::host::now_ms();
+            let prev = LAST_SLOW.load(Ordering::Relaxed);
+            if now >= prev + 5_000
+                && LAST_SLOW.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+            {
+                let tex_ms = total_elapsed.saturating_sub(t_slots).as_millis();
+                tracing::info!(
+                    total_ms = total_elapsed.as_millis(),
+                    buffers_ms = t_slots.as_millis(),
+                    textures_ms = tex_ms,
+                    slots_scanned = slots.len(),
+                    spans = spans.len(),
+                    dirty_spans,
+                    "slow heap_buffers pass breakdown"
+                );
+            }
+        }
         static LOGGED: AtomicU64 = AtomicU64::new(0);
         // The first pass and every growth of the set by half.
         let seen = LOGGED.load(Ordering::Relaxed);
@@ -1551,7 +1575,7 @@ impl State {
             HEAP_TEXTURES_RECHECKED[1].fetch_add(changed, Ordering::Relaxed);
             HEAP_TEXTURES_RECHECKED[2].store(waiting, Ordering::Relaxed);
         }
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due(frame, 256);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1586,10 +1610,10 @@ impl State {
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
                 .filter(|&ms| ms >= 2)
-                .unwrap_or(20)
+                .unwrap_or(12)
         });
         let span_normal = std::time::Duration::from_millis(base_ms);
-        let span_catch_up = std::time::Duration::from_millis(base_ms.saturating_mul(3).min(60));
+        let span_catch_up = std::time::Duration::from_millis(base_ms.saturating_mul(2).min(24));
         let (per_frame, span) = if census[0] > LONG && catching_up(std::time::Duration::ZERO) {
             (PER_FRAME_CATCHING_UP, span_catch_up)
         } else {

@@ -76,7 +76,7 @@ pub(crate) struct Shadow {
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, bool)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1572,10 +1572,10 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        if self.place.is_some() {
+        if let Some((_, _, section)) = &self.place {
             // Never counted with the copies (`Shadow::placed`).
             unregister_in_place(self.start, self.len);
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, *section);
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1853,6 +1853,11 @@ impl Shadow {
         self.watched.load(Ordering::Relaxed) == NOT_WATCHED
     }
 
+    /// Whether this buffer stands directly over title memory (`crate::inplace`).
+    pub(crate) fn is_in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     /// The copy's own number (see the field).
     pub(crate) fn id(&self) -> u64 {
         self.id
@@ -1876,7 +1881,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.section));
         register_in_place(start, len);
         shadow
     }
