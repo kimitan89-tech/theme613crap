@@ -180,6 +180,13 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
     unsafe { (*this.cast::<List>()).host.as_ref() }
 }
 
+/// Drops cached host bindings on `this` after an internal GPU pass modifies
+/// the host command list directly.
+#[cfg(windows)]
+pub(crate) fn invalidate_host(this: This) {
+    with_state(this, |_, state| state.invalidate_host());
+}
+
 /// The host side of a submitted list, taken from it: a queue that waits
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its

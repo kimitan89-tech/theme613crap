@@ -250,6 +250,10 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// itself in the 16-bit format are skipped ([`stands_in`]); convert them
 /// if a pass turns out to need one.
 pub(crate) fn target_format(format: u32) -> u32 {
+    // R9G9B9E5_SHAREDEXP (67): PC D3D12 forbids RTV/UAV; promote to FP16 RGBA.
+    if format == 67 {
+        return 10; // R16G16B16A16_FLOAT
+    }
     const STAND_INS: [(u32, u32); 2] = [(86, 28), (115, 28)];
     let Some(i) = STAND_INS.iter().position(|&(f, _)| f == format) else {
         return format;

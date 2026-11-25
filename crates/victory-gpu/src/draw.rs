@@ -613,10 +613,16 @@ impl State {
     /// shortcut: the render target views are made again from the handles'
     /// descriptors as they are now, not as they were when the title set
     /// the targets (a descriptor rewritten in between names another view).
-    pub(crate) fn replay(&mut self, list: &HostList) {
+    /// Drops cached host bindings after an internal pass replaces heaps, root
+    /// signature or pipeline on the underlying command list.
+    pub(crate) fn invalidate_host(&mut self) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+    }
+
+    pub(crate) fn replay(&mut self, list: &HostList) {
+        self.invalidate_host();
         if self.topology_set {
             self.set_topology(list, self.topology);
         }

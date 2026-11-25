@@ -16,9 +16,41 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+/// Optional automatic capture frame set `N` frames after the first upscaler
+/// dispatch when `VICTORY_DUMP_ON_UPSCALE=<N>` is set.
+static AUTO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Notes that a world upscaler dispatch ran on the frame currently being
+/// recorded; schedules an automatic target dump `N` frames later when
+/// `VICTORY_DUMP_ON_UPSCALE=<N>` is set.
+pub(crate) fn note_upscale() {
+    use std::sync::atomic::Ordering;
+    static OFFSET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let Some(offset) = *OFFSET.get_or_init(|| {
+        std::env::var("VICTORY_DUMP_ON_UPSCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    }) else {
+        return;
+    };
+    if AUTO_FRAME.load(Ordering::Relaxed) == 0 {
+        let target = crate::queue::presented() + 1 + offset;
+        if AUTO_FRAME
+            .compare_exchange(0, target, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            tracing::info!(target_frame = target, "scheduled automatic target dump after upscale");
+        }
+    }
+}
+
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    let auto = AUTO_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+    if auto != 0 && n == auto {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
