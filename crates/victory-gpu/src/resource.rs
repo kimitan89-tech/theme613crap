@@ -890,6 +890,11 @@ fn host_texture(
             &mut texture,
         )
     };
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!(
+        "CreateCommittedResource texture {}x{} f{} flags={:#x}",
+        d.width, d.height, d.format, d.flags
+    ));
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, "no host texture");
     }

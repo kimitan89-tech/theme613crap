@@ -315,12 +315,22 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             host.device
                 .CreateShaderResourceView(src, Some(&srv_desc), srv_cpu);
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateShaderResourceView upscale src {}x{} f{}",
+                src_w, src_h, src_desc.Format.0
+            ));
             host.device.CreateUnorderedAccessView(
                 dst,
                 None::<&ID3D12Resource>,
                 Some(&uav_desc),
                 uav_cpu,
             );
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateUnorderedAccessView upscale dst {}x{} f{}",
+                out_w, out_h, dst_desc.Format.0
+            ));
             let l = host_list.cmd();
             #[cfg(feature = "diagnostics")]
             host_list.note_op(|| {

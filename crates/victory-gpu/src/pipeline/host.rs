@@ -524,6 +524,10 @@ impl HostPipeline {
                 // SAFETY: as above.
                 || unsafe { host.device.CreateComputePipelineState(&desc) },
             );
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateComputePipelineState {shaders:?}"
+            ));
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
@@ -621,6 +625,10 @@ impl HostPipeline {
             // SAFETY: as above.
             || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
         );
+        #[cfg(feature = "diagnostics")]
+        crate::host::check_device_alive(format_args!(
+            "CreateGraphicsPipelineState {shaders:?}"
+        ));
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
@@ -697,13 +705,16 @@ fn mesh_pipeline(
         pPipelineStateSubobjectStream: (&raw mut stream).cast(),
     };
     let device = device.cast::<ID3D12Device2>()?;
-    super::library::pipeline(
+    let made = super::library::pipeline(
         name,
         // SAFETY: the stream holds whole subobjects pointing at live data.
         |library, name| unsafe { library.LoadPipeline(name, &desc) },
         // SAFETY: as above.
         || unsafe { device.CreatePipelineState(&desc) },
-    )
+    );
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!("CreatePipelineState mesh {name}"));
+    made
 }
 
 /// The bytes of shader code (none for an absent stage).
@@ -758,6 +769,13 @@ fn root_signature(
         let blob = blob.ok_or_else(windows::core::Error::empty)?;
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+        let root = device.CreateRootSignature(0, bytes)?;
+        #[cfg(feature = "diagnostics")]
+        crate::host::check_device_alive(format_args!(
+            "CreateRootSignature params={} samplers={} compute={compute}",
+            params.len(),
+            samplers.len()
+        ));
+        Ok((root, bytes.to_vec()))
     }
 }

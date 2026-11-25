@@ -363,6 +363,8 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of a sampler heap of ours.
     unsafe { host.device.CreateSampler(&desc, at) };
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!("CreateSampler null point"));
 }
 
 impl HostHeap {
@@ -511,15 +513,33 @@ impl HostHeap {
     ) {
         self.keep(index, kept);
         let Some(host) = host() else { return };
+        let at = self.cpu(index);
+        // D3D12 rejects a zero GPU address and non-256 alignment with device removal.
+        if gpu == 0 || !gpu.is_multiple_of(256) {
+            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+            // SAFETY: a slot of our heap; a zero location makes a null view.
+            unsafe {
+                host.device.CreateConstantBufferView(Some(&desc), at);
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateConstantBufferView null (bad gpu={gpu:#x} size={size})"
+            ));
+            return;
+        }
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: size.max(1).next_multiple_of(256).min(65536),
         };
         // SAFETY: a slot of our heap; the memory is kept alive by the caller or `kept`.
         unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
-        };
+            host.device.CreateConstantBufferView(Some(&desc), at);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::host::check_device_alive(format_args!(
+            "CreateConstantBufferView gpu={gpu:#x} size={}",
+            desc.SizeInBytes
+        ));
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
@@ -697,12 +717,300 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
+/// `D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING` when any 3-bit source is past
+/// `FORCE_1` (5) or the mapping is zero (unset from title memory).
+fn valid_component_mapping(m: u32) -> u32 {
+    if m == 0 {
+        return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    }
+    for i in 0..4 {
+        if ((m >> (3 * i)) & 0x7) > 5 {
+            return D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        }
+    }
+    m
+}
+
+/// Whether the host device supports a typed UAV of `format` (cached).
+fn uav_format_supported(device: &ID3D12Device, format: DXGI_FORMAT) -> bool {
+    static CACHE: Mutex<Option<HashMap<i32, bool>>> = Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(&ok) = map.get(&format.0) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: format,
+        ..Default::default()
+    };
+    // SAFETY: CheckFeatureSupport writes `support` of the given size.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .is_ok()
+        && (support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0) != 0;
+    map.insert(format.0, ok);
+    ok
+}
+
+/// Clamps mip/array fields shared by 1D/2D/cube SRV descriptions.
+fn clamp_srv_mips(most: &mut u32, levels: &mut u32, mip_count: u16) -> bool {
+    let mips = u32::from(mip_count.max(1));
+    if *most >= mips {
+        return false;
+    }
+    if *levels != u32::MAX {
+        *levels = (*levels).min(mips - *most);
+        if *levels == 0 {
+            return false;
+        }
+    }
+    true
+}
+
+fn clamp_array(first: &mut u32, size: &mut u32, count: u16) -> bool {
+    let n = u32::from(count.max(1));
+    if *first >= n {
+        return false;
+    }
+    if *size != u32::MAX {
+        *size = (*size).min(n - *first);
+        if *size == 0 {
+            return false;
+        }
+    } else {
+        *size = n - *first;
+    }
+    true
+}
+
+fn plane_ok(plane: u32, format: DXGI_FORMAT) -> bool {
+    // R32G8X24_TYPELESS (19) and R24G8_TYPELESS (44) expose a second plane.
+    plane == 0 || (plane == 1 && matches!(format.0, 19 | 44))
+}
+
+/// Rejects / clamps a texture SRV description against the host resource.
+fn sanitize_texture_srv(
+    desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC,
+    d: &D3D12_RESOURCE_DESC,
+) -> bool {
+    desc.Shader4ComponentMapping = valid_component_mapping(desc.Shader4ComponentMapping);
+    let msaa = d.SampleDesc.Count > 1;
+    let dim = d.Dimension;
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D | D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+                return false;
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2D
+        | D3D12_SRV_DIMENSION_TEXTURE2DARRAY
+        | D3D12_SRV_DIMENSION_TEXTURECUBE
+        | D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                return false;
+            }
+            if matches!(
+                desc.ViewDimension,
+                D3D12_SRV_DIMENSION_TEXTURECUBE | D3D12_SRV_DIMENSION_TEXTURECUBEARRAY
+            ) && d.DepthOrArraySize < 6
+            {
+                return false;
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE2D || !msaa {
+                return false;
+            }
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    if msaa
+        && !matches!(
+            desc.ViewDimension,
+            D3D12_SRV_DIMENSION_TEXTURE2DMS | D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY
+        )
+    {
+        return false;
+    }
+    match desc.ViewDimension {
+        D3D12_SRV_DIMENSION_TEXTURE1D => {
+            // SAFETY: ViewDimension selects Texture1D.
+            let t = unsafe { &mut desc.Anonymous.Texture1D };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: ViewDimension selects Texture1DArray.
+            let t = unsafe { &mut desc.Anonymous.Texture1DArray };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+                && clamp_array(&mut t.FirstArraySlice, &mut t.ArraySize, d.DepthOrArraySize)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2D => {
+            // SAFETY: ViewDimension selects Texture2D.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+                && plane_ok(t.PlaneSlice, d.Format)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: ViewDimension selects Texture2DArray.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+                && clamp_array(&mut t.FirstArraySlice, &mut t.ArraySize, d.DepthOrArraySize)
+                && plane_ok(t.PlaneSlice, d.Format)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE2DMS => true,
+        D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+            // SAFETY: ViewDimension selects Texture2DMSArray.
+            let t = unsafe { &mut desc.Anonymous.Texture2DMSArray };
+            clamp_array(&mut t.FirstArraySlice, &mut t.ArraySize, d.DepthOrArraySize)
+        }
+        D3D12_SRV_DIMENSION_TEXTURE3D => {
+            // SAFETY: ViewDimension selects Texture3D.
+            let t = unsafe { &mut desc.Anonymous.Texture3D };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBE => {
+            // SAFETY: ViewDimension selects TextureCube.
+            let t = unsafe { &mut desc.Anonymous.TextureCube };
+            clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels)
+        }
+        D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+            // SAFETY: ViewDimension selects TextureCubeArray.
+            let t = unsafe { &mut desc.Anonymous.TextureCubeArray };
+            if !clamp_srv_mips(&mut t.MostDetailedMip, &mut t.MipLevels, d.MipLevels) {
+                return false;
+            }
+            let faces = u32::from(d.DepthOrArraySize);
+            if t.First2DArrayFace >= faces {
+                return false;
+            }
+            let max_cubes = (faces - t.First2DArrayFace) / 6;
+            if max_cubes == 0 {
+                return false;
+            }
+            if t.NumCubes == 0 || t.NumCubes == u32::MAX {
+                t.NumCubes = max_cubes;
+            } else {
+                t.NumCubes = t.NumCubes.min(max_cubes);
+            }
+            t.NumCubes > 0
+        }
+        _ => false,
+    }
+}
+
+/// Rejects / clamps a texture UAV description against the host resource.
+fn sanitize_texture_uav(
+    desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    d: &D3D12_RESOURCE_DESC,
+) -> bool {
+    let dim = d.Dimension;
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE1D | D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE1D {
+                return false;
+            }
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2D | D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                return false;
+            }
+        }
+        D3D12_UAV_DIMENSION_TEXTURE3D => {
+            if dim != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+    let mips = u32::from(d.MipLevels.max(1));
+    match desc.ViewDimension {
+        D3D12_UAV_DIMENSION_TEXTURE1D => {
+            // SAFETY: ViewDimension selects Texture1D.
+            let t = unsafe { &mut desc.Anonymous.Texture1D };
+            t.MipSlice < mips
+        }
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+            // SAFETY: ViewDimension selects Texture1DArray.
+            let t = unsafe { &mut desc.Anonymous.Texture1DArray };
+            t.MipSlice < mips
+                && clamp_array(&mut t.FirstArraySlice, &mut t.ArraySize, d.DepthOrArraySize)
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2D => {
+            // SAFETY: ViewDimension selects Texture2D.
+            let t = unsafe { &mut desc.Anonymous.Texture2D };
+            t.MipSlice < mips && t.PlaneSlice == 0
+        }
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+            // SAFETY: ViewDimension selects Texture2DArray.
+            let t = unsafe { &mut desc.Anonymous.Texture2DArray };
+            t.MipSlice < mips
+                && t.PlaneSlice == 0
+                && clamp_array(&mut t.FirstArraySlice, &mut t.ArraySize, d.DepthOrArraySize)
+        }
+        D3D12_UAV_DIMENSION_TEXTURE3D => {
+            // SAFETY: ViewDimension selects Texture3D.
+            let t = unsafe { &mut desc.Anonymous.Texture3D };
+            if t.MipSlice >= mips {
+                return false;
+            }
+            let depth_at_mip = (u32::from(d.DepthOrArraySize) >> t.MipSlice.min(31)).max(1);
+            if t.FirstWSlice >= depth_at_mip {
+                return false;
+            }
+            if t.WSize == u32::MAX {
+                t.WSize = depth_at_mip - t.FirstWSlice;
+            } else {
+                t.WSize = t.WSize.min(depth_at_mip - t.FirstWSlice);
+            }
+            t.WSize > 0
+        }
+        _ => false,
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_SRV_DIMENSION_BUFFER {
+        once!(
+            dimension = desc.ViewDimension.0,
+            "non-buffer SRV dimension on buffer"
+        );
+        return None;
+    }
+    desc.Shader4ComponentMapping = valid_component_mapping(desc.Shader4ComponentMapping);
+    {
+        // SAFETY: ViewDimension is BUFFER.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            if buffer.StructureByteStride > 2048 {
+                once!(
+                    stride = buffer.StructureByteStride,
+                    "structured buffer SRV stride past 2048"
+                );
+                return None;
+            }
+            buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+            desc.Format = DXGI_FORMAT_UNKNOWN;
+        } else if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        } else if desc.Format == DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+    }
     let shadow = crate::shadow::find(address, len)?;
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
@@ -717,12 +1025,43 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    // SAFETY: a live host buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    let cap = width / element;
+    if buffer.FirstElement >= cap {
+        once!(
+            first = buffer.FirstElement,
+            cap,
+            "buffer SRV FirstElement past host width"
+        );
+        return None;
+    }
+    buffer.NumElements = u64::from(buffer.NumElements)
+        .min(cap - buffer.FirstElement)
+        .min(u64::from(u32::MAX)) as u32;
+    if buffer.NumElements == 0 {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
+            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: ViewDimension is BUFFER.
+        let b = unsafe { desc.Anonymous.Buffer };
+        crate::host::check_device_alive(format_args!(
+            "CreateShaderResourceView buffer fmt={} dim={} first={} num={} stride={} flags={:#x}",
+            desc.Format.0,
+            desc.ViewDimension.0,
+            b.FirstElement,
+            b.NumElements,
+            b.StructureByteStride,
+            b.Flags.0
+        ));
+    }
     Some(Some(shadow.buffer.clone()))
 }
 
@@ -737,10 +1076,36 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    if desc.ViewDimension != D3D12_UAV_DIMENSION_BUFFER {
+        once!(
+            dimension = desc.ViewDimension.0,
+            "non-buffer UAV dimension on buffer"
+        );
+        return None;
+    }
+    {
+        // SAFETY: ViewDimension is BUFFER.
+        let buffer = unsafe { &mut desc.Anonymous.Buffer };
+        if buffer.StructureByteStride > 0 {
+            if buffer.StructureByteStride > 2048 {
+                once!(
+                    stride = buffer.StructureByteStride,
+                    "structured buffer UAV stride past 2048"
+                );
+                return None;
+            }
+            buffer.Flags = D3D12_BUFFER_UAV_FLAG_NONE;
+            desc.Format = DXGI_FORMAT_UNKNOWN;
+        } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
+            desc.Format = DXGI_FORMAT_R32_TYPELESS;
+        } else if desc.Format == DXGI_FORMAT_UNKNOWN {
+            return None;
+        }
+    }
     let shadow = crate::shadow::find(address, len)?;
     // SAFETY: a live buffer.
-    let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
-    if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+    let host_desc = unsafe { shadow.buffer.GetDesc() };
+    if host_desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
         once!("unordered access to a buffer whose host copy shaders cannot write");
         return None;
     }
@@ -760,12 +1125,41 @@ fn buffer_uav(
     }
     buffer.FirstElement += offset / element;
     buffer.CounterOffsetInBytes = 0;
+    let cap = host_desc.Width / element;
+    if buffer.FirstElement >= cap {
+        once!(
+            first = buffer.FirstElement,
+            cap,
+            "buffer UAV FirstElement past host width"
+        );
+        return None;
+    }
+    buffer.NumElements = u64::from(buffer.NumElements)
+        .min(cap - buffer.FirstElement)
+        .min(u64::from(u32::MAX)) as u32;
+    if buffer.NumElements == 0 {
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
-    };
+            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at);
+    }
+    #[cfg(feature = "diagnostics")]
+    {
+        // SAFETY: ViewDimension is BUFFER.
+        let b = unsafe { desc.Anonymous.Buffer };
+        crate::host::check_device_alive(format_args!(
+            "CreateUnorderedAccessView buffer fmt={} dim={} first={} num={} stride={} flags={:#x}",
+            desc.Format.0,
+            desc.ViewDimension.0,
+            b.FirstElement,
+            b.NumElements,
+            b.StructureByteStride,
+            b.Flags.0
+        ));
+    }
     Some(Some(shadow.buffer.clone()))
 }
 
@@ -796,6 +1190,10 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
         );
         return false;
     }
+    if unordered && d.SampleDesc.Count > 1 {
+        once!(samples = d.SampleDesc.Count, "MSAA texture UAV refused");
+        return false;
+    }
     // Every family has more than one format, its typeless one first.
     let typeless = family(own) == own && family(own + 1) == own;
     if let Some(format) = format.as_deref_mut()
@@ -808,17 +1206,36 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
     if view == 0 {
-        return !typeless;
+        if typeless {
+            return false;
+        }
+    } else {
+        let promoted = crate::resource::pc_target_format(view) == own;
+        if family(view) != family(own) && !promoted {
+            once!(view, own, "view format of another family");
+            return false;
+        }
+        if let Some(format) = format.as_deref_mut()
+            && (!typeless || promoted)
+        {
+            *format = d.Format;
+        }
     }
-    let promoted = crate::resource::pc_target_format(view) == own;
-    if family(view) != family(own) && !promoted {
-        once!(view, own, "view format of another family");
-        return false;
-    }
-    if let Some(format) = format
-        && (!typeless || promoted)
-    {
-        *format = d.Format;
+    if unordered {
+        let Some(device) = host().map(|h| &h.device) else {
+            return false;
+        };
+        let mut view_fmt = format.as_ref().map_or(d.Format, |f| **f);
+        if view_fmt.0 == 0 {
+            view_fmt = d.Format;
+        }
+        if !uav_format_supported(device, view_fmt) {
+            once!(
+                format = view_fmt.0,
+                "host device does not support UAV for texture format"
+            );
+            return false;
+        }
     }
     true
 }
@@ -830,22 +1247,29 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = crate::shadow::find(address, u64::from(size.max(1)))?;
             let gpu = shadow.gpu(address);
-            let cbv_bytes = u64::from(size.max(1).next_multiple_of(256));
-            if !gpu.is_multiple_of(256) || cbv_bytes > shadow.left(address) {
+            let cbv_bytes = size.max(1).next_multiple_of(256).min(65536);
+            if gpu == 0 || !gpu.is_multiple_of(256) || u64::from(cbv_bytes) > shadow.left(address)
+            {
                 once!(
                     address = format_args!("{address:#x}"),
+                    gpu,
+                    size,
                     "constant buffer not 256-byte aligned on the host"
                 );
                 return None;
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: cbv_bytes as u32,
+                SizeInBytes: cbv_bytes,
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateConstantBufferView gpu={gpu:#x} size={cbv_bytes}"
+            ));
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -855,14 +1279,37 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
+                // SAFETY: a live texture.
+                let d = unsafe { texture.GetDesc() };
+                if let Some(ref mut desc) = desc
+                    && !sanitize_texture_srv(desc, &d)
+                {
+                    once!(
+                        dim = desc.ViewDimension.0,
+                        res = d.Dimension.0,
+                        "texture SRV ViewDimension/mip/array refused"
+                    );
+                    return None;
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
                         texture,
                         desc.as_ref().map(std::ptr::from_ref),
                         at,
-                    )
-                };
+                    );
+                }
+                #[cfg(feature = "diagnostics")]
+                crate::host::check_device_alive(format_args!(
+                    "CreateShaderResourceView tex {}x{}x{} f{} flags={:#x} view_dim={} view_fmt={}",
+                    d.Width,
+                    d.Height,
+                    d.DepthOrArraySize,
+                    d.Format.0,
+                    d.Flags.0,
+                    desc.as_ref().map(|x| x.ViewDimension.0).unwrap_or(0),
+                    desc.as_ref().map(|x| x.Format.0).unwrap_or(0),
+                ));
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -886,6 +1333,18 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            // SAFETY: a live texture.
+            let d = unsafe { texture.GetDesc() };
+            if let Some(ref mut desc) = desc
+                && !sanitize_texture_uav(desc, &d)
+            {
+                once!(
+                    dim = desc.ViewDimension.0,
+                    res = d.Dimension.0,
+                    "texture UAV ViewDimension/mip/array refused"
+                );
+                return None;
+            }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -893,8 +1352,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     None::<&ID3D12Resource>,
                     desc.as_ref().map(std::ptr::from_ref),
                     at,
-                )
-            };
+                );
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateUnorderedAccessView tex {}x{}x{} f{} flags={:#x} view_dim={} view_fmt={}",
+                d.Width,
+                d.Height,
+                d.DepthOrArraySize,
+                d.Format.0,
+                d.Flags.0,
+                desc.as_ref().map(|x| x.ViewDimension.0).unwrap_or(0),
+                desc.as_ref().map(|x| x.Format.0).unwrap_or(0),
+            ));
             Some(Some(texture.clone()))
         }
         View::Sampler(words) => {
@@ -906,12 +1376,22 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateSampler filter={} addrU={}",
+                desc.Filter.0, desc.AddressU.0
+            ));
             Some(None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!(
+                "CreateSampler console filter={} addrU={}",
+                desc.Filter.0, desc.AddressU.0
+            ));
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
@@ -984,7 +1464,10 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            #[cfg(feature = "diagnostics")]
+            crate::host::check_device_alive(format_args!("CreateConstantBufferView null"));
+            return;
         }
         _ => return null_view(at),
     };
@@ -1004,8 +1487,13 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             None::<&ID3D12Resource>,
             Some(&desc),
             at,
-        )
-    };
+        );
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!(
+        "CreateUnorderedAccessView null dim={} fmt={}",
+        desc.ViewDimension.0, desc.Format.0
+    ));
 }
 
 /// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
@@ -1067,8 +1555,10 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!("CreateShaderResourceView null buffer"));
 }
 
 /// A texture view that reads zeros with the dimension (and mip and array
@@ -1094,8 +1584,13 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!(
+        "CreateShaderResourceView null_like dim={}",
+        desc.ViewDimension.0
+    ));
 }
 
 /// A view that reads zeros, for slots whose view the host cannot make.
@@ -1118,8 +1613,10 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
         host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
-    };
+            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::host::check_device_alive(format_args!("CreateShaderResourceView null 2D"));
 }
 
 #[cfg(test)]
@@ -1221,5 +1718,193 @@ mod tests {
         heap.release(first, 2);
         heap.release(first, 2);
         assert_eq!(heap.acquire_shared(&key), None);
+    }
+
+    fn alive(host: &crate::host::Host) {
+        assert!(
+            // SAFETY: a plain query.
+            unsafe { host.device.GetDeviceRemovedReason() }.is_ok(),
+            "host device was removed"
+        );
+    }
+
+    fn tex2d(
+        host: &crate::host::Host,
+        format: DXGI_FORMAT,
+        flags: D3D12_RESOURCE_FLAGS,
+    ) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: plain committed texture for the test.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut texture,
+                )
+                .ok()?;
+        }
+        texture
+    }
+
+    /// Illegal / out-of-range views are refused or sanitized without removing the device.
+    #[test]
+    fn invalid_views_do_not_remove_the_device() {
+        let Some(host) = host() else {
+            return;
+        };
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return;
+        };
+        alive(host);
+
+        // RAYTRACING_ACCELERATION_STRUCTURE (11) on a buffer → refused.
+        let rtas = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION(11),
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            ..Default::default()
+        };
+        assert!(buffer_srv(0x2000_0000, 64, rtas, heap.cpu(0)).is_none());
+        alive(host);
+
+        // R9G9B9E5_SHAREDEXP texture UAV → refused by format support.
+        let f67 = DXGI_FORMAT(67); // R9G9B9E5_SHAREDEXP
+        if let Some(tex) = tex2d(host, f67, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+            let mut fmt = f67;
+            assert!(!fits(&tex, Some(&mut fmt), true));
+            alive(host);
+        }
+
+        // Out-of-bounds buffer SRV / UAV.
+        crate::shadow::register(0xDEAD, 0x3000_0000, 64);
+        let oob_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 1_000_000,
+                    NumElements: 4,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(buffer_srv(0x3000_0000, 64, oob_srv, heap.cpu(1)).is_none());
+        alive(host);
+        let oob_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 1_000_000,
+                    NumElements: 4,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(buffer_uav(0x3000_0000, 64, oob_uav, heap.cpu(2)).is_none());
+        alive(host);
+
+        // Structured buffer with a non-UNKNOWN format is sanitized (not a removal).
+        let structured = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 0,
+                    NumElements: 4,
+                    StructureByteStride: 16,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        assert!(buffer_srv(0x3000_0000, 64, structured, heap.cpu(3)).is_some());
+        alive(host);
+        let structured_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: 0,
+                    NumElements: 4,
+                    StructureByteStride: 16,
+                    Flags: D3D12_BUFFER_UAV_FLAG_NONE,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(buffer_uav(0x3000_0000, 64, structured_uav, heap.cpu(4)).is_some());
+        alive(host);
+
+        // TEXTURE3D SRV / UAV on a TEXTURE2D resource → refused.
+        let Some(tex2) = tex2d(
+            host,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ) else {
+            return;
+        };
+        // SAFETY: live test texture.
+        let d = unsafe { tex2.GetDesc() };
+        let mut bad_srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE3D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV {
+                    MipLevels: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(!sanitize_texture_srv(&mut bad_srv, &d));
+        let mut bad_uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE3D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_UAV {
+                    WSize: 1,
+                    ..Default::default()
+                },
+            },
+        };
+        assert!(!sanitize_texture_uav(&mut bad_uav, &d));
+        alive(host);
+
+        // CBV size 0 and past 65536: clamped / null, device stays up.
+        let (buf, _) = host.shared_buffer(256).expect("shared");
+        // SAFETY: live shared buffer.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        heap.constant_at(5, gpu, 0, Some(buf.clone()));
+        heap.constant_at(6, gpu, 70_000, Some(buf));
+        heap.constant_at(7, 0, 256, None); // null CBV for bad address
+        alive(host);
+
+        crate::shadow::unregister(0xDEAD, 0x3000_0000);
     }
 }

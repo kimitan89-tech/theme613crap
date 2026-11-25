@@ -95,6 +95,26 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// Logs the first time the host device is found removed, naming the call
+/// that just ran (void Create*View / Present / PSO paths that otherwise
+/// leave no HRESULT).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn check_device_alive(what: std::fmt::Arguments<'_>) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if let Some(h) = host() {
+        // SAFETY: a plain query.
+        if let Err(reason) = unsafe { h.device.GetDeviceRemovedReason() }
+            && !LOGGED.swap(true, Ordering::Relaxed)
+        {
+            tracing::error!(
+                ?reason,
+                thread = ?std::thread::current().name(),
+                "FIRST DEVICE REMOVAL DETECTED RIGHT AFTER: {what}"
+            );
+        }
+    }
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -1224,6 +1244,18 @@ impl Host {
             handle.ptr += (slot * self.rtv_size) as usize;
             self.device
                 .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            #[cfg(feature = "diagnostics")]
+            {
+                let d = resource.GetDesc();
+                check_device_alive(format_args!(
+                    "CreateRenderTargetView {}x{} f{} dim={} view_fmt={}",
+                    d.Width,
+                    d.Height,
+                    d.Format.0,
+                    d.Dimension.0,
+                    desc.map(|x| x.Format.0).unwrap_or(0),
+                ));
+            }
             handle
         }
     }
@@ -1241,6 +1273,18 @@ impl Host {
             handle.ptr += (slot * self.dsv_size) as usize;
             self.device
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            #[cfg(feature = "diagnostics")]
+            {
+                let d = resource.GetDesc();
+                check_device_alive(format_args!(
+                    "CreateDepthStencilView {}x{} f{} dim={} view_fmt={}",
+                    d.Width,
+                    d.Height,
+                    d.Format.0,
+                    d.Dimension.0,
+                    desc.map(|x| x.Format.0).unwrap_or(0),
+                ));
+            }
             handle
         }
     }
@@ -2909,6 +2953,11 @@ impl Host {
                     };
                     self.device
                         .CreateShaderResourceView(ov, Some(&srv_desc), cpu);
+                    #[cfg(feature = "diagnostics")]
+                    check_device_alive(format_args!(
+                        "CreateShaderResourceView present overlay fmt={} dim={}",
+                        srv_desc.Format.0, srv_desc.ViewDimension.0
+                    ));
                     list.SetGraphicsRootDescriptorTable(0, gpu);
                     list.DrawInstanced(3, 1, 0, 0);
                 }
@@ -2942,6 +2991,8 @@ impl Host {
                         crate::capture::save_read_back(frame, &buffer, &footprint);
                     }
                     let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+                    #[cfg(feature = "diagnostics")]
+                    check_device_alive(format_args!("swap_chain.Present overlays"));
                     p.meter.frame(p.hwnd);
                     let black = probe.is_some_and(|b| crate::capture::black(&b));
                     let _ = &scene;
@@ -2986,6 +3037,8 @@ impl Host {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            check_device_alive(format_args!("swap_chain.Present"));
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             {
