@@ -74,19 +74,18 @@ pub(crate) fn probe_level() -> u8 {
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// What stage 2 assumes with every submission waited for (the default):
+/// nothing reads title memory a flying submission writes through such a
+/// buffer. With `VICTORY_LATE_WAIT` / `VICTORY_RELAY`, in-place shader
+/// writes still join `Line::written` (`Step::InPlaceWrite`) so a host
+/// read of that memory settles the flight first — race-free with late
+/// wait and relay.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
 /// it). The view guard (`VICTORY_VIEW_GUARD`) also skips those pages
 /// (`shadow::in_place_covers`) so it never asks `VirtualProtect` on an
-/// in-place heap. Safe with `VICTORY_RELAY` (the card reads title memory
-/// itself; no copy-back). Do not combine stage 2 with `VICTORY_LATE_WAIT`
-/// (see above). The title's heaps are allocated once and kept, and
+/// in-place heap. The title's heaps are allocated once and kept, and
 /// nothing of the kind was seen; [`title_memory_freeing`] is there for
 /// the runtime to call before such a call once it takes them over.
 pub(crate) fn level() -> u8 {

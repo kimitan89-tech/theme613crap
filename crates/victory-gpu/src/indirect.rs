@@ -718,50 +718,73 @@ void main() {
         let content: Vec<u8> = (0..size).map(|i| (i * 31 + i / 251) as u8).collect();
         // SAFETY: the mapping holds `size` bytes.
         unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
-        // One pass over the three pieces; what it left in `differs` (7s
-        // where it stored nothing).
-        let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+        // One group per piece (64 threads hash one 64 KiB piece).
+        let run = |warp: &mut WarpHarness, mode: u32, first: u32, skew: u32, pieces: u32, bytes: u32| -> Vec<u32> {
             // SAFETY: our open list, live buffers, the compare's own root
             // signature; the mappings hold what is read and written.
             unsafe {
-                for piece in 0..PIECES as usize {
+                for piece in 0..pieces as usize {
                     differs_ptr.cast::<u32>().add(piece).write_volatile(7);
                 }
                 warp.list.SetComputeRootSignature(&compare.root);
                 warp.list.SetPipelineState(&compare.pso);
-                let constants = [0u32, 0, size as u32, PIECES, 0, mode];
+                let constants = [first, skew, bytes, pieces, 0, mode];
                 warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(pieces, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
-            [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            (0..pieces as usize)
+                .map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+                .collect()
         };
-        let at = PIECE + 1234;
-        // SAFETY (each): inside the mapping.
-        let set = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let set = |at: usize, value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+        let get = |at: usize| unsafe { now_ptr.add(at).read_volatile() };
         // 0: the hashes are stored, nothing is flagged.
-        assert_eq!(run(&mut warp, 0), [7, 7, 7]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
-        // A change in the second piece: flagged, and with 1 flagged again
-        // (the hash stays the old one).
-        set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 1), [0, 1, 0]);
-        // Changed back: with 1 the piece looks untouched.
-        set(content[at]);
-        assert_eq!(run(&mut warp, 1), [0, 0, 0]);
-        // With 2 the change is flagged once, and the hash is the new one.
-        set(content[at] ^ 0x40);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
-        // Changed back: flagged, where 1 saw nothing.
-        set(content[at]);
-        assert_eq!(run(&mut warp, 2), [0, 1, 0]);
-        assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        assert_eq!(run(&mut warp, 0, 0, 0, PIECES, size as u32), [7, 7, 7]);
+        assert_eq!(run(&mut warp, 1, 0, 0, PIECES, size as u32), [0, 0, 0]);
+        // Flips at first / middle / last byte of a piece, and across a
+        // 16-byte lane boundary (lane 0 ↔ lane 1).
+        for at in [0usize, PIECE + 1234, 2 * PIECE - 1, PIECE + 16, PIECE + 15] {
+            let before = get(at);
+            set(at, before ^ 0x40);
+            let flagged = run(&mut warp, 1, 0, 0, PIECES, size as u32);
+            assert_eq!(flagged[at / PIECE], 1, "flip at {at:#x}");
+            set(at, before);
+            assert_eq!(run(&mut warp, 1, 0, 0, PIECES, size as u32), [0, 0, 0]);
+        }
+        // Mode 2: detects then stores so the next compare is clean.
+        let at = PIECE + 1234;
+        set(at, get(at) ^ 0x40);
+        assert_eq!(run(&mut warp, 2, 0, 0, PIECES, size as u32), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2, 0, 0, PIECES, size as u32), [0, 0, 0]);
+        set(at, content[at]);
+        assert_eq!(run(&mut warp, 2, 0, 0, PIECES, size as u32), [0, 1, 0]);
+        assert_eq!(run(&mut warp, 2, 0, 0, PIECES, size as u32), [0, 0, 0]);
+        // Identical repeated 16-byte blocks: a flip must still flag (the
+        // reduce must not cancel identical lane hashes under XOR).
+        let block = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00];
+        for i in 0..PIECE / 16 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(block.as_ptr(), now_ptr.add(i * 16), 16);
+            }
+        }
+        assert_eq!(run(&mut warp, 0, 0, 0, 1, PIECE as u32), [7]);
+        assert_eq!(run(&mut warp, 1, 0, 0, 1, PIECE as u32), [0]);
+        set(32, get(32) ^ 1);
+        assert_eq!(run(&mut warp, 1, 0, 0, 1, PIECE as u32), [1]);
+        // Unaligned skew / size (copy starts mid-piece).
+        let skew = 0x1230u32;
+        let bytes = (2 * PIECE) as u32;
+        // SAFETY: restore a patterned prefix the skew path will hash.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        assert_eq!(run(&mut warp, 0, 0, skew, 2, bytes), [7, 7]);
+        assert_eq!(run(&mut warp, 1, 0, skew, 2, bytes), [0, 0]);
+        set(PIECE + 8, get(PIECE + 8) ^ 0x5a);
+        assert_eq!(run(&mut warp, 1, 0, skew, 2, bytes)[1], 1);
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
