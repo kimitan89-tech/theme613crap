@@ -49,6 +49,8 @@ pub(crate) struct Staging {
     size: usize,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// Actual allocated capacity of `buffer` (for `STAGING_POOL` reuse).
+    cap: u64,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -390,11 +392,57 @@ fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> 
 /// bytes.
 static STAGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Pooled D3D12 upload buffers (`ID3D12Resource`, persistent mapping, capacity)
+/// recycled from dropped [`Staging`] instances so streaming thousands of
+/// bindless textures does not call `CreateCommittedResource` per texture.
+struct PooledUpload {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    cap: u64,
+}
+// SAFETY: D3D12 upload resources and their persistent mappings are free-threaded;
+// a buffer only enters the pool after the last list referencing it has reset.
+unsafe impl Send for PooledUpload {}
+
+const STAGING_POOL_MAX_BYTES: u64 = 32 << 20;
+const STAGING_POOL_MAX_ENTRY: u64 = 8 << 20;
+
+static STAGING_POOL: Mutex<(Vec<PooledUpload>, u64)> = Mutex::new((Vec::new(), 0));
+
+fn take_staging_upload(min_size: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
+    let max_size = min_size.saturating_mul(2).max(64 << 10);
+    let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    // Best fit: smallest pooled buffer in `[min_size, max_size]`.
+    let best = pool
+        .0
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.cap >= min_size && p.cap <= max_size)
+        .min_by_key(|(_, p)| p.cap)
+        .map(|(i, _)| i)?;
+    let entry = pool.0.swap_remove(best);
+    pool.1 = pool.1.saturating_sub(entry.cap);
+    Some((entry.buffer, entry.data, entry.cap))
+}
+
+fn return_staging_upload(buffer: ID3D12Resource, data: *mut u8, cap: u64) {
+    if cap == 0 || cap > STAGING_POOL_MAX_ENTRY || crate::host::memory_pressure() {
+        return;
+    }
+    let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if pool.1.saturating_add(cap) > STAGING_POOL_MAX_BYTES {
+        return;
+    }
+    pool.1 += cap;
+    pool.0.push(PooledUpload { buffer, data, cap });
+}
+
 impl Drop for Staging {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        return_staging_upload(self.buffer.clone(), self.data, self.cap);
     }
 }
 
@@ -430,7 +478,13 @@ pub(crate) fn let_go() -> [u64; 2] {
 /// Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     use std::sync::atomic::Ordering::Relaxed;
-    let (idle_ms, idle_frames) = if crate::host::memory_pressure() {
+    let pressure = crate::host::memory_pressure();
+    if pressure {
+        let mut pool = STAGING_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.0.clear();
+        pool.1 = 0;
+    }
+    let (idle_ms, idle_frames) = if pressure {
         (2_000, 2)
     } else {
         (10_000, 4)
@@ -1153,23 +1207,46 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);
         }
-        // By 64 KiB block, one page asked of each: the title's memory is
-        // mapped in blocks of that size (the console's page), and the
-        // answer is a measure of how much of a texture has arrived, not a
-        // promise that every byte can be read (the upload reads through the
-        // kernel). By page, a texture half there cost a failed kernel read
-        // for each of its missing pages, every frame it stayed due: 1,663
-        // textures "uploaded in part" kept the pass over the heap's views at
-        // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
+        // By 64 KiB block, one page asked of each — batched up to 256 blocks
+        // per `K32QueryWorkingSetEx` syscall instead of 1 syscall per block.
+        use windows_sys::Win32::System::ProcessStatus::{
+            K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
         const BLOCK: usize = 64 << 10;
+        const KERNEL_PAGE: usize = 4096;
         let mut there = 0u64;
+        // SAFETY: plain data.
+        let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+        let mut spans: [(usize, usize); 256] = [(0, 0); 256];
         let mut block = start & !(BLOCK - 1);
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
-                there += (hi - lo) as u64;
+            let mut n = 0usize;
+            while block < end && n < info.len() {
+                let lo = block.max(start);
+                let hi = block.saturating_add(BLOCK).min(end);
+                info[n].VirtualAddress = (lo & !(KERNEL_PAGE - 1)) as *mut _;
+                spans[n] = (lo, hi);
+                n += 1;
+                block = block.saturating_add(BLOCK);
             }
-            block = block.saturating_add(BLOCK);
+            // SAFETY: `n` entries of the size given; our own process.
+            let asked = unsafe {
+                K32QueryWorkingSetEx(
+                    GetCurrentProcess(),
+                    info.as_mut_ptr().cast(),
+                    (n * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+                )
+            } != 0;
+            for i in 0..n {
+                // SAFETY: plain data filled by `K32QueryWorkingSetEx`.
+                let valid = asked && unsafe { info[i].VirtualAttributes.Flags } & 1 != 0;
+                let (lo, hi) = spans[i];
+                let mut byte = [0u8];
+                if valid || crate::host::read_into(lo as *const u8, &mut byte) {
+                    there += (hi - lo) as u64;
+                }
+            }
         }
         return there;
     }
@@ -1245,7 +1322,14 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let alloc_size = total.next_multiple_of(64 << 10);
+    let (buffer, data, cap) = match take_staging_upload(total) {
+        Some(reused) => reused,
+        None => {
+            let (buffer, data) = host.upload_buffer(alloc_size)?;
+            (buffer, data, alloc_size)
+        }
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1267,6 +1351,7 @@ fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<S
         first,
         size,
         bytes: total,
+        cap,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
