@@ -59,8 +59,13 @@ struct Journal {
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` / `ahead_views` stay, until
-    /// [`ask_once_end`].
+    /// [`ask_once_end`]. With [`ask_frame`], write-watched `ahead` ranges
+    /// also stand for later submissions of the same title frame (view
+    /// `ahead_views` are cleared every submission).
     kept: bool,
+    /// Title frame ([`crate::frame::current`]) the kept write-watched asking
+    /// belongs to when [`ask_frame`] is on.
+    frame: u64,
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -71,6 +76,7 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead_views: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    frame: 0,
 });
 
 /// Ranges of one submission closer than this are asked about together:
@@ -181,12 +187,48 @@ pub(crate) fn once() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ASK_ONCE").is_none_or(|v| v != "0"))
 }
 
+/// Whether write-watched [`ask_once`] ranges stand for every submission of
+/// the title frame (`VICTORY_ASK_FRAME=1`; on by default with [`once`]). A
+/// 174 MB title buffer was asked ~12–33×/frame; one write-watched asking
+/// per frame cuts that. View-memory guards are still redone every
+/// submission. Cross-thread stores into write-watched memory during the
+/// frame are seen on the next frame (same tradeoff [`once`] takes within a
+/// submission). `VICTORY_ASK_FRAME=0` ends the asking per submission.
+pub(crate) fn ask_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        once() && std::env::var_os("VICTORY_ASK_FRAME").is_none_or(|v| v != "0")
+    })
+}
+
 /// With [`once`]: asks about `ranges` (everything a submission's lists
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
-/// [`ask_once_end`].
+/// [`ask_once_end`]. With [`ask_frame`], later submissions of the same
+/// title frame reuse write-watched ranges and only extend them.
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
+    }
+    let frame = crate::frame::current();
+    if ask_frame() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        if j.kept && j.frame == frame {
+            // Same title frame: keep write-watched ahead, re-check views,
+            // and extend with ranges the earlier asking missed.
+            j.ahead_views.clear();
+            for &(start, end) in ranges {
+                if start >= end {
+                    continue;
+                }
+                let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+                if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b)
+                    && ask_kernel(&mut j, first, last)
+                {
+                    j.ahead.push((first, last));
+                }
+            }
+            return;
+        }
     }
     ask_once_end();
     ask_ahead(ranges);
@@ -212,6 +254,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         }
     }
     j.ahead_views.clear();
+    j.frame = frame;
     j.kept = true;
     KEPT.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -225,7 +268,20 @@ pub(crate) fn ask_once_end() {
         KEPT.store(false, std::sync::atomic::Ordering::Relaxed);
         j.ahead.clear();
         j.ahead_views.clear();
+        j.frame = 0;
     }
+}
+
+/// Submission finished: with [`ask_frame`], write-watched ranges stand for
+/// later submissions of the same title frame (view guards do not); otherwise
+/// as [`ask_once_end`].
+pub(crate) fn ask_once_release() {
+    if ask_frame() {
+        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        j.ahead_views.clear();
+        return;
+    }
+    ask_once_end();
 }
 
 /// We wrote title memory `[at, at + len)` while a submission's one asking

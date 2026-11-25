@@ -4262,7 +4262,10 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         batch.flush();
-        crate::watch::ask_once_end();
+        // With `VICTORY_ASK_FRAME`, write-watched ranges stand for later
+        // submissions of this title frame (a 174 MB buffer was asked dozens
+        // of times a frame); view guards are redone every submission.
+        crate::watch::ask_once_release();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
