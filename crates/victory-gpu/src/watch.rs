@@ -24,7 +24,7 @@
 //! system call writing into a guarded block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -326,7 +326,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Lock order stays JOURNAL → GUARDS (as `guard` takes `GUARDS`).
     let known_view = cover_view || {
         guarded && {
-            let g = guards();
+            let g = guards_read();
             g.protected.contains(&(start / BLOCK)) || g.absent.contains(&(start / BLOCK))
         }
     };
@@ -407,15 +407,19 @@ struct Guards {
     aliased: BTreeSet<usize>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
 });
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
+    GUARDS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn guards_write() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -430,20 +434,27 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
-        let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first)
-    };
-    if !known && !is_view(start, end) {
-        return None;
+    let ask_always = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    {
+        let g = guards_read();
+        let known = !ask_always && (g.protected.contains(&first) || g.absent.contains(&first));
+        // Clean under a shared lock: wide merges and refreshes skip the write lock.
+        if known && g.clean.range(first..last).count() == last - first {
+            return Some(Vec::new());
+        }
+        if !known {
+            drop(g);
+            if !is_view(start, end) {
+                return None;
+            }
+        }
     }
     install();
-    let mut g = guards();
+    let mut g = guards_write();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Fast path: every block is already clean — no Vec allocation.
+    // Fast path under the write lock: another thread may have cleaned it.
     if g.clean.range(first..last).count() == last - first {
         return Some(written);
     }
@@ -744,10 +755,22 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// Before our own write into title memory `[at, at + len)` through the
 /// kernel (which does not fault into our handler): opens its guarded blocks.
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
-/// reads into its own memory.
+/// reads into its own memory. Private write-watched buffers take only a
+/// shared lock (nothing is guarded there).
 pub fn writing(at: usize, len: usize) {
     // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
+    let end = at.saturating_add(len);
+    let needs_open = if at < end {
+        let g = guards_read();
+        let range = at / BLOCK..end.div_ceil(BLOCK);
+        g.protected.range(range.clone()).next().is_some()
+            || (!g.aliased.is_empty() && g.aliased.range(range).next().is_some())
+    } else {
+        false
+    };
+    if needs_open {
+        open(&mut guards_write(), at, end);
+    }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
 }
@@ -765,7 +788,7 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
     if ranges.is_empty() {
         return;
     }
-    let mut g = guards();
+    let mut g = guards_write();
     for &(at, n) in &ranges {
         if open_here(&mut g, at, at.saturating_add(n)) {
             #[cfg(feature = "diagnostics")]
@@ -834,7 +857,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
-    let mut g = guards();
+    let mut g = guards_write();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -873,7 +896,7 @@ fn install() {
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
-        let mut g = guards();
+        let mut g = guards_write();
         if open(&mut g, at, at + 1) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
@@ -912,6 +935,56 @@ mod tests {
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+    /// `writing` on private memory takes only a read lock; on a guarded
+    /// view it upgrades and opens so a later kernel-style write can land.
+    #[test]
+    fn writing_skips_unguarded_and_opens_guarded_views() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
+        };
+        // Private write-watched pages: nothing in GUARDS → read-lock path.
+        let private = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                BLOCK,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(private, 0);
+        writing(private, BLOCK);
+        assert!(!guards_read().protected.contains(&(private / BLOCK)));
+        unsafe { VirtualFree(private as *mut _, 0, MEM_RELEASE) };
+
+        // Guarded view: writing must open the block.
+        let view = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                BLOCK as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + BLOCK).is_some());
+        assert!(guards_read().protected.contains(&(view / BLOCK)));
+        writing(view, 16);
+        assert!(!guards_read().protected.contains(&(view / BLOCK)));
+        // SAFETY: our view, now writable again.
+        unsafe {
+            (view as *mut u8).write_volatile(0x5a);
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, BLOCK);
+    }
+
     /// Four contiguous guarded view blocks open in one call and leave
     /// `protected` / `clean`.
     #[test]
@@ -935,7 +1008,7 @@ mod tests {
         assert_ne!(view, 0);
         assert!(guard(view, view + 4 * BLOCK).is_some());
         {
-            let mut g = guards();
+            let mut g = guards_write();
             let from = view / BLOCK;
             assert!(g.protected.contains(&from));
             assert!(g.protected.contains(&(from + 3)));

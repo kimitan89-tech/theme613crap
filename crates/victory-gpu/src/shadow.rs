@@ -1026,9 +1026,20 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| word + i)
 }
 
+/// Copies only the minimal differing byte span `[first..=last]` from `src`
+/// into `dst` (same length). Returns `Some((first, last + 1))` when at least
+/// one byte differed, or `None` when `src == dst`.
+fn diff_copy_into(src: &[u8], dst: &mut [u8]) -> Option<(usize, usize)> {
+    debug_assert_eq!(src.len(), dst.len());
+    let first = first_difference(src, dst)?;
+    let last = last_difference(src, dst).unwrap_or(first);
+    dst[first..=last].copy_from_slice(&src[first..=last]);
+    Some((first, last + 1))
+}
+
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{diff_copy_into, first_difference, last_difference};
 
     /// The word-wise searches agree with the byte-wise ones they replace.
     #[test]
@@ -1050,6 +1061,31 @@ mod difference_tests {
                 }
             }
         }
+    }
+
+    /// Diff-before-dirty: identical bytes leave the destination alone (kills
+    /// the card re-upload ping-pong); edits copy only the spanning run.
+    #[test]
+    fn diff_copy_into_skips_identical_and_copies_minimal_span() {
+        for len in [0usize, 1, 7, 9, 65536] {
+            let src: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
+            let mut dst = src.clone();
+            assert_eq!(diff_copy_into(&src, &mut dst), None);
+            assert_eq!(dst, src);
+        }
+        let mut src = vec![0u8; 64];
+        let mut dst = src.clone();
+        src[12..16].copy_from_slice(&0xA1B2C3D4u32.to_le_bytes());
+        assert_eq!(diff_copy_into(&src, &mut dst), Some((12, 16)));
+        assert_eq!(&dst[12..16], &src[12..16]);
+        assert_eq!(&dst[..12], &[0u8; 12]);
+        assert_eq!(&dst[16..], &vec![0u8; 48]);
+        let mut src = vec![0u8; 64];
+        let mut dst = src.clone();
+        src[4] ^= 1;
+        src[40] ^= 2;
+        assert_eq!(diff_copy_into(&src, &mut dst), Some((4, 41)));
+        assert_eq!(dst, src);
     }
 }
 
@@ -2576,13 +2612,25 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
+    /// asking), whole pages within the buffer. Card copies already filled
+    /// by a merge skip the re-upload when title bytes match (`copy_card_diff`).
     fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        // `(first page, first load)`: first loads always take [`copy`]; later
+        // card pages take [`copy_card_diff`] so identical bytes stay clean.
+        let (mut bytes, mut run): (usize, Option<(usize, bool)>) = (0, None);
         let last = (to - 1) / PAGE;
+        let flush = |first_page: usize, first_load: bool, end: usize| -> usize {
+            let a = (first_page * PAGE).max(from);
+            let b = end.min(to);
+            if self.card.is_some() && !first_load {
+                self.copy_card_diff(a, b)
+            } else {
+                self.copy(a, b)
+            }
+        };
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -2593,22 +2641,66 @@ impl Shadow {
             };
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let is_first = *at == 0;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                if let Some((start_page, run_first)) = run
+                    && run_first != is_first
+                {
+                    bytes += flush(start_page, run_first, (page * PAGE).min(to));
+                    run = Some((page, is_first));
+                } else {
+                    run.get_or_insert((page, is_first));
+                }
+            } else if let Some((first, first_load)) = run.take() {
+                bytes += flush(first, first_load, (page * PAGE).min(to));
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
-        if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        if let Some((first, first_load)) = run {
+            bytes += flush(first, first_load, ((last + 1) * PAGE).min(to));
         }
         bytes
+    }
+
+    /// For a card copy already loaded once: read title memory and update the
+    /// host side only where bytes differ, so a page dirtied by a merge that
+    /// already wrote the same bytes does not re-upload to the card.
+    fn copy_card_diff(&self, from: usize, to: usize) -> usize {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut copied = 0usize;
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let mut c_from = from;
+            while c_from < to {
+                let c_to = (c_from + (256 << 10)).min(to);
+                let n = c_to - c_from;
+                let off = c_from - start;
+                scratch.resize(n, 0);
+                crate::host::copy_mapped(scratch.as_mut_ptr(), c_from as *const u8, n, false);
+                // SAFETY: inside the mapping; `copy_stale` only runs outside
+                // ranges shaders may still be writing (`self.pending`).
+                let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };
+                if let Some((lo, hi)) = diff_copy_into(&scratch[..n], held) {
+                    self.changed(off + lo, off + hi);
+                    self.card_changed(off + lo, off + hi);
+                    copied += hi - lo;
+                }
+                c_from = c_to;
+            }
+        });
+        copied
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
