@@ -1352,19 +1352,36 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        type CachedSpans = Vec<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges, CachedSpans)>>> =
-            std::sync::Mutex::new(None);
+        // Ranges are bucketed by `index % RESCAN_BUCKETS` so each pass only
+        // walks 1/128 of the keys when pruning. Per shadow, the list of
+        // active (from, to) ranges lets a boundary change recompute that
+        // shadow's span in O(k) instead of rebuilding from all ~83,000 slots.
+        type Range = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+        type Ranges = std::collections::HashMap<u32, Range>;
+        type Buckets = Vec<Ranges>;
+        type SpansMap = std::collections::HashMap<usize, Range>;
+        type ShadowParts = std::collections::HashMap<usize, Vec<(u64, u64)>>;
+        type CachedSpans = Vec<Range>;
+        const RESCAN_BUCKETS: u32 = 128;
+        static RANGES: std::sync::Mutex<
+            Option<std::collections::HashMap<usize, (u64, Buckets, SpansMap, ShadowParts, CachedSpans)>>,
+        > = std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges, cached_spans) = kept
+        let (passes, buckets, spans_map, shadow_parts, cached_spans) = kept
             .get_or_insert_with(Default::default)
             .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new(), Vec::new()));
+            .or_insert_with(|| {
+                (
+                    0,
+                    (0..RESCAN_BUCKETS).map(|_| Ranges::new()).collect(),
+                    SpansMap::new(),
+                    ShadowParts::new(),
+                    Vec::new(),
+                )
+            });
         // Always rescan what changed; each pass also walks 1/128 of all
         // slots (~650 slots/frame instead of ~5,200) and prunes that bucket's
         // stale keys so released views clear without stalling every frame.
-        const RESCAN_BUCKETS: u32 = 128;
         let bucket = (*passes % u64::from(RESCAN_BUCKETS)) as u32;
         let bucket_slots = host.buffer_slots_bucket(bucket, RESCAN_BUCKETS);
         let bucket_set: std::collections::HashSet<u32> = bucket_slots.iter().copied().collect();
@@ -1372,23 +1389,102 @@ impl State {
         for &index in &bucket_slots {
             scan.insert(index);
         }
-        let before_len = ranges.len();
-        ranges.retain(|k, _| *k % RESCAN_BUCKETS != bucket || bucket_set.contains(k));
-        let mut dirty_spans = ranges.len() != before_len;
+        let mut spans_touched = cached_spans.is_empty();
+        let mut boundary_rebuilds: u32 = 0;
+        // Drop one (from, to) from a shadow's part list; recompute that
+        // shadow's span when the removed range sat on the current min/max.
+        let span_remove = |spans: &mut SpansMap,
+                           parts: &mut ShadowParts,
+                           shadow: &std::sync::Arc<crate::shadow::Shadow>,
+                           from: u64,
+                           to: u64|
+         -> bool {
+            let key = std::sync::Arc::as_ptr(shadow) as usize;
+            let Some(list) = parts.get_mut(&key) else {
+                spans.remove(&key);
+                return false;
+            };
+            if let Some(i) = list.iter().position(|&(a, b)| a == from && b == to) {
+                list.swap_remove(i);
+            }
+            let boundary = spans
+                .get(&key)
+                .is_some_and(|(_, lo, hi)| *lo == from || *hi == to);
+            if list.is_empty() {
+                parts.remove(&key);
+                spans.remove(&key);
+                return true;
+            }
+            if boundary {
+                let (mut lo, mut hi) = (u64::MAX, 0u64);
+                for &(a, b) in list.iter() {
+                    lo = lo.min(a);
+                    hi = hi.max(b);
+                }
+                if let Some(span) = spans.get_mut(&key) {
+                    span.1 = lo;
+                    span.2 = hi;
+                }
+                return true;
+            }
+            false
+        };
+        let span_add = |spans: &mut SpansMap,
+                        parts: &mut ShadowParts,
+                        shadow: std::sync::Arc<crate::shadow::Shadow>,
+                        from: u64,
+                        to: u64| {
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            parts.entry(key).or_default().push((from, to));
+            let span = spans.entry(key).or_insert_with(|| (shadow, from, to));
+            span.1 = span.1.min(from);
+            span.2 = span.2.max(to);
+        };
+        {
+            let bucket_map = &mut buckets[bucket as usize];
+            let mut removed = Vec::new();
+            bucket_map.retain(|k, v| {
+                if bucket_set.contains(k) {
+                    true
+                } else {
+                    removed.push(v.clone());
+                    false
+                }
+            });
+            for (shadow, from, to) in removed {
+                if span_remove(spans_map, shadow_parts, &shadow, from, to) {
+                    boundary_rebuilds += 1;
+                    spans_touched = true;
+                }
+            }
+        }
         let slots: Vec<u32> = scan.into_iter().collect();
         *passes += 1;
+        let t_prune = started.elapsed();
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            let prev = ranges.remove(&index);
+            let b = (index % RESCAN_BUCKETS) as usize;
+            let prev = buckets[b].remove(&index);
             let Some(handle) = heap.handle(index) else {
-                dirty_spans |= prev.is_some();
+                if let Some((shadow, from, to)) = prev
+                    && span_remove(spans_map, shadow_parts, &shadow, from, to)
+                {
+                    boundary_rebuilds += 1;
+                    spans_touched = true;
+                }
                 continue;
             };
-            let Some(view) = host.mirror(index, handle, true) else {
-                dirty_spans |= prev.is_some();
+            let need_copy = prev.is_none();
+            let Some((remade, copy)) = host.mirror_buffer(index, handle, need_copy) else {
+                if let Some((shadow, from, to)) = prev
+                    && span_remove(spans_map, shadow_parts, &shadow, from, to)
+                {
+                    boundary_rebuilds += 1;
+                    spans_touched = true;
+                }
                 continue;
             };
             // Every 64 views while the device lives (a cheap query).
@@ -1406,38 +1502,49 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                dirty_spans |= prev.is_some();
+            // The copy the slot shows: from mirror_buffer when remade or when
+            // this slot was new to the cache; otherwise the previous range.
+            let resolved = match copy {
+                Some((shadow, address, len)) => Some((shadow, address, address + len)),
+                None if !remade => prev.clone(),
+                None => None,
+            };
+            let Some((shadow, address, end)) = resolved else {
+                if let Some((shadow, from, to)) = prev
+                    && span_remove(spans_map, shadow_parts, &shadow, from, to)
+                {
+                    boundary_rebuilds += 1;
+                    spans_touched = true;
+                }
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            let end = address + len;
             let same = prev.as_ref().is_some_and(|(s, a, b)| {
                 std::sync::Arc::ptr_eq(s, &shadow) && *a == address && *b == end
             });
-            dirty_spans |= !same;
-            ranges.insert(index, (shadow, address, end));
-        }
-        let views = ranges.len() as u32;
-        if dirty_spans || cached_spans.is_empty() {
-            // Per host copy, the span its picked views cover.
-            let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-                std::collections::HashMap::new();
-            for (shadow, from, to) in ranges.values() {
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-                span.1 = span.1.min(*from);
-                span.2 = span.2.max(*to);
+            if !same {
+                spans_touched = true;
+                if let Some((ps, pa, pb)) = prev
+                    && span_remove(spans_map, shadow_parts, &ps, pa, pb)
+                {
+                    boundary_rebuilds += 1;
+                }
+                span_add(spans_map, shadow_parts, shadow.clone(), address, end);
             }
-            *cached_spans = spans.into_values().collect();
+            buckets[b].insert(index, (shadow, address, end));
+        }
+        let t_scan = started.elapsed();
+        let views = buckets.iter().map(|b| b.len() as u32).sum::<u32>();
+        if spans_touched || cached_spans.is_empty() {
+            *cached_spans = spans_map.values().cloned().collect();
         }
         let spans = cached_spans.clone();
+        let dirty_spans = boundary_rebuilds > 0;
         drop(kept);
+        let t_spans = started.elapsed();
         let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
         // Memory that is not write-watched is copied whole by every refresh.
         // It was once refreshed only every 120 frames (unmapped pages read
@@ -1490,10 +1597,15 @@ impl State {
                 tracing::info!(
                     total_ms = total_elapsed.as_millis(),
                     buffers_ms = t_slots.as_millis(),
+                    prune_ms = t_prune.as_millis(),
+                    scan_ms = t_scan.saturating_sub(t_prune).as_millis(),
+                    spans_ms = t_spans.saturating_sub(t_scan).as_millis(),
+                    refresh_ms = t_slots.saturating_sub(t_spans).as_millis(),
                     textures_ms = tex_ms,
                     slots_scanned = slots.len(),
                     spans = spans.len(),
                     dirty_spans,
+                    boundary_rebuilds,
                     "slow heap_buffers pass breakdown"
                 );
             }

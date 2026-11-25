@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -1441,7 +1441,10 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        // Only title writes (`!seen`) dirty the change set. A draw or the
+        // heap buffer pass making a slot (`seen`) used to re-insert every
+        // remade slot, so the next frame rescanned tens of thousands.
+        if was && !seen {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1630,6 +1633,33 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        self.mirror_inner(index, handle, for_draw, false)
+            .map(|(view, _, _)| view)
+    }
+
+    /// Like [`mirror`] for the heap buffer pass: ensures the host slot is
+    /// current for a draw and returns whether it was remade, plus the buffer
+    /// copy the slot shows when `need_copy` or a remake required looking it
+    /// up. The copy is computed once and reused for host view creation, so
+    /// [`buffer_copy`] / [`crate::shadow::find`] are not run a second time
+    /// by the caller. The `made` lock is dropped around host view creation.
+    pub(crate) fn mirror_buffer(
+        &self,
+        index: u32,
+        handle: u64,
+        need_copy: bool,
+    ) -> Option<(bool, Option<(Arc<crate::shadow::Shadow>, u64, u64)>)> {
+        self.mirror_inner(index, handle, true, need_copy)
+            .map(|(_, remade, copy)| (remade, copy))
+    }
+
+    fn mirror_inner(
+        &self,
+        index: u32,
+        handle: u64,
+        for_draw: bool,
+        need_copy: bool,
+    ) -> Option<(View, bool, Option<(Arc<crate::shadow::Shadow>, u64, u64)>)> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.
@@ -1655,59 +1685,107 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                drop(made);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
                 // Left for later and stale since: out of the sets and the stride table.
+                drop(made);
                 let _ = self.note_buffer(index, None, false);
             }
             return None;
         };
-        if made[index as usize] != key {
-            // Views of other textures in the memory this one describes
-            // are stale: their host slots read nothing from here on, and
-            // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
-                if stale != index {
-                    self.unmake(&mut made, stale);
-                }
-            }
-            // A view of a texture object that has no host copy yet waits
-            // for it, as buffer views wait for a draw: the slot is made
-            // when the texture is first used (`super::make_waiting`), or
-            // here when a draw reads the slot through a table.
-            let waiting = if for_draw { None } else { view.waiting_texture() };
-            if let Some(texture) = waiting {
-                super::wait_for(texture, handle);
-            }
-            let later = !for_draw && (view.is_buffer() || waiting.is_some());
-            // Another view of the placed texture the slot shows already (a
-            // title that streams a texture in writes its view again with
-            // more mips each time some arrive): the slot goes on showing
-            // the old view until a draw or the texture pass makes the new
-            // one and uploads what it shows. Made null here, the texture
-            // read as nothing for as long as it waited in the queue, every
-            // time it got sharper.
-            if later
-                && keep_views()
-                && view_at(made[index as usize] as u32, (made[index as usize] >> 32) as u32)
-                    .is_some_and(|old| same_placed_texture(&old, &view))
-            {
-                KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Some(view);
-            }
-            made[index as usize] = if later { 0 } else { key };
-            let kept = if later {
-                None
+        let old_key = made[index as usize];
+        if old_key == key {
+            drop(made);
+            let copy = if need_copy {
+                buffer_copy(&view)
             } else {
-                make(&view, self.cpu(index))
+                None
             };
-            if kept.is_none() && !self.sampler {
-                null_for(&view, self.cpu(index));
-            }
-            self.keep(index, kept.flatten());
+            return Some((view, false, copy));
         }
-        Some(view)
+        // Title rewrote the descriptor with a new generation (or index) but
+        // the view words are the same: the host slot already shows it
+        // (`made` holds a key only after a successful make), so skip
+        // Create*View. A failed make leaves `made` at 0 and retries below.
+        if old_key != 0
+            && view_at(old_key as u32, (old_key >> 32) as u32).is_some_and(|old| old == view)
+        {
+            made[index as usize] = key;
+            drop(made);
+            let copy = if need_copy {
+                buffer_copy(&view)
+            } else {
+                None
+            };
+            return Some((view, false, copy));
+        }
+        // Views of other textures in the memory this one describes
+        // are stale: their host slots read nothing from here on, and
+        // let go of the host copies they held.
+        for stale in self.note_buffer(index, Some(&view), for_draw) {
+            if stale != index {
+                self.unmake(&mut made, stale);
+            }
+        }
+        // A view of a texture object that has no host copy yet waits
+        // for it, as buffer views wait for a draw: the slot is made
+        // when the texture is first used (`super::make_waiting`), or
+        // here when a draw reads the slot through a table.
+        let waiting = if for_draw { None } else { view.waiting_texture() };
+        if let Some(texture) = waiting {
+            super::wait_for(texture, handle);
+        }
+        let later = !for_draw && (view.is_buffer() || waiting.is_some());
+        // Another view of the placed texture the slot shows already (a
+        // title that streams a texture in writes its view again with
+        // more mips each time some arrive): the slot goes on showing
+        // the old view until a draw or the texture pass makes the new
+        // one and uploads what it shows. Made null here, the texture
+        // read as nothing for as long as it waited in the queue, every
+        // time it got sharper.
+        if later
+            && keep_views()
+            && view_at(old_key as u32, (old_key >> 32) as u32)
+                .is_some_and(|old| same_placed_texture(&old, &view))
+        {
+            KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            drop(made);
+            return Some((view, false, None));
+        }
+        // Buffer (and waiting-texture) writes leave the host slot for a draw
+        // to make (same-content rewrites already returned above with the new
+        // key, so Create*View is not repeated for thousands of slots/frame).
+        if later {
+            made[index as usize] = 0;
+            drop(made);
+            return Some((view, true, None));
+        }
+        let at = self.cpu(index);
+        drop(made);
+        // One lookup for the copy the slot will show: reused for host view
+        // creation (when it names the same whole-buffer copy `make` would
+        // find) and returned to the heap buffer pass.
+        let copy = buffer_copy(&view);
+        let known = if view_extent() {
+            copy.as_ref().map(|(shadow, _, _)| shadow)
+        } else {
+            None
+        };
+        let kept = make_with(&view, at, known);
+        if kept.is_none() && !self.sampler {
+            null_for(&view, at);
+        }
+        let resource = kept.flatten();
+        // Record the key only when the host slot shows something: a failed
+        // make (no host copy yet) stays at 0 so the next write/pass retries.
+        {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            made[index as usize] = if resource.is_some() { key } else { 0 };
+        }
+        self.keep(index, resource);
+        Some((view, true, copy))
     }
 
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
@@ -1998,8 +2076,12 @@ fn buffer_srv(
     len: u64,
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    known: Option<&Arc<crate::shadow::Shadow>>,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = match known {
+        Some(shadow) => Arc::clone(shadow),
+        None => crate::shadow::find(address, len)?,
+    };
     let offset = shadow.offset(address);
     // A structured view as a raw view of the same bytes (see `raw_window`).
     // SAFETY: a buffer view's union member.
@@ -2070,8 +2152,12 @@ fn buffer_uav(
     len: u64,
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    known: Option<&Arc<crate::shadow::Shadow>>,
 ) -> Option<Kept> {
-    let shadow = crate::shadow::find(address, len)?;
+    let shadow = match known {
+        Some(shadow) => Arc::clone(shadow),
+        None => crate::shadow::find(address, len)?,
+    };
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -2274,11 +2360,24 @@ fn twin_uav(
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    make_with(view, at, None)
+}
+
+/// As [`make`], with an optional host copy already found for a buffer view
+/// ([`buffer_copy`]): skips a second [`crate::shadow::find`].
+fn make_with(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    known: Option<&Arc<crate::shadow::Shadow>>,
+) -> Option<Kept> {
     let host = host()?;
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let shadow = match known {
+                Some(shadow) => Arc::clone(shadow),
+                None => crate::shadow::find(address, u64::from(size))?,
+            };
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
                 once!(
@@ -2338,7 +2437,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
             {
-                buffer_srv(data as u64, len, srv_desc(desc), at)
+                buffer_srv(data as u64, len, srv_desc(desc), at, known)
             } else {
                 None
             }
@@ -2348,7 +2447,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let Some(texture) = crate::resource::host_resource(resource) else {
                 return match (crate::resource::buffer_bytes(resource), desc) {
                     (Some((data, len)), Some(desc)) => {
-                        buffer_uav(data as u64, len, uav_desc(desc), at)
+                        buffer_uav(data as u64, len, uav_desc(desc), at, known)
                     }
                     _ => None,
                 };
@@ -2417,7 +2516,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
         }
         View::Placed(unordered, resource, desc) => {
             if let Some(view) = placed_texture(view) {
-                return make(&view, at);
+                return make_with(&view, at, known);
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
@@ -2432,9 +2531,9 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
             let words: &[u32; 10] = desc[..10].try_into().unwrap_or(&[0; 10]);
             if *unordered {
-                buffer_uav(address, len, uav_desc(words), at)
+                buffer_uav(address, len, uav_desc(words), at, known)
             } else {
-                buffer_srv(address, len, srv_desc(words), at)
+                buffer_srv(address, len, srv_desc(words), at, known)
             }
         }
     }
